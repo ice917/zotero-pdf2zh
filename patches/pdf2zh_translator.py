@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import re
+import threading
+import time
 import unicodedata
 from collections import deque
 from copy import copy
@@ -448,9 +450,48 @@ class OpenAITranslator(BaseTranslator):
         self._polish_enabled = str(self.envs.get("POLISH", "")).lower() in ("1", "true", "on")
         self._polish_glossary_path = self.envs.get("POLISH_GLOSSARY") or None
         self._polish_glossary = None
-        self._polish_context = deque(maxlen=3)
+        # 上下文窗口按线程隔离: 并发翻译时段落顺序互不污染
+        self._tls = threading.local()
+        # 反思模式: 先审校批判, 再按建议修订 (吴恩达 translation-agent 三步流)
+        self._polish_reflect = str(self.envs.get("POLISH_REFLECT", "")).lower() in ("1", "true", "on")
+        # 确定性锚点断言: 数字保真+不译词保留, 不经 LLM 无盲区 (默认开, POLISH_ANCHOR=0 关闭)
+        self._polish_anchor = str(self.envs.get("POLISH_ANCHOR", "1")).lower() in ("1", "true", "on")
+        # 翻译指南: 每篇论文一份的语域/术语/风格约定, 注入每次润色
+        self._polish_guideline_path = self.envs.get("POLISH_GUIDELINE") or None
+        self._polish_guideline_text = None
+        # 人审报告: 审校批判结果落盘为 Markdown, 供人工终审 (目录由 POLISH_REPORT_DIR 指定)
+        self._polish_report_dir = self.envs.get("POLISH_REPORT_DIR") or None
+        self._polish_report_file = None
+        self._polish_report_seq = 0
+        if self._polish_report_dir and self._polish_enabled:
+            ts_pid = f"{time.strftime('%Y%m%d_%H%M%S')}_{os.getpid()}"
+            self._polish_report_file = os.path.join(
+                self._polish_report_dir, f"审校报告_{ts_pid}.md")
+            self._polish_doubt_file = os.path.join(
+                self._polish_report_dir, f"存疑清单_{ts_pid}.md")
+        # 启动自检: 钩子是否存活/配置是否生效, 在服务器控制台可见 (防静默失效)
         if self._polish_enabled:
             self.add_cache_impact_parameters("polish", "on")
+            if self._polish_anchor:
+                self.add_cache_impact_parameters("polish_anchor", "on")
+            print(
+                "[润色钩子] 已加载 | "
+                f"反思={'开' if self._polish_reflect else '关'} | "
+                f"锚点断言={'开' if self._polish_anchor else '关'} | "
+                f"人审报告={'开' if self._polish_report_file else '关'} | "
+                f"术语表={os.path.basename(self._polish_glossary_path) if self._polish_glossary_path else '无'} | "
+                f"指南={os.path.basename(self._polish_guideline_path) if self._polish_guideline_path else '无'}",
+                flush=True,
+            )
+        if self._polish_reflect:
+            self.add_cache_impact_parameters("polish_reflect", "on")
+
+    @property
+    def _polish_context(self):
+        """线程局部的上下文窗口 (并发翻译时每条线程独立维护自己的前文)."""
+        if not hasattr(self._tls, "polish_ctx"):
+            self._tls.polish_ctx = deque(maxlen=3)
+        return self._tls.polish_ctx
 
     @retry(
         retry=retry_if_exception_type(openai.RateLimitError),
@@ -488,12 +529,116 @@ class OpenAITranslator(BaseTranslator):
             logger.exception("Failed to load polish glossary, ignore it.")
         return glossary
 
+    def _load_text_file(self, path: str) -> str:
+        try:
+            with open(path, "r", encoding="utf-8-sig") as f:
+                return f.read().strip()
+        except Exception:
+            logger.exception("Failed to load polish config file: %s", path)
+            return ""
+
+    def _polish_llm(self, messages) -> str:
+        response = self.client.chat.completions.create(
+            model=self.envs.get("POLISH_MODEL") or self.model,
+            **self.options,
+            messages=messages,
+        )
+        content = response.choices[0].message.content.strip()
+        return self.think_filter_regex.sub("", content).strip()
+
+    def _polish_report_append(self, source: str, draft: str, critique: str, revised: str):
+        """审校报告落盘: 原文/初译/建议/修订 四栏对照, 供人工终审."""
+        if not self._polish_report_file:
+            return
+        try:
+            os.makedirs(self._polish_report_dir, exist_ok=True)
+            self._polish_report_seq += 1
+            with open(self._polish_report_file, "a", encoding="utf-8") as f:
+                f.write(f"## 段落 {self._polish_report_seq}\n\n")
+                f.write(f"**原文**\n\n{source}\n\n")
+                f.write(f"**初译**\n\n{draft}\n\n")
+                f.write(f"**审校建议**\n\n{critique}\n\n")
+                f.write(f"**自动修订**\n\n{revised}\n\n---\n\n")
+        except Exception:
+            logger.exception("Failed to write polish review report.")
+
+    def _extract_doubt(self, critique: str) -> str:
+        m = re.search(r"【存疑】(.*?)(?=\n【|$)", critique, flags=re.DOTALL)
+        return m.group(1).strip() if m else ""
+
+    def _polish_doubt_append(self, source: str, draft: str, doubt: str):
+        """存疑清单单独落盘: 人审疲劳的解法, 只看这一份小文件即可裁决术语冲突."""
+        if not self._polish_doubt_file or not doubt:
+            return
+        try:
+            os.makedirs(self._polish_report_dir, exist_ok=True)
+            with open(self._polish_doubt_file, "a", encoding="utf-8") as f:
+                f.write(f"## 存疑段落 {self._polish_report_seq}\n\n")
+                f.write(f"**原文**\n\n{source}\n\n**初译(保持未动)**\n\n{draft}\n\n")
+                f.write(f"**存疑点**\n\n{doubt}\n\n---\n\n")
+        except Exception:
+            logger.exception("Failed to write doubt list.")
+
+    def _anchor_check(self, source: str, content: str) -> str:
+        """确定性锚点断言 (不经 LLM, 无盲区). 返回违规描述, 空串=通过.
+        检查项: ①数字保真 ②不译词保留(术语表中 target==source 的条目)."""
+        problems = []
+        # ① 数字保真: 剔除占位符后, 原文数字必须全部出现在译文中
+        src_clean = re.sub(r"\{\{v\d+\}\}", " ", source)
+        out_clean = re.sub(r"\{\{v\d+\}\}", " ", content)
+        src_nums = set(
+            n.replace(",", "")
+            for n in re.findall(r"\d[\d,]*(?:\.\d+)?", src_clean)
+        )
+        missing = sorted(n for n in src_nums if n not in out_clean.replace(",", ""))
+        if missing:
+            problems.append(f"数字缺失: {', '.join(missing[:8])}")
+        # ② 不译词保留: 缩写/专名在润色后必须原样存在 (仅检查原文中出现的词)
+        if self._polish_glossary:
+            lost = [
+                k for k, v in self._polish_glossary.items()
+                if k.strip().lower() == v.strip().lower()
+                and k.lower() in src_clean.lower()
+                and k.lower() not in out_clean.lower()
+            ]
+            if lost:
+                problems.append(f"不译词丢失: {', '.join(lost[:8])}")
+        return "; ".join(problems)
+
+    def _polish_anchor_note(self, source: str, note: str):
+        """锚点断言违规写入主报告, 供人工核查."""
+        if not self._polish_report_file:
+            return
+        try:
+            os.makedirs(self._polish_report_dir, exist_ok=True)
+            self._polish_report_seq += 1
+            with open(self._polish_report_file, "a", encoding="utf-8") as f:
+                f.write(f"## 段落 {self._polish_report_seq}（锚点断言）\n\n")
+                f.write(f"**原文**\n\n{source}\n\n**违规**\n\n{note}\n\n---\n\n")
+        except Exception:
+            logger.exception("Failed to write anchor assertion note.")
+
+    def _polish_blocks(self, source: str, target: str, terms: str, context: str) -> str:
+        """公共 prompt 块: 术语表 + 前文 + 原文 + 初译."""
+        blocks = ""
+        if context:
+            blocks += f"前文参考(注意译名与指代一致):\n{context}\n\n"
+        if terms:
+            blocks += f"必须遵守的术语表:\n{terms}\n\n"
+        blocks += f"原文:\n{source}\n\n初译:\n{target}\n\n"
+        return blocks
+
     def polish(self, source: str, target: str) -> str:
-        """二次润色: 带上下文窗口与术语表对初译结果润色, 未开启时原样返回."""
+        """二次润色: 上下文窗口 + 术语表 + 翻译指南; POLISH_REFLECT 开启时走'审校批判-修订'两段式."""
         if not self._polish_enabled:
             return target
         if self._polish_glossary is None:
             self._polish_glossary = self._load_polish_glossary()
+        if self._polish_guideline_text is None:
+            self._polish_guideline_text = (
+                self._load_text_file(self._polish_guideline_path)
+                if self._polish_guideline_path else ""
+            )
         glossary = self._polish_glossary
         terms = "\n".join(
             f"- {k} => {v}"
@@ -504,29 +649,76 @@ class OpenAITranslator(BaseTranslator):
             f"[前文{i+1}] 原文: {s}\n[前文{i+1}] 译文: {t}"
             for i, (s, t) in enumerate(self._polish_context)
         )
-        sys_prompt = (
-            "你是资深学术译者, 对机器初译结果做最终润色。要求:\n"
-            "1. 只润色, 不改写意思, 不增删信息; 使用正式、严谨、流畅的学术语言。\n"
-            "2. 严禁修改任何形如 {{v数字}} 的占位符(公式/富文本标记), 必须原样保留, 数量与编号都不能变。\n"
-            "3. 专业术语译法必须与术语表一致; 与前文译文中已采用的译法保持前后一致。\n"
-            "4. 只输出润色后的译文, 不要任何解释或前后缀。"
+        guideline_block = (
+            f"翻译指南(必须遵守):\n{self._polish_guideline_text}\n\n"
+            if self._polish_guideline_text else ""
         )
-        user_prompt = ""
-        if context:
-            user_prompt += f"前文参考(注意译名与指代一致):\n{context}\n\n"
-        if terms:
-            user_prompt += f"必须遵守的术语表:\n{terms}\n\n"
-        user_prompt += f"原文:\n{source}\n\n初译:\n{target}\n\n润色后的译文:"
-        response = self.client.chat.completions.create(
-            model=self.envs.get("POLISH_MODEL") or self.model,
-            **self.options,
-            messages=[
+        base_block = self._polish_blocks(source, target, terms, context)
+
+        if self._polish_reflect:
+            # 阶段1: 审校批判 (忠实性优先, 流畅性其次)
+            critique_sys = (
+                "你是资深学术译审, 对机器初译进行严格审校。只输出修改建议清单, 分三组:\n"
+                "【忠实性】漏译/加译/错译/数字单位错误/逻辑扭曲, 逐条给出位置和改法;\n"
+                "【流畅性】术语不一致/指代不清/欧化句式/生硬表达, 逐条给出位置和改法;\n"
+                "【存疑】术语表译名与上下文语境冲突、或译名疑似不当需要人工裁决的条目, "
+                "逐条说明冲突点(这些将提交人工终审, 不自动修改)。\n"
+                "不输出译文本身。若确实无任何问题, 只输出: 无明显问题"
+            )
+            critique = self._polish_llm([
+                {"role": "system", "content": critique_sys},
+                {"role": "user", "content": guideline_block + base_block + "审校建议:"},
+            ])
+            critique_txt = critique
+            # 无问题则跳过修订, 节省一次调用
+            if "无明显问题" in critique and len(critique) < 30:
+                content = target
+                critique_txt = ""
+            else:
+                # 阶段2: 按建议修订
+                revise_sys = (
+                    "你是资深学术译者, 根据审校建议对初译做最终修订。要求:\n"
+                    "1. 只落实【忠实性】【流畅性】两组建议, 不改写意思, 不增删信息; "
+                    "使用正式严谨的学术语言;\n"
+                    "2.【存疑】条目保持初译现状不动, 留待人工终审裁决;\n"
+                    "3. 严禁修改任何形如 {{v数字}} 的占位符(公式/富文本标记), 必须原样保留;\n"
+                    "4. 术语必须与术语表一致, 与前文译文译法保持一致;\n"
+                    "5. 只输出修订后的译文, 不要任何解释或前后缀。"
+                )
+                content = self._polish_llm([
+                    {"role": "system", "content": revise_sys},
+                    {"role": "user", "content": (
+                        guideline_block
+                        + f"审校建议(逐条落实):\n{critique}\n\n"
+                        + base_block + "修订后的译文:"
+                    )},
+                ])
+        else:
+            critique_txt = ""
+            sys_prompt = (
+                "你是资深学术译者, 对机器初译结果做最终润色。要求:\n"
+                "1. 只润色, 不改写意思, 不增删信息; 使用正式、严谨、流畅的学术语言。\n"
+                "2. 严禁修改任何形如 {{v数字}} 的占位符(公式/富文本标记), 必须原样保留, 数量与编号都不能变。\n"
+                "3. 专业术语译法必须与术语表一致; 与前文译文中已采用的译法保持前后一致。\n"
+                "4. 只输出润色后的译文, 不要任何解释或前后缀。"
+            )
+            content = self._polish_llm([
                 {"role": "system", "content": sys_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        content = response.choices[0].message.content.strip()
-        content = self.think_filter_regex.sub("", content).strip()
+                {"role": "user", "content": guideline_block + base_block + "润色后的译文:"},
+            ])
+
+        # 锚点断言 (确定性, 不经 LLM): 数字保真 + 不译词保留, 违规回退初译
+        if self._polish_anchor:
+            violation = self._anchor_check(source, content)
+            if violation:
+                if self._anchor_check(source, target):
+                    violation += "（初译同样存在，疑似上游漏译，请人工核查）"
+                else:
+                    logger.warning(f"Anchor check failed, fall back to draft: {violation}")
+                    violation += "（润色引入，已回退初译）"
+                    content = target
+                self._polish_anchor_note(source, violation)
+
         # 占位符保护: 润色若破坏 {{vN}} 占位符, 回退初译
         src_ph = set(re.findall(r"\{\{v\d+\}\}", target))
         dst_ph = set(re.findall(r"\{\{v\d+\}\}", content))
@@ -534,6 +726,11 @@ class OpenAITranslator(BaseTranslator):
             logger.warning("Polish broke placeholders, fall back to raw translation.")
             content = target
         self._polish_context.append((source, content))
+
+        # 审校报告与存疑清单落盘 (仅反思模式且批判有效时)
+        if critique_txt:
+            self._polish_report_append(source, target, critique_txt, content)
+            self._polish_doubt_append(source, target, self._extract_doubt(critique_txt))
         return content
 
     def get_formular_placeholder(self, id: int):
