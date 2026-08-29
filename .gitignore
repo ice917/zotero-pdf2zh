@@ -1,0 +1,9 @@
+﻿server/translated/
+server/fonts/
+server/__pycache__/
+server/utils/__pycache__/
+server/zip/
+server.zip
+logs/*.log
+*.staging
+*.backup
