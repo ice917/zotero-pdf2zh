@@ -13,7 +13,7 @@ $workDir = 'D:\zotero-pdf2zh\server'
 Add-Content -Path $logRun -Value "Start at $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
 
 $p = Start-Process -FilePath $uv `
-  -ArgumentList @('run','--python','3.12','--with-requirements','requirements.txt','server.py') `
+  -ArgumentList @('run','--python','3.12','--with-requirements','requirements.txt','server.py','--check_update','false') `
   -WorkingDirectory $workDir `
   -RedirectStandardOutput $logOut `
   -RedirectStandardError $logErr `

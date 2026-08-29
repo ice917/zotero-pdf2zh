@@ -41,7 +41,10 @@
                 "SILICON_API_KEY": "",
                 "SILICON_MODEL": "deepseek-ai/DeepSeek-V3",
                 "POLISH": "1",
-                "POLISH_GLOSSARY": "D:/zotero-pdf2zh/server/glossary/terms.csv"
+                "POLISH_REFLECT": "1",
+                "POLISH_GLOSSARY": "D:/zotero-pdf2zh/server/glossary/terms.csv",
+                "POLISH_GUIDELINE": "D:/zotero-pdf2zh/server/glossary/guideline.txt",
+                "POLISH_REPORT_DIR": "D:/zotero-pdf2zh/server/translated/review"
             }
         },
         

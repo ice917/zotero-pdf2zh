@@ -273,6 +273,25 @@ class Config:
                     else:
                         print(f"✏️ 跳过 extraData: {key} = {value} (empty or null)")
 
+            # [自研补丁] 保护润色钩子配置: POLISH_* 键不被插件请求刷新删除,
+            # 并从 server 目录的 config.json 预置段补齐 (否则钩子静默失效)
+            try:
+                _server_cfg_path = os.path.join(
+                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                    'config', 'config.json')
+                with open(_server_cfg_path, 'r', encoding='utf-8') as f:
+                    _server_cfg = json.load(f)
+                for _t_src in _server_cfg.get('translators', []):
+                    if _t_src.get('name') == service:
+                        for _k, _v in (_t_src.get('envs') or {}).items():
+                            if _k.startswith('POLISH') and _v not in (None, "", [], {}):
+                                translator['envs'][_k] = _v
+                                translator_keys.append(_k)
+                                print(f"✏️ 润色钩子配置: {_k} = {_v}")
+                        break
+            except Exception:
+                print("⚠️ 读取润色钩子预置配置失败, POLISH 键可能丢失")
+
             # 将所有不在translator_keys中的key删除
             for key in list(translator['envs']):
                 if key not in translator_keys:
