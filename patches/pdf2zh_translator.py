@@ -570,6 +570,8 @@ class OpenAITranslator(BaseTranslator):
         """存疑清单单独落盘: 人审疲劳的解法, 只看这一份小文件即可裁决术语冲突."""
         if not self._polish_doubt_file or not doubt:
             return
+        if doubt.strip() in ("无", "无明显问题", "无明显问题。"):
+            return
         try:
             os.makedirs(self._polish_report_dir, exist_ok=True)
             with open(self._polish_doubt_file, "a", encoding="utf-8") as f:
@@ -579,21 +581,21 @@ class OpenAITranslator(BaseTranslator):
         except Exception:
             logger.exception("Failed to write doubt list.")
 
-    def _anchor_check(self, source: str, content: str) -> str:
-        """确定性锚点断言 (不经 LLM, 无盲区). 返回违规描述, 空串=通过.
+    def _anchor_check(self, source: str, content: str):
+        """确定性锚点断言 (不经 LLM, 无盲区). 返回 (不译词丢失列表, 数字缺失列表).
         检查项: ①数字保真 ②不译词保留(术语表中 target==source 的条目)."""
-        problems = []
-        # ① 数字保真: 剔除占位符后, 原文数字必须全部出现在译文中
+        # 剔除占位符与文献引用括号(如 [15–17, 24]), 避免区间端点误报
         src_clean = re.sub(r"\{\{v\d+\}\}", " ", source)
+        src_clean = re.sub(r"\[[^\]]*\]", " ", src_clean)
         out_clean = re.sub(r"\{\{v\d+\}\}", " ", content)
+        # ① 数字保真: 原文数字必须全部出现在译文中 (千分位归一化)
         src_nums = set(
             n.replace(",", "")
             for n in re.findall(r"\d[\d,]*(?:\.\d+)?", src_clean)
         )
         missing = sorted(n for n in src_nums if n not in out_clean.replace(",", ""))
-        if missing:
-            problems.append(f"数字缺失: {', '.join(missing[:8])}")
         # ② 不译词保留: 缩写/专名在润色后必须原样存在 (仅检查原文中出现的词)
+        lost = []
         if self._polish_glossary:
             lost = [
                 k for k, v in self._polish_glossary.items()
@@ -601,9 +603,7 @@ class OpenAITranslator(BaseTranslator):
                 and k.lower() in src_clean.lower()
                 and k.lower() not in out_clean.lower()
             ]
-            if lost:
-                problems.append(f"不译词丢失: {', '.join(lost[:8])}")
-        return "; ".join(problems)
+        return lost, missing
 
     def _polish_anchor_note(self, source: str, note: str):
         """锚点断言违规写入主报告, 供人工核查."""
@@ -707,17 +707,25 @@ class OpenAITranslator(BaseTranslator):
                 {"role": "user", "content": guideline_block + base_block + "润色后的译文:"},
             ])
 
-        # 锚点断言 (确定性, 不经 LLM): 数字保真 + 不译词保留, 违规回退初译
+        # 锚点断言 (确定性, 不经 LLM):
+        #   不译词丢失 = 强信号, 初译完好则回退初译;
+        #   数字缺失   = 弱信号 (存在合法数字转换如 1630 hours→16时30分), 只记录不回退
         if self._polish_anchor:
-            violation = self._anchor_check(source, content)
-            if violation:
-                if self._anchor_check(source, target):
-                    violation += "（初译同样存在，疑似上游漏译，请人工核查）"
-                else:
-                    logger.warning(f"Anchor check failed, fall back to draft: {violation}")
-                    violation += "（润色引入，已回退初译）"
+            lost_words, missing_nums = self._anchor_check(source, content)
+            if lost_words:
+                note = f"不译词丢失: {', '.join(lost_words[:8])}"
+                _, lost_in_target = self._anchor_check(source, target)
+                if not lost_in_target:
+                    logger.warning(f"Anchor check failed, fall back to draft: {note}")
+                    note += "（润色引入，已回退初译）"
                     content = target
-                self._polish_anchor_note(source, violation)
+                else:
+                    note += "（初译同样存在，请人工核查）"
+                self._polish_anchor_note(source, note)
+            if missing_nums:
+                self._polish_anchor_note(
+                    source,
+                    f"数字缺失(仅供参考, 可能是合法数字转换): {', '.join(missing_nums[:8])}")
 
         # 占位符保护: 润色若破坏 {{vN}} 占位符, 回退初译
         src_ph = set(re.findall(r"\{\{v\d+\}\}", target))
