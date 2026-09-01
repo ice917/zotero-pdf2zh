@@ -452,6 +452,10 @@ class OpenAITranslator(BaseTranslator):
         self._polish_glossary = None
         # 上下文窗口按线程隔离: 并发翻译时段落顺序互不污染
         self._tls = threading.local()
+        # [自研补丁] 全文术语表: 必须与上下文窗口相反, 走实例级共享。
+        # 上下文窗口讲究"就近", 应线程隔离; 术语表讲究"全局一致", 应跨线程共享。
+        self._polish_terms = {}
+        self._polish_terms_lock = threading.Lock()
         # 反思模式: 先审校批判, 再按建议修订 (吴恩达 translation-agent 三步流)
         self._polish_reflect = str(self.envs.get("POLISH_REFLECT", "")).lower() in ("1", "true", "on")
         # 确定性锚点断言: 数字保真+不译词保留, 不经 LLM 无盲区 (默认开, POLISH_ANCHOR=0 关闭)
@@ -681,16 +685,21 @@ class OpenAITranslator(BaseTranslator):
         # [自研补丁] 全文术语一致性: 累积"本文已采用的译名"。
         # 原实现只把"前 2 段原文+译文"作上下文(deque maxlen=3), 窗口太窄,
         # 导致同一术语在相隔较远的段落里译法漂移(如 柔顺机构/CM 混用)。
-        # 这里按线程累积全部命中过的术语, 作为独立块注入 prompt。
-        if not hasattr(self._tls, "polish_terms"):
-            self._tls.polish_terms = {}
-        term_seen = self._tls.polish_terms
-        for k, v in glossary.items():
-            if k.lower() in source.lower():
-                term_seen[k] = v
-        term_memory = "\n".join(
-            f"- {k} => {v}" for k, v in term_seen.items()
-        )
+        #
+        # 2026-09-02 修正: 原实现挂在 self._tls(线程局部) 上, 而段落是被
+        # ThreadPoolExecutor(max_workers=thread_num, 默认 8) 并发处理的,
+        # 于是 8 个线程各自只累积 1/8, 所谓"全文"名不副实。
+        # 改为实例级共享 + 互斥锁, 使任一线程发现的术语立即对所有线程可见。
+        # 注: 字典读写在 CPython 下有 GIL 保护不会损坏结构, 但仍加锁以确保
+        #     (a) 读到的 term_memory 是完整一致快照; (b) 不依赖 GIL 实现细节。
+        term_seen = self._polish_terms
+        with self._polish_terms_lock:
+            for k, v in glossary.items():
+                if k.lower() in source.lower():
+                    term_seen[k] = v
+            term_memory = "\n".join(
+                f"- {k} => {v}" for k, v in term_seen.items()
+            )
         context = "\n".join(
             f"[前文{i+1}] 原文: {s}\n[前文{i+1}] 译文: {t}"
             for i, (s, t) in enumerate(self._polish_context)
