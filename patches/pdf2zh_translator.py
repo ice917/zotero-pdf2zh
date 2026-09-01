@@ -456,6 +456,11 @@ class OpenAITranslator(BaseTranslator):
         self._polish_reflect = str(self.envs.get("POLISH_REFLECT", "")).lower() in ("1", "true", "on")
         # 确定性锚点断言: 数字保真+不译词保留, 不经 LLM 无盲区 (默认开, POLISH_ANCHOR=0 关闭)
         self._polish_anchor = str(self.envs.get("POLISH_ANCHOR", "1")).lower() in ("1", "true", "on")
+        # [自研补丁] 公式占位符可读性增强 (默认关, POLISH_FORMULA_HINT=1 开启):
+        # 允许在 {{vN}} 占位符后补一句简短中文说明其数学含义, 占位符本身仍原样保留。
+        # 默认关闭是因为它会向译文插入额外文字, 可能改变版面; 需实测后再决定是否常开。
+        self._polish_formula_hint = str(
+            self.envs.get("POLISH_FORMULA_HINT", "0")).lower() in ("1", "true", "on")
         # 翻译指南: 每篇论文一份的语域/术语/风格约定, 注入每次润色
         self._polish_guideline_path = self.envs.get("POLISH_GUIDELINE") or None
         self._polish_guideline_text = None
@@ -581,6 +586,33 @@ class OpenAITranslator(BaseTranslator):
         except Exception:
             logger.exception("Failed to write doubt list.")
 
+    # [自研补丁] 中文数字对照表, 用于锚点断言识别合法数字转换
+    _CN_DIGIT_MAP = {
+        "0": "零", "1": "一", "2": "二", "3": "三", "4": "四",
+        "5": "五", "6": "六", "7": "七", "8": "八", "9": "九",
+    }
+
+    def _num_in_text(self, num: str, text: str) -> bool:
+        """判断数字 num 是否出现在 text 中。
+
+        [自研补丁] 除字面匹配外, 还接受两类等价形式, 避免合法数字转换被误判为
+        "数字缺失"(误报会让本已正确的译文被记入违规, 干扰人工核查):
+          ① 去前导零: 02 -> 2   (July 02-05 -> 7月2日-5日)
+          ② 中文数字: 3  -> 三  (3D -> 三维)
+        """
+        if num in text:
+            return True
+        # ① 去前导零后匹配
+        stripped = num.lstrip("0")
+        if stripped and stripped in text:
+            return True
+        # ② 逐位中文数字匹配 (仅当每一位都有对应汉字时成立)
+        if all(ch in self._CN_DIGIT_MAP for ch in num):
+            cn = "".join(self._CN_DIGIT_MAP[ch] for ch in num)
+            if cn in text:
+                return True
+        return False
+
     def _anchor_check(self, source: str, content: str):
         """确定性锚点断言 (不经 LLM, 无盲区). 返回 (不译词丢失列表, 数字缺失列表).
         检查项: ①数字保真 ②不译词保留(术语表中 target==source 的条目)."""
@@ -593,7 +625,8 @@ class OpenAITranslator(BaseTranslator):
             n.replace(",", "")
             for n in re.findall(r"\d[\d,]*(?:\.\d+)?", src_clean)
         )
-        missing = sorted(n for n in src_nums if n not in out_clean.replace(",", ""))
+        out_norm = out_clean.replace(",", "")
+        missing = sorted(n for n in src_nums if not self._num_in_text(n, out_norm))
         # ② 不译词保留: 缩写/专名在润色后必须原样存在 (仅检查原文中出现的词)
         lost = []
         if self._polish_glossary:
@@ -645,6 +678,19 @@ class OpenAITranslator(BaseTranslator):
             for k, v in glossary.items()
             if k.lower() in source.lower()
         )
+        # [自研补丁] 全文术语一致性: 累积"本文已采用的译名"。
+        # 原实现只把"前 2 段原文+译文"作上下文(deque maxlen=3), 窗口太窄,
+        # 导致同一术语在相隔较远的段落里译法漂移(如 柔顺机构/CM 混用)。
+        # 这里按线程累积全部命中过的术语, 作为独立块注入 prompt。
+        if not hasattr(self._tls, "polish_terms"):
+            self._tls.polish_terms = {}
+        term_seen = self._tls.polish_terms
+        for k, v in glossary.items():
+            if k.lower() in source.lower():
+                term_seen[k] = v
+        term_memory = "\n".join(
+            f"- {k} => {v}" for k, v in term_seen.items()
+        )
         context = "\n".join(
             f"[前文{i+1}] 原文: {s}\n[前文{i+1}] 译文: {t}"
             for i, (s, t) in enumerate(self._polish_context)
@@ -653,7 +699,19 @@ class OpenAITranslator(BaseTranslator):
             f"翻译指南(必须遵守):\n{self._polish_guideline_text}\n\n"
             if self._polish_guideline_text else ""
         )
-        base_block = self._polish_blocks(source, target, terms, context)
+        # 全文已用译名(优先级低于术语表, 用于消除跨段落译名漂移)
+        term_memory_block = (
+            f"本文已采用的译名(全文须保持一致, 与术语表冲突时以术语表为准):\n{term_memory}\n\n"
+            if term_memory else ""
+        )
+        base_block = term_memory_block + self._polish_blocks(source, target, terms, context)
+        # [自研补丁] 公式占位符可读性提示 (POLISH_FORMULA_HINT=1 时启用)
+        formula_hint_rule = (
+            "6. 若原文含 {{v数字}} 占位符(公式片段), 可在该占位符紧邻处用全角括号补一句极简短的"
+            "中文说明其数学含义(例: {{v8}}0{{v9}}1{{v10}} 后补'（体积分数介于0与1之间）'), "
+            "使句子可读; 占位符本身必须原样保留, 不得改写/移动/删除, 且不得臆造原文无依据的数值。\n"
+            if self._polish_formula_hint else ""
+        )
 
         if self._polish_reflect:
             # 阶段1: 审校批判 (忠实性优先, 流畅性其次)
@@ -661,9 +719,16 @@ class OpenAITranslator(BaseTranslator):
                 "你是资深学术译审, 对机器初译进行严格审校。只输出修改建议清单, 分三组:\n"
                 "【忠实性】漏译/加译/错译/数字单位错误/逻辑扭曲, 逐条给出位置和改法;\n"
                 "【流畅性】术语不一致/指代不清/欧化句式/生硬表达, 逐条给出位置和改法;\n"
-                "【存疑】术语表译名与上下文语境冲突、或译名疑似不当需要人工裁决的条目, "
-                "逐条说明冲突点(这些将提交人工终审, 不自动修改)。\n"
-                "不输出译文本身。若确实无任何问题, 只输出: 无明显问题"
+                # [自研补丁] 存疑判定收窄: 原措辞导致 LLM 把"术语表未收录"一律记为存疑,
+                # 产生大量标准译法(如 topology optimization=拓扑优化)的低价值条目,
+                # 使存疑清单膨胀到数十KB, 反而加重人工审阅负担。
+                "【存疑】仅限以下两类, 务必严格、宁缺毋滥:\n"
+                "  ① 术语表译名与本文上下文明显冲突(表内译名在此语境下讲不通);\n"
+                "  ② 该英文术语在学界存在两种以上通行中文译法, 且本文语境不足以判定取舍。\n"
+                "不列入: 术语表未收录但译法属学界标准译法的词条(例: topology optimization=拓扑优化);\n"
+                "不列入: 占位符导致的语义不完整; 不列入: 一般性措辞优劣。\n"
+                "若无符合上述条件者, 此组输出: 无存疑\n"
+                "不输出译文本身。若三组均无内容, 只输出: 无明显问题"
             )
             critique = self._polish_llm([
                 {"role": "system", "content": critique_sys},
@@ -683,7 +748,8 @@ class OpenAITranslator(BaseTranslator):
                     "2.【存疑】条目保持初译现状不动, 留待人工终审裁决;\n"
                     "3. 严禁修改任何形如 {{v数字}} 的占位符(公式/富文本标记), 必须原样保留;\n"
                     "4. 术语必须与术语表一致, 与前文译文译法保持一致;\n"
-                    "5. 只输出修订后的译文, 不要任何解释或前后缀。"
+                    "5. 只输出修订后的译文, 不要任何解释或前后缀。\n"
+                    + formula_hint_rule
                 )
                 content = self._polish_llm([
                     {"role": "system", "content": revise_sys},
@@ -700,7 +766,8 @@ class OpenAITranslator(BaseTranslator):
                 "1. 只润色, 不改写意思, 不增删信息; 使用正式、严谨、流畅的学术语言。\n"
                 "2. 严禁修改任何形如 {{v数字}} 的占位符(公式/富文本标记), 必须原样保留, 数量与编号都不能变。\n"
                 "3. 专业术语译法必须与术语表一致; 与前文译文中已采用的译法保持前后一致。\n"
-                "4. 只输出润色后的译文, 不要任何解释或前后缀。"
+                "4. 只输出润色后的译文, 不要任何解释或前后缀。\n"
+                + formula_hint_rule
             )
             content = self._polish_llm([
                 {"role": "system", "content": sys_prompt},
