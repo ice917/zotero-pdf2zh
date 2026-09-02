@@ -465,6 +465,12 @@ class OpenAITranslator(BaseTranslator):
         # 默认关闭是因为它会向译文插入额外文字, 可能改变版面; 需实测后再决定是否常开。
         self._polish_formula_hint = str(
             self.envs.get("POLISH_FORMULA_HINT", "0")).lower() in ("1", "true", "on")
+        # [自研补丁] 领域标签: 告知模型"这是一篇什么领域的论文", 用于消解术语歧义。
+        # 依据: EMNLP 2025 实证 —— 同一英文词在不同领域译法不同
+        #       (例: system 在法律领域应译"体系"而非字面"系统"),
+        #       加领域标签后 LLM 翻译正确; 论文结论是"关键在于如何有效利用领域信息"。
+        # 默认关 (POLISH_DOMAIN=空), 需实测后决定是否常开。
+        self._polish_domain = (self.envs.get("POLISH_DOMAIN") or "").strip()
         # 翻译指南: 每篇论文一份的语域/术语/风格约定, 注入每次润色
         self._polish_guideline_path = self.envs.get("POLISH_GUIDELINE") or None
         self._polish_guideline_text = None
@@ -713,7 +719,19 @@ class OpenAITranslator(BaseTranslator):
             f"本文已采用的译名(全文须保持一致, 与术语表冲突时以术语表为准):\n{term_memory}\n\n"
             if term_memory else ""
         )
-        base_block = term_memory_block + self._polish_blocks(source, target, terms, context)
+        # [自研补丁] 领域标签: 置于最前, 让模型先建立"这是什么领域的文本"的认知,
+        # 再读待译段落 —— 顺序有讲究, 领域信息应先于具体内容进入上下文。
+        domain_block = (
+            f"本文所属领域: {self._polish_domain}\n"
+            "请按该领域的通行译法与表达习惯处理术语; 遇到多义词时, "
+            "优先采用该领域的惯用译法, 而非字面直译。\n\n"
+            if self._polish_domain else ""
+        )
+        base_block = (
+            domain_block
+            + term_memory_block
+            + self._polish_blocks(source, target, terms, context)
+        )
         # [自研补丁] 公式占位符可读性提示 (POLISH_FORMULA_HINT=1 时启用)
         formula_hint_rule = (
             "6. 若原文含 {{v数字}} 占位符(公式片段), 可在该占位符紧邻处用全角括号补一句极简短的"
