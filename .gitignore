@@ -7,3 +7,9 @@ server.zip
 logs/*.log
 *.staging
 *.backup
+
+# Python 缓存（项目根及任意层级，含 tools/）
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
