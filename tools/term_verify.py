@@ -141,6 +141,96 @@ def _is_relevant(title, term, strict=True):
     return any(w in title_l for w in words)
 
 
+def llm_judge_relevance(term, titles, context="", timeout=30):
+    """
+    [方案 3] 用 LLM 判断检索结果是否与术语真正相关，过滤领域偏移的噪音。
+
+    依据: arXiv:2601.11238 (LLM-Assisted Pseudo-Relevance Feedback) ——
+          在利用 top-k 结果前插入 LLM 过滤层，既利用 LLM 语义判断，
+          又基于语料证据，避免纯生成式方法的幻觉。
+    痛点: 实测 "CM" 召回 DC-DC 变换器/电动车充电/跨膜蛋白预测（全无关），
+          纯字面/关键词过滤对此无能为力，需语义判断。
+
+    配置(环境变量, 全部为空则该功能不可用, 自动跳过):
+        TERM_VERIFY_LLM_BASE    OpenAI 兼容端点, 例 https://.../v1
+        TERM_VERIFY_LLM_KEY     API Key
+        TERM_VERIFY_LLM_MODEL   模型名, 默认 qwen-plus
+
+    **重要: 直连 LLM 端点, 不经过 8787(qwen_proxy)/8788(local_mcp_server),
+    因此对 AI Butler 零影响**（不占其缓存、不触发熔断、不消耗其配额）。
+
+    保守策略(避免误杀正确证据):
+        - 调用失败/超时/解析异常 → 返回 None, 调用方**保留全部结果**不剔除
+        - 只剔除 LLM 明确判为不相关(relevant=false)的条目
+        - 每个判断附带 reason, 写入报告供人工复核
+
+    返回: {title: {'relevant': bool, 'reason': str}} 或 None(不可用/失败)
+    """
+    base = os.getenv("TERM_VERIFY_LLM_BASE", "").strip()
+    key = os.getenv("TERM_VERIFY_LLM_KEY", "").strip()
+    model = os.getenv("TERM_VERIFY_LLM_MODEL", "qwen-plus").strip()
+    if not base or not key:
+        return None
+
+    numbered = "\n".join("%d. %s" % (i, t) for i, t in enumerate(titles))
+    domain_line = ("本文领域: %s\n" % context) if context else ""
+    prompt = (
+        "你是学术术语辨析助手。\n"
+        "%s"
+        '待判断术语: "%s"\n\n'
+        "以下检索到的文献标题:\n%s\n\n"
+        "请逐条判断: 该文献是否确实在本文领域下讨论该术语(或该术语所指的概念)?\n"
+        "注意: 术语在其他领域的同名用法视为不相关。"
+        '例: 术语 "CM" 在拓扑优化领域指 compliant mechanism(柔顺机构), '
+        "则 DC-DC 变换器、电动车充电、跨膜蛋白预测等标题均不相关。\n\n"
+        '只输出 JSON 数组, 不要任何解释文字:\n'
+        '[{"i": 0, "relevant": true, "reason": "简述理由"}, ...]'
+        % (domain_line, term, numbered)
+    )
+
+    url = base.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+    }
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + key},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        content = data["choices"][0]["message"]["content"]
+    except Exception:
+        return None  # 保守: 失败不剔除
+
+    # 解析 JSON(模型可能用 ```json 包裹)
+    m = re.search(r"\[.*\]", content, flags=re.S)
+    if not m:
+        return None
+    try:
+        arr = json.loads(m.group(0))
+    except Exception:
+        return None
+
+    out = {}
+    for item in arr:
+        try:
+            idx = int(item.get("i"))
+            if 0 <= idx < len(titles):
+                out[titles[idx]] = {
+                    "relevant": bool(item.get("relevant")),
+                    "reason": str(item.get("reason", ""))[:200],
+                }
+        except Exception:
+            continue
+    # 若一个都没解析出来, 视为失败(保守不剔除)
+    return out if out else None
+
+
 def openalex_search(term, max_results=5, timeout=8, context="", max_retries=4):
     """
     检索术语的学术上下文证据。
@@ -250,6 +340,8 @@ def build_report(src_path, results, elapsed):
             lines.append("  （可能术语过于具体、拼写特殊，或需补充 `--context` 领域上下文）")
             lines.append("")
             continue
+        if res.get("llm_note"):
+            lines.append("- %s" % res["llm_note"])
         lines.append("- 文献语境证据：")
         n_weak = sum(1 for p in res["papers"] if p.get("relevance") == "weak")
         if n_weak:
@@ -259,6 +351,16 @@ def build_report(src_path, results, elapsed):
             y = p["year"] if p["year"] else "n.d."
             tag = "  [弱]" if p.get("relevance") == "weak" else ""
             lines.append("  - (%s, 被引 %d)%s %s" % (y, p["cited"], tag, p["title"]))
+            if p.get("llm_reason"):
+                lines.append("    - LLM 判据：%s" % p["llm_reason"])
+        if res.get("llm_dropped"):
+            lines.append("")
+            lines.append("  <details><summary>LLM 剔除的条目（可复核）</summary>")
+            lines.append("")
+            for t, why in res["llm_dropped"]:
+                lines.append("  - %s —— %s" % (t, why))
+            lines.append("")
+            lines.append("  </details>")
         lines.append("")
 
     return "\n".join(lines)
@@ -291,6 +393,11 @@ def main():
                     help="领域上下文词，会拼到检索词后以提升通用短词的召回精度 "
                          "(例: --context 'topology optimization')；"
                          "也可用环境变量 TERM_CONTEXT 设置")
+    ap.add_argument("--llm-filter", action="store_true",
+                    help="[方案 3] 用 LLM 过滤领域偏移的检索结果(默认关)。"
+                         "需环境变量 TERM_VERIFY_LLM_BASE / TERM_VERIFY_LLM_KEY；"
+                         "直连 LLM 端点, 不经 8787/8788, 对 AI Butler 零影响。"
+                         "采用保守策略: LLM 调用失败时保留全部结果不剔除")
     ap.add_argument("--out", help="输出报告路径（默认与源清单同目录）")
     args = ap.parse_args()
 
@@ -313,12 +420,55 @@ def main():
     if args.context:
         print("[INFO] 领域上下文: %s" % args.context)
 
+    # [方案 3] LLM 过滤: 仅在显式开启且环境变量齐备时启用。
+    # 未配置/调用失败时 llm_judge_relevance 返回 None, 自动跳过, 不影响主流程。
+    use_llm = args.llm_filter
+    if use_llm:
+        has_cfg = bool(os.getenv("TERM_VERIFY_LLM_BASE", "").strip()
+                       and os.getenv("TERM_VERIFY_LLM_KEY", "").strip())
+        if not has_cfg:
+            print("[WARN] --llm-filter 已指定，但未配置 TERM_VERIFY_LLM_BASE / "
+                  "TERM_VERIFY_LLM_KEY，自动跳过过滤（结果不受影响）")
+            use_llm = False
+        else:
+            print("[INFO] LLM 过滤已启用 (model=%s)"
+                  % os.getenv("TERM_VERIFY_LLM_MODEL", "qwen-plus"))
+
     results = []
     t0 = time.time()
     for i, it in enumerate(items, 1):
         print("[%d/%d] 查证: %s" % (i, len(items), it["term"]))
         res = openalex_search(it["term"], max_results=args.per_term,
                               context=args.context)
+
+        if use_llm and res["ok"] and res["papers"]:
+            verdict = llm_judge_relevance(
+                it["term"],
+                [p["title"] for p in res["papers"]],
+                context=args.context,
+            )
+            if verdict is None:
+                res["llm_note"] = "LLM 过滤不可用/失败，已保留全部结果"
+            else:
+                kept = []
+                dropped = []
+                for p in res["papers"]:
+                    v = verdict.get(p["title"])
+                    if v is None:
+                        kept.append(p)          # LLM 未覆盖 -> 保留(保守)
+                        continue
+                    if v["relevant"]:
+                        p["llm_reason"] = v["reason"]
+                        kept.append(p)
+                    else:
+                        dropped.append((p["title"], v["reason"]))
+                res["papers"] = kept
+                res["llm_dropped"] = dropped
+                res["llm_note"] = ("LLM 过滤：保留 %d 条，剔除 %d 条"
+                                   % (len(kept), len(dropped)))
+        elif use_llm:
+            res["llm_note"] = "无检索结果，跳过 LLM 过滤"
+
         results.append({
             "term": it["term"], "para": it["para"],
             "note": it["note"], "res": res,
