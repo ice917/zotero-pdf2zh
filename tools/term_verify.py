@@ -51,6 +51,11 @@ USER_AGENT = "zotero-pdf2zh-term-verify/1.0 (mailto:%s)" % (OPENALEX_EMAIL or "a
 REVIEW_DIRNAME = "review"
 
 
+def project_root_env():
+    """项目根目录（tools/ 的上级），供 --glossary 默认值使用"""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 # ----------------------------------------------------------------------
 # 解析
 # ----------------------------------------------------------------------
@@ -378,6 +383,85 @@ def find_latest_doubt_md(base_dir):
     return max(files, key=os.path.getmtime)
 
 
+# ----------------------------------------------------------------------
+# [方案 2] 术语表回写
+# ----------------------------------------------------------------------
+def propose_glossary_updates(results, context=""):
+    """
+    从查证结果中提出术语表新增/修订建议。
+
+    生成规则(保守, 宁缺毋滥):
+      - 只对"证据强"的术语提建议: 至少 1 条 strong 证据, 且 strong 数 >= weak 数
+      - 短语术语(>=2 个实词)才建议; 单词/缩写歧义太大, 必须人工裁决
+      - 建议译名 = 取被引最高的强证据文献标题(不自动定中文译名!)
+
+    返回: [{'term', 'evidence_title', 'cited', 'year', 'suggested_by'}]
+          —— 只含英文术语与证据, 不含中文译名; 中文译名由人工/LLM 裁决后写入。
+    """
+    proposals = []
+    for r in results:
+        res = r["res"]
+        if not res.get("ok") or not res.get("papers"):
+            continue
+        strong = [p for p in res["papers"] if p.get("relevance") == "strong"]
+        weak = [p for p in res["papers"] if p.get("relevance") == "weak"]
+        if not strong or len(strong) < len(weak):
+            continue
+        # 至少两个实词(降低单词歧义误入术语表的风险)
+        words = re.findall(r"[a-z]{3,}", r["term"].lower())
+        if len(words) < 2:
+            continue
+        best = max(strong, key=lambda p: p.get("cited") or 0)
+        proposals.append({
+            "term": r["term"],
+            "evidence_title": best["title"],
+            "cited": best.get("cited", 0),
+            "year": best.get("year"),
+            "suggested_by": "term_verify(evidence-based)",
+        })
+    return proposals
+
+
+def load_glossary(path):
+    """读取现有术语表(csv, 无表头, 'english,chinese')。返回 dict 与原始行数。"""
+    entries = {}
+    n = 0
+    if not os.path.isfile(path):
+        return entries, n
+    for line in open(path, encoding="utf-8"):
+        line = line.strip()
+        n += 1
+        if not line or "," not in line:
+            continue
+        en, _, zh = line.partition(",")
+        entries[en.strip().lower()] = zh.strip()
+    return entries, n
+
+
+def write_glossary_updates(path, proposals, zh_by_term):
+    """
+    把人工/LLM 裁决后的译名写入术语表。
+    zh_by_term: {term_lower: 中文译名} —— 必须已经过裁决, 不接受空值。
+    返回 (added, skipped_exists, skipped_no_zh)
+    """
+    existing, _ = load_glossary(path)
+    added, skip_exist, skip_nozh = [], [], []
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        for p in proposals:
+            key = p["term"].lower()
+            if key in existing:
+                skip_exist.append(p["term"])
+                continue
+            zh = zh_by_term.get(key, "").strip()
+            if not zh:
+                skip_nozh.append(p["term"])
+                continue
+            f.write("%s,%s\n" % (p["term"], zh))
+            existing[key] = zh
+            added.append((p["term"], zh))
+    return added, skip_exist, skip_nozh
+
+
 def main():
     here = os.path.dirname(os.path.abspath(__file__))
     project_root = os.path.dirname(here)  # tools/ 的上级
@@ -399,6 +483,12 @@ def main():
                          "直连 LLM 端点, 不经 8787/8788, 对 AI Butler 零影响。"
                          "采用保守策略: LLM 调用失败时保留全部结果不剔除")
     ap.add_argument("--out", help="输出报告路径（默认与源清单同目录）")
+    ap.add_argument("--glossary", default=os.getenv("POLISH_GLOSSARY",
+                    os.path.join(project_root_env(), "server", "glossary", "terms.csv")),
+                    help="术语表 csv 路径(无表头, 'english,chinese')。"
+                         "默认取 POLISH_GLOSSARY 环境变量, 其次 server/glossary/terms.csv")
+    ap.add_argument("--propose", action="store_true",
+                    help="[方案 2] 在报告末尾附上术语表新增建议(仅强证据短语, 不含中文译名)")
     args = ap.parse_args()
 
     src = args.src or find_latest_doubt_md(project_root)
@@ -478,6 +568,30 @@ def main():
     elapsed = time.time() - t0
 
     report = build_report(src, results, elapsed)
+
+    # [方案 2] 术语表新增建议(只提英文术语+证据, 中文译名留人工/LLM 裁决)
+    if args.propose:
+        proposals = propose_glossary_updates(results, context=args.context)
+        existing, total_rows = load_glossary(args.glossary)
+        new_items = [p for p in proposals
+                     if p["term"].lower() not in existing]
+        report += "\n\n---\n\n## 术语表新增建议（供裁决，不自动写入）\n\n"
+        report += ("- 依据：仅收录**强证据**(标题含全部实词)且强证据数不少于弱证据的**短语术语**；\n"
+                   "- 单词/缩写歧义大，一律不自动建议；\n"
+                   "- **不含中文译名**——请人工(或让 LLM 依据证据)裁决后，"
+                   "手动追加到 `%s`（格式 `english,chinese`）。\n\n" % args.glossary)
+        if not new_items:
+            report += "（本轮无符合条件的新术语）\n"
+        else:
+            report += "| 英文术语 | 依据文献(被引最高) | 年份 | 被引 |\n|---|---|---|---|\n"
+            for p in new_items:
+                y = p["year"] if p["year"] else "-"
+                report += "| %s | %s | %s | %d |\n" % (
+                    p["term"], p["evidence_title"], y, p["cited"])
+            report += ("\n当前术语表共 %d 行；本轮可新增 %d 条（已有 %d 条命中现有表，自动跳过）\n"
+                       % (total_rows, len(new_items),
+                          len(proposals) - len(new_items)))
+
     out = args.out or os.path.join(
         os.path.dirname(src),
         "术语查证报告_%s.md" % time.strftime("%Y%m%d_%H%M%S"),
