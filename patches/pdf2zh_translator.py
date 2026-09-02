@@ -465,6 +465,11 @@ class OpenAITranslator(BaseTranslator):
         # 默认关闭是因为它会向译文插入额外文字, 可能改变版面; 需实测后再决定是否常开。
         self._polish_formula_hint = str(
             self.envs.get("POLISH_FORMULA_HINT", "0")).lower() in ("1", "true", "on")
+        # [自研补丁] 公式占位符对照注入 (默认开, POLISH_FORMULA_MAP=0 关闭):
+        # converter 将本段 {vN}->公式原文 的映射写入线程局部存储,
+        # 润色 prompt 据此注入对照块, 使带公式句子的译文语序正确。
+        self._polish_formula_map = str(
+            self.envs.get("POLISH_FORMULA_MAP", "1")).lower() not in ("0", "false", "off")
         # [自研补丁] 领域标签: 告知模型"这是一篇什么领域的论文", 用于消解术语歧义。
         # 依据: EMNLP 2025 实证 —— 同一英文词在不同领域译法不同
         #       (例: system 在法律领域应译"体系"而非字面"系统"),
@@ -561,6 +566,20 @@ class OpenAITranslator(BaseTranslator):
         content = response.choices[0].message.content.strip()
         return self.think_filter_regex.sub("", content).strip()
 
+    def _formula_readable(self, text: str) -> str:
+        """[自研补丁] 报告可读化: 把 {vN} 占位符替换为 ⟨公式: 原文⟩, 供人工终审阅读。
+
+        对照表来自 converter 注入的线程局部存储(本段翻译时有效); 表里没有的
+        占位符保持原样。仅用于报告展示, 不影响任何翻译/校验逻辑。
+        """
+        fmap = getattr(self._tls, "formula_map", None) or {}
+        if not fmap:
+            return text
+        def _sub(m):
+            v = fmap.get(m.group(0))
+            return "⟨公式: %s⟩" % v if v else m.group(0)
+        return re.sub(r"\{v\d+\}", _sub, text)
+
     def _polish_report_append(self, source: str, draft: str, critique: str, revised: str):
         """审校报告落盘: 原文/初译/建议/修订 四栏对照, 供人工终审."""
         if not self._polish_report_file:
@@ -570,10 +589,10 @@ class OpenAITranslator(BaseTranslator):
             self._polish_report_seq += 1
             with open(self._polish_report_file, "a", encoding="utf-8") as f:
                 f.write(f"## 段落 {self._polish_report_seq}\n\n")
-                f.write(f"**原文**\n\n{source}\n\n")
-                f.write(f"**初译**\n\n{draft}\n\n")
+                f.write(f"**原文**\n\n{self._formula_readable(source)}\n\n")
+                f.write(f"**初译**\n\n{self._formula_readable(draft)}\n\n")
                 f.write(f"**审校建议**\n\n{critique}\n\n")
-                f.write(f"**自动修订**\n\n{revised}\n\n---\n\n")
+                f.write(f"**自动修订**\n\n{self._formula_readable(revised)}\n\n---\n\n")
         except Exception:
             logger.exception("Failed to write polish review report.")
 
@@ -591,7 +610,8 @@ class OpenAITranslator(BaseTranslator):
             os.makedirs(self._polish_report_dir, exist_ok=True)
             with open(self._polish_doubt_file, "a", encoding="utf-8") as f:
                 f.write(f"## 存疑段落 {self._polish_report_seq}\n\n")
-                f.write(f"**原文**\n\n{source}\n\n**初译(保持未动)**\n\n{draft}\n\n")
+                f.write(f"**原文**\n\n{self._formula_readable(source)}\n\n"
+                        f"**初译(保持未动)**\n\n{self._formula_readable(draft)}\n\n")
                 f.write(f"**存疑点**\n\n{doubt}\n\n---\n\n")
         except Exception:
             logger.exception("Failed to write doubt list.")
@@ -627,9 +647,12 @@ class OpenAITranslator(BaseTranslator):
         """确定性锚点断言 (不经 LLM, 无盲区). 返回 (不译词丢失列表, 数字缺失列表).
         检查项: ①数字保真 ②不译词保留(术语表中 target==source 的条目)."""
         # 剔除占位符与文献引用括号(如 [15–17, 24]), 避免区间端点误报
-        src_clean = re.sub(r"\{\{v\d+\}\}", " ", source)
+        # [自研补丁 2026-09-02 修正] 原正则 \{\{v\d+\}\} 匹配双大括号, 但 converter.py
+        # 实际生成的是单大括号 {vN}(f-string "{{" 转义), 4 处正则全部失配=形同虚设,
+        # 锚点剔除与占位符保护从未生效。统一改为 \{v\d+\}。
+        src_clean = re.sub(r"\{v\d+\}", " ", source)
         src_clean = re.sub(r"\[[^\]]*\]", " ", src_clean)
-        out_clean = re.sub(r"\{\{v\d+\}\}", " ", content)
+        out_clean = re.sub(r"\{v\d+\}", " ", content)
         # ① 数字保真: 原文数字必须全部出现在译文中 (千分位归一化)
         src_nums = set(
             n.replace(",", "")
@@ -727,15 +750,31 @@ class OpenAITranslator(BaseTranslator):
             "优先采用该领域的惯用译法, 而非字面直译。\n\n"
             if self._polish_domain else ""
         )
+        # [自研补丁] 公式占位符对照表: converter 在调用 translate 前把本段 {vN} 与其
+        # 原文(字符流)写入线程局部存储。据此告知 LLM 每个占位符的数学含义, 使带公式
+        # 句子的译文语序正确(例: {v8}0{v9}1{v10} = "0 ≤ v ≤ 1" 时可译成通顺的中文句式)。
+        # 占位符本身必须原样保留 —— 这一点同时由"占位符保护"(破坏即回退初译)硬性兜底。
+        formula_map = getattr(self._tls, "formula_map", None) or {}
+        formula_block = ""
+        if formula_map and self._polish_formula_map:
+            _rows = "\n".join(
+                "  %s = %s" % (k, v if v else "(空)")
+                for k, v in formula_map.items()
+            )
+            formula_block = (
+                "本段公式占位符对照(供理解句意; 译文中占位符必须原样保留, 位置可按中文语序调整):\n"
+                + _rows + "\n\n"
+            )
         base_block = (
             domain_block
+            + formula_block
             + term_memory_block
             + self._polish_blocks(source, target, terms, context)
         )
         # [自研补丁] 公式占位符可读性提示 (POLISH_FORMULA_HINT=1 时启用)
         formula_hint_rule = (
-            "6. 若原文含 {{v数字}} 占位符(公式片段), 可在该占位符紧邻处用全角括号补一句极简短的"
-            "中文说明其数学含义(例: {{v8}}0{{v9}}1{{v10}} 后补'（体积分数介于0与1之间）'), "
+            "6. 若原文含 {v数字} 占位符(公式片段), 可在该占位符紧邻处用全角括号补一句极简短的"
+            "中文说明其数学含义(例: {v8}0{v9}1{v10} 后补'（体积分数介于0与1之间）'), "
             "使句子可读; 占位符本身必须原样保留, 不得改写/移动/删除, 且不得臆造原文无依据的数值。\n"
             if self._polish_formula_hint else ""
         )
@@ -821,9 +860,10 @@ class OpenAITranslator(BaseTranslator):
                     source,
                     f"数字缺失(仅供参考, 可能是合法数字转换): {', '.join(missing_nums[:8])}")
 
-        # 占位符保护: 润色若破坏 {{vN}} 占位符, 回退初译
-        src_ph = set(re.findall(r"\{\{v\d+\}\}", target))
-        dst_ph = set(re.findall(r"\{\{v\d+\}\}", content))
+        # 占位符保护: 润色若破坏 {vN} 占位符, 回退初译
+        # [自研补丁 2026-09-02 修正] 正则同上修正(原双大括号失配, 此保护从未生效)
+        src_ph = set(re.findall(r"\{v\d+\}", target))
+        dst_ph = set(re.findall(r"\{v\d+\}", content))
         if src_ph != dst_ph:
             logger.warning("Polish broke placeholders, fall back to raw translation.")
             content = target
