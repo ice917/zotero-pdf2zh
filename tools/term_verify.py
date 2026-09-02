@@ -114,28 +114,44 @@ def parse_doubt_md(path):
 # ----------------------------------------------------------------------
 # 检索
 # ----------------------------------------------------------------------
-def _is_relevant(title, term):
+def _is_relevant(title, term, strict=True):
     """
-    相关性过滤：标题需包含术语的某个实词（长度>=3 的英文词）。
+    相关性过滤。OpenAlex 的 search 是全文检索，通用短词会召回大量无关文献：
+      - "void states"  实测召回 Ferroptosis(细胞死亡)、Ruling The Void(政治学书籍)
+      - "CM"           实测召回 DC-DC 变换器、电动车充电、跨膜蛋白预测（全无关）
 
-    OpenAlex 的 search 是全文检索，通用短词（如 void / state）会召回
-    大量无关文献（实测 "void states" 召回了 Ferroptosis 细胞死亡、
-    Ruling The Void 政治学书籍）。这里做一道硬过滤保证证据可用性。
+    strict=True  : 标题需包含术语的**全部**实词（精确优先）
+    strict=False : 标题包含术语的**任一**实词（用于补足，避免 0 结果）
+
+    对缩写/短词（如 "CM"）特殊处理：用**词边界**匹配，避免 "cm" 作为子串
+    命中无关词。2026-09-02 修复：此前无实词时直接 return True 导致完全不过滤。
     """
-    words = [w for w in re.findall(r"[a-z]{3,}", term.lower())]
-    if not words:
-        return True  # 非英文术语不做此过滤
     title_l = title.lower()
+    words = [w for w in re.findall(r"[a-z]{3,}", term.lower())]
+
+    if not words:
+        # 缩写或无英文实词: 用词边界匹配整串, 而非 return True
+        t = re.escape(term.lower().strip())
+        if not t:
+            return False
+        return bool(re.search(r"\b%s\b" % t, title_l))
+
+    if strict:
+        return all(w in title_l for w in words)
     return any(w in title_l for w in words)
 
 
-def openalex_search(term, max_results=5, timeout=8, context=""):
+def openalex_search(term, max_results=5, timeout=8, context="", max_retries=4):
     """
     检索术语的学术上下文证据。
     返回 {'ok': bool, 'papers': [{'title','year','cited'}...], 'error': str}
 
     context: 领域上下文词（如 "topology optimization"），会拼接到检索词后，
              显著提升通用短词的召回精度（实测必加，否则噪音很大）。
+
+    max_retries: 429 限流的指数退避重试次数。
+             2026-09-02 实测 18 个术语有 5 个因 HTTP 429 失败(28%)，
+             故加入退避重试：等待 2s / 4s / 8s 后重试。
     """
     query = (term + " " + context).strip() if context else term
     params = {
@@ -148,26 +164,54 @@ def openalex_search(term, max_results=5, timeout=8, context=""):
     url = OPENALEX_API + "?" + urllib.parse.urlencode(params)
 
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        return {"ok": False, "papers": [], "error": "%s: %s" % (type(e).__name__, e)}
 
-    papers = []
+    last_err = None
+    for attempt in range(max_retries):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            break  # 成功, 跳出重试循环
+        except urllib.error.HTTPError as e:
+            last_err = "HTTP %s: %s" % (e.code, e.reason)
+            # 仅对 429(限流) / 5xx(服务端错误) 重试, 4xx 客户端错误不重试
+            if e.code == 429 or 500 <= e.code < 600:
+                if attempt < max_retries - 1:
+                    wait = 2 ** (attempt + 1)      # 2s, 4s, 8s
+                    time.sleep(wait)
+                    continue
+            return {"ok": False, "papers": [], "error": last_err}
+        except Exception as e:
+            return {"ok": False, "papers": [], "error": "%s: %s" % (type(e).__name__, e)}
+    else:
+        return {"ok": False, "papers": [], "error": last_err or "未知错误"}
+
+    # 分级过滤: 先严格(匹配全部实词), 不足再用宽松(匹配任一实词)补足。
+    # 目的: 优先保证精确性, 同时避免严格过滤导致 0 结果(如 "void states"
+    #       在论文标题里常写作 "void regions"/"void elements")。
+    raw = []
     for w in data.get("results", []):
         title = (w.get("title") or "").strip()
         if not title:
             continue
-        if not _is_relevant(title, term):
-            continue
-        papers.append({
+        raw.append({
             "title": title,
             "year": w.get("publication_year"),
             "cited": w.get("cited_by_count", 0),
         })
-        if len(papers) >= max_results:
-            break
+
+    strict = [p for p in raw if _is_relevant(p["title"], term, strict=True)]
+    papers = strict[:max_results]
+    for p in papers:
+        p["relevance"] = "strong"        # 标题含全部实词, 强证据
+    if len(papers) < max_results:
+        seen = {p["title"] for p in papers}
+        loose = [p for p in raw
+                 if p["title"] not in seen
+                 and _is_relevant(p["title"], term, strict=False)]
+        for p in loose:
+            p["relevance"] = "weak"      # 仅含部分实词, 可能领域偏移
+        papers += loose[:max_results - len(papers)]
+
     return {"ok": True, "papers": papers, "error": None}
 
 
@@ -207,9 +251,14 @@ def build_report(src_path, results, elapsed):
             lines.append("")
             continue
         lines.append("- 文献语境证据：")
+        n_weak = sum(1 for p in res["papers"] if p.get("relevance") == "weak")
+        if n_weak:
+            lines.append("  - ⚠️ 其中 **%d 条为弱证据**（标题仅含部分词，可能领域偏移），"
+                         "请优先参考未标记的强证据" % n_weak)
         for p in res["papers"]:
             y = p["year"] if p["year"] else "n.d."
-            lines.append("  - (%s, 被引 %d) %s" % (y, p["cited"], p["title"]))
+            tag = "  [弱]" if p.get("relevance") == "weak" else ""
+            lines.append("  - (%s, 被引 %d)%s %s" % (y, p["cited"], tag, p["title"]))
         lines.append("")
 
     return "\n".join(lines)
@@ -234,7 +283,9 @@ def main():
     ap = argparse.ArgumentParser(description="存疑术语联网查证器")
     ap.add_argument("src", nargs="?", help="存疑清单 .md 路径（默认取最新一份）")
     ap.add_argument("--limit", type=int, default=0, help="只查前 N 个术语（0=全部）")
-    ap.add_argument("--delay", type=float, default=1.0, help="请求间隔秒数（礼貌限流）")
+    ap.add_argument("--delay", type=float, default=2.0,
+                    help="请求间隔秒数（礼貌限流）。默认 2.0s；"
+                         "2026-09-02 实测 1.0s 时 18 个术语有 5 个遭 HTTP 429")
     ap.add_argument("--per-term", type=int, default=5, help="每术语取多少篇文献")
     ap.add_argument("--context", default=os.getenv("TERM_CONTEXT", ""),
                     help="领域上下文词，会拼到检索词后以提升通用短词的召回精度 "
