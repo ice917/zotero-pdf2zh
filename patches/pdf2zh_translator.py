@@ -618,6 +618,55 @@ class OpenAITranslator(BaseTranslator):
         # [自研补丁 2026-09-03] 机械伤清洗: 初译入库前整形(不开润色也生效)
         return self._clean_cjk_typography(content)
 
+    def prompt(
+        self, text: str, prompt_template: Template | None = None
+    ) -> list[dict[str, str]]:
+        """[自研补丁 2026-09-07] 初译术语表注入。
+
+        背景: 术语表原先只进润色 prompt, 初译(默认模板)对术语表一无所知;
+        润色修订虽能纠正术语误译, 但修订稿可能被占位符保护/锚点断言回退到
+        初译(占位符密集段高发), 于是终稿落回"从未见过术语表"的初译
+        (实例: Melhani 标题 in-silico → "硅基准验证")。
+        修法: 在初译 user 消息前注入**与本段文本匹配的**术语条目 ——
+        初译第一次就译对, 回退也无害。按需注入控制增量 token(全表仅
+        注入命中条目); 不开润色(纯初译)时同样生效。
+        缓存一致性: 术语表内容通过 init 时登记的 polish_glossary_fp 进入
+        缓存键, 表更新后旧缓存自动失效。"""
+        messages = super().prompt(text, prompt_template)
+        try:
+            # getattr 防御: init 期间 add_cache_impact_parameters("prompt", ...)
+            # 会先于 _polish_* 属性赋值调用本方法, 此时静默跳过注入。
+            glossary = getattr(self, "_polish_glossary", None)
+            glossary_path = getattr(self, "_polish_glossary_path", None)
+            if glossary is None and glossary_path:
+                self._polish_glossary = glossary = self._load_polish_glossary()
+            if glossary and messages:
+                # 归一化匹配: 占位符会把术语隔断(实例: In{v3}Silico 匹配不到
+                # in-silico), 故对两侧先剥离 {vN} 再压缩为 [a-z0-9] 比较。
+                def _norm(s: str) -> str:
+                    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+                text_norm = _norm(re.sub(r"\{v\d+\}", "", text or ""))
+                terms = "\n".join(
+                    f"- {k} => {v}"
+                    for k, v in glossary.items()
+                    if _norm(k) and _norm(k) in text_norm
+                )
+                if terms:
+                    block = (
+                        "Glossary of mandatory translations (use exactly these "
+                        "translations, keep them consistent; a {vN} placeholder "
+                        "inside a term is part of that term):\n"
+                        f"{terms}\n\n"
+                    )
+                    for m in messages:
+                        if m.get("role") == "user":
+                            m["content"] = block + m["content"]
+                            break
+        except Exception:
+            logging.exception("Init-prompt glossary injection failed, ignore it.")
+        return messages
+
     def _load_polish_glossary(self) -> dict:
         path = self._polish_glossary_path
         if not path:
@@ -870,6 +919,10 @@ class OpenAITranslator(BaseTranslator):
 
         if self._polish_reflect:
             # 阶段1: 审校批判 (忠实性优先, 流畅性其次)
+            # [自研补丁 2026-09-07] 输出纪律: 早期版本不限长度, 批判输出人均
+            # 2.5K token(审校报告 266 段写出 1.2MB), 绝大多数是复述原文的低价值
+            # 建议; 且批判几乎从不"无问题" → 修订调用几乎必发。限流后批判输出
+            # 预期降至 ~600 token, 全链省 ~40% token。
             critique_sys = (
                 "你是资深学术译审, 对机器初译进行严格审校。只输出修改建议清单, 分三组:\n"
                 "【忠实性】漏译/加译/错译/数字单位错误/逻辑扭曲, 逐条给出位置和改法;\n"
@@ -883,7 +936,10 @@ class OpenAITranslator(BaseTranslator):
                 "不列入: 术语表未收录但译法属学界标准译法的词条(例: topology optimization=拓扑优化);\n"
                 "不列入: 占位符导致的语义不完整; 不列入: 一般性措辞优劣。\n"
                 "若无符合上述条件者, 此组输出: 无存疑\n"
-                "不输出译文本身。若三组均无内容, 只输出: 无明显问题"
+                "不输出译文本身。若三组均无内容, 只输出: 无明显问题\n"
+                "输出纪律(必须遵守): 每组最多 3 条、按影响程度排序; 每条不超过 60 字, "
+                "格式为\"位置 → 改法\"; 严禁复述原文或译文整句来\"说明问题\", "
+                "只写最小可执行的修正指令。"
             )
             critique = self._polish_llm([
                 {"role": "system", "content": critique_sys},
@@ -912,7 +968,12 @@ class OpenAITranslator(BaseTranslator):
                     {"role": "user", "content": (
                         guideline_block
                         + f"审校建议(逐条落实):\n{critique}\n\n"
-                        + base_block + "修订后的译文:"
+                        # [自研补丁 2026-09-07] 修订瘦身: 不再重复注入前文 context
+                        # (批判阶段已看过, 修订是局部改写用不到跨段上下文),
+                        # 只保留 领域+公式对照+术语记忆+原文+初译 —— 省去每次
+                        # 修订调用约 1-2K 输入 token。
+                        + self._polish_blocks(source, target, terms, "")
+                        + "修订后的译文:"
                     )},
                 ])
         else:

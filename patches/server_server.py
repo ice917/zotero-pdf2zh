@@ -530,6 +530,27 @@ class PDFTranslator:
         return None
 
     @staticmethod
+    def _completed_task_id_for_file(file_name):
+        """[自研补丁 2026-09-07] 同文件名且已成功完成的最近任务 ID(无则 None)。
+
+        背景: 插件挂载靠"自己持有的 taskId 轮询"会话, 外部直提(API/脚本)
+        的任务完成后插件无感知; 且去重只查活跃任务 → 插件重提同名文件会
+        触发无谓重跑(即使缓存命中也要等排版)。查 history 后, 插件拿到历史
+        taskId 轮询 /api/history 直接命中 fileList → 秒级下载挂载, 零重跑。
+        注: history 为内存态, server 重启后自然退回重跑路径(缓存兜底)。"""
+        if not file_name:
+            return None
+        try:
+            for hist in task_manager.get_history():
+                if (hist.get('fileName') == file_name
+                        and hist.get('status') == 'success'
+                        and (hist.get('fileList') or hist.get('filePaths'))):
+                    return hist.get('taskId')
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
     def _release_inflight(file_name, task_id):
         """[自研补丁] 释放在途文件名登记(仅当登记者仍是本任务)"""
         if not file_name:
@@ -552,6 +573,13 @@ class PDFTranslator:
             dup = self._active_task_id_for_file(fname) or _INFLIGHT_FILES.get(fname)
             if dup and dup != task_id:
                 return dup, fname
+            # [自研补丁 2026-09-07] 已完成同名任务复用: 返回历史 taskId。
+            # 新插件: accepted+taskId → 轮询 /api/history 命中 → 秒挂载;
+            # 旧插件同步协议: _wait_for_task_payload 的 history 分支返回
+            # complete_task 存的 result payload, 同样直达产物。均零重跑。
+            dup_done = self._completed_task_id_for_file(fname)
+            if dup_done:
+                return dup_done, fname
             _INFLIGHT_FILES[fname] = task_id
             return None, fname
 

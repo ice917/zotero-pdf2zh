@@ -417,7 +417,138 @@ class TranslateConverter(PDFConverterEx):
 
             return re.sub(r"\{v(\d+)\}", repl, text)
 
+        # [自研补丁 2026-09-07] 混合占位符首尾标点整形(v20 的补集):
+        # v20 只消除"孤立纯标点"占位符; 实际 PDF 中标点常与数字/字母连成
+        # 同一 var 段(如 ", 2006" "3 (" "(3)"), 整段回填时首尾半角标点
+        # 夹在汉字之间形成机械伤(实例: "新泽西州, 2006." "步骤 3 ( 窗口")。
+        # 本函数把这类混合段的**首尾标点**抽出来整形(句读转全角, 连字符/
+        # 方括号删除, 圆括号转全角), 剩余主体重开 var 条目继续原字体回填。
+        # 安全边界: 中段标点不动(小数点/千分位/复合词天然安全); 主体缺失
+        # (纯标点)不动 —— 由 v20 处理; 含字母数字以外的主体结构(如希腊字母
+        # 上下标混排的真公式)不动; 邻接非汉字不动; 新增 var 条目只增不改,
+        # 原条目不再被引用即不会被渲染, 无副作用。
+        _MIX_PUNCT = "-[]{}.,;:()"
+        _MIX_RE = re.compile(
+            r"([-\[\]{}.,;:()\s]*)([0-9A-Za-z][0-9A-Za-z\s]*[0-9A-Za-z%]|[0-9A-Za-z])([-\[\]{}.,;:()\s]*)"
+        )
+
+        def _map_head_punct(ch: str) -> str:
+            # 段首标点: 句点多为编号/缩写点(Fig. / No.), 删除比转句号安全
+            return {
+                ",": "，", ";": "；", ":": "：", ".": "",
+                "(": "（", ")": "）",
+            }.get(ch, "")
+
+        def _map_tail_punct(ch: str) -> str:
+            return {
+                ",": "，", ".": "。", ";": "；", ":": "：",
+                "(": "（", ")": "）",
+            }.get(ch, "")
+
+        def _split_mixed_placeholders(text: str) -> str:
+            def _norm(ch) -> str:
+                t = ch.get_text()
+                m = re.match(r"\(cid:(\d+)\)", t)
+                return chr(int(m.group(1))) if m else t
+
+            def repl(m):
+                idx = int(m.group(1))
+                if idx >= len(var):
+                    return m.group(0)
+                chars = var[idx]
+                content = "".join(_norm(c) for c in chars).strip()
+                if not content or re.fullmatch(
+                    r"[-\[\]{}.,;:()]+", content
+                ):
+                    return m.group(0)  # 纯标点: 交给 v20
+                mm = _MIX_RE.fullmatch(content)
+                if not mm:
+                    return m.group(0)  # 含其他结构 → 真公式等, 不动
+                head_raw, _body, tail_raw = mm.group(1), mm.group(2), mm.group(3)
+                # 负数守卫: "-5" 的连字符是真负号, 删除会破坏语义
+                # (装饰断字符 "-level" 的 body 以字母开头, 不受影响)。
+                if (head_raw.rstrip().endswith("-") and _body[:1].isdigit()) or (
+                    tail_raw.lstrip().startswith("-") and _body[-1:].isdigit()
+                ):
+                    return m.group(0)
+                head = "".join(_map_head_punct(c) for c in head_raw.strip())
+                tail = "".join(_map_tail_punct(c) for c in tail_raw.strip())
+                # 触发判定用原始标点段(非映射结果): 删除型标点(如连字符)映射后
+                # 为空串, 但仍需重开 var 把该字符从回填流中剔除。
+                if not head_raw.strip() and not tail_raw.strip():
+                    return m.group(0)
+                start, end = m.span()
+                left = text[start - 1] if start > 0 else ""
+                right = text[end] if end < len(text) else ""
+
+                def cjkish(c):
+                    return bool(c) and (
+                        "\u4e00" <= c <= "\u9fff" or c in "，。；：！？、《》（）"
+                    )
+
+                if not (cjkish(left) or cjkish(right)):
+                    return m.group(0)
+                # 主体重开 var 条目: 保留 body 对应的原字符(原字体回填),
+                # 剔除首尾标点字符; 主体内部空格随边界自然收拢。
+                body_chars = _extract_body_chars(chars, _body, _norm)
+                if not body_chars:
+                    return m.group(0)
+                new_id = len(var)
+                var.append(body_chars)
+                varl.append([])
+                varf.append(0)
+                # 宽度按主体首尾字符的横向跨度重算, 供排版用
+                try:
+                    _l = max(c.x1 for c in body_chars) - body_chars[0].x0
+                except Exception:
+                    _l = vlen[idx]
+                vlen.append(_l)
+                return f"{head}{{v{new_id}}}{tail}"
+
+            def _extract_body_chars(chars, body, norm):
+                """按原字符流顺序取出组成 body 的连续字符(含主体内部空格)。"""
+                # 去掉首尾标点/空格后, body 与 chars 的尾段子序列一一对应;
+                # 用双指针从两端向内收缩, 跳过首尾的标点与空格。
+                seq = [norm(c) for c in chars]
+                lo, hi = 0, len(chars) - 1
+                body_stripped = body.replace(" ", "")
+                # 从左找第一个属于 body 的字符: 逐个消费 head 部分
+                target = list(body_stripped)
+                ti = 0
+                picked = []
+                started = False
+                for c, n in zip(chars, seq):
+                    if not started:
+                        if n == " " or n in _MIX_PUNCT:
+                            continue  # 尚在 head 区
+                        started = True
+                    if n == " ":
+                        # 主体内部空格: 仅当后面还有 body 字符才保留
+                        picked.append(c)
+                        continue
+                    if ti < len(target) and n == target[ti]:
+                        picked.append(c)
+                        ti += 1
+                    else:
+                        # 主体结束后的 tail 字符或异常字符: 停止收取
+                        if ti >= len(target):
+                            break
+                        # 异常(匹配错位): 保守放弃整段整形
+                        return []
+                if ti != len(target):
+                    return []
+                # 去掉尾部多余空格字符
+                while picked and picked[-1].get_text() == " ":
+                    picked.pop()
+                return picked
+
+            return re.sub(r"\{v(\d+)\}", repl, text)
+
         news = [_strip_punct_placeholders(n) for n in news]
+        try:
+            news = [_split_mixed_placeholders(n) for n in news]
+        except Exception:
+            pass  # 整形失败不阻塞翻译, 退化为 v20 行为
         news = [re.sub(r"([，。；：！？、])\1+", r"\1", n) for n in news]
 
         ############################################################
