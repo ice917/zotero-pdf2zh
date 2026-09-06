@@ -18,12 +18,40 @@ def _package_name(requirement: str) -> str:
 
 
 def _merge_managed_requirements(default_items: list, current_items: list) -> list:
-    """Use release constraints for managed packages and preserve user extras."""
+    """Use release constraints for managed packages and preserve user extras.
+
+    [自研补丁 2026-09-03] 用户手动钉死版本的托管包(包名后带版本说明符,
+    如 ``pdf2zh==1.9.11``)必须保留用户钉版; 旧实现每次启动迁移都用 release
+    默认约束覆写, 用户锁的版本静默丢失。未钉版的托管包仍跟随 release 约束,
+    额外包原样保留。
+    """
     defaults = [str(item) for item in default_items]
     current = [str(item) for item in current_items]
     managed_names = {_package_name(item) for item in defaults}
-    extras = [item for item in current if _package_name(item) not in managed_names]
-    return defaults + extras
+
+    def _has_version_pin(requirement: str) -> bool:
+        tail = requirement[len(_package_name(requirement)):]
+        return bool(re.search(r"[<>=!~]", tail))
+
+    user_pinned = {
+        _package_name(item): item
+        for item in current
+        if _package_name(item) in managed_names and _has_version_pin(item)
+    }
+
+    merged = []
+    seen = set()
+    for item in defaults:
+        name = _package_name(item)
+        merged.append(user_pinned.get(name, item))
+        seen.add(name)
+    for item in current:
+        name = _package_name(item)
+        if name in managed_names or name in seen:
+            continue
+        merged.append(item)
+        seen.add(name)
+    return merged
 
 
 def _merge_defaults(default: Any, current: Any) -> Any:
@@ -110,8 +138,17 @@ def _migrate_json(active: Path, example: Path) -> None:
     try:
         with active.open("r", encoding="utf-8") as handle:
             current = json.load(handle)
-    except Exception as exc:
-        backup = _backup_invalid(active)
+    except ValueError as exc:
+        # [自研补丁 2026-09-03] 仅"解析失败"(JSONDecodeError 等 ValueError)
+        # 才允许备份+恢复默认; OSError/PermissionError(文件被占用)等
+        # 一律跳过迁移并告警, 绝不覆写用户配置
+        backup = None
+        try:
+            backup = _backup_invalid(active)
+        except Exception as bak_exc:
+            print(f"⚠️ [配置文件] {active.name} 备份失败 ({bak_exc})，"
+                  f"放弃恢复默认以保护用户配置。")
+            return
         _atomic_write_text(
             active,
             json.dumps(defaults, ensure_ascii=False, indent=4) + "\n",
@@ -120,6 +157,10 @@ def _migrate_json(active: Path, example: Path) -> None:
             f"⚠️ [配置文件] {active.name} 无法解析 ({exc})；"
             f"已备份到 {backup.name} 并恢复默认配置。"
         )
+        return
+    except OSError as exc:
+        print(f"⚠️ [配置文件] {active.name} 读取失败 ({exc})，"
+              f"本次跳过迁移，保留现有文件不动。")
         return
 
     merged = _merge_defaults(defaults, current)
@@ -143,13 +184,24 @@ def _migrate_toml(active: Path, example: Path) -> None:
 
     try:
         current = toml.load(active)
-    except Exception as exc:
-        backup = _backup_invalid(active)
+    except ValueError as exc:
+        # [自研补丁 2026-09-03] 同 JSON 分支: 仅解析失败才恢复默认
+        backup = None
+        try:
+            backup = _backup_invalid(active)
+        except Exception as bak_exc:
+            print(f"⚠️ [配置文件] {active.name} 备份失败 ({bak_exc})，"
+                  f"放弃恢复默认以保护用户配置。")
+            return
         _atomic_write_text(active, toml.dumps(defaults))
         print(
             f"⚠️ [配置文件] {active.name} 无法解析 ({exc})；"
             f"已备份到 {backup.name} 并恢复默认配置。"
         )
+        return
+    except OSError as exc:
+        print(f"⚠️ [配置文件] {active.name} 读取失败 ({exc})，"
+              f"本次跳过迁移，保留现有文件不动。")
         return
 
     merged = _merge_defaults(defaults, current)

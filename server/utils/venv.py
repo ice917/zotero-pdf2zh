@@ -7,6 +7,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import threading
 import traceback
 from collections import defaultdict
 from pathlib import Path
@@ -87,6 +88,12 @@ class VirtualEnvManager:
         self.curr_env_path = None
         self.conda_env_path = defaultdict(lambda: None)
         self.ensured_env = defaultdict(lambda: None)
+        # [自研补丁 2026-09-03] 环境操作锁(报告 🔴2): 单例被所有任务线程共享,
+        # 旧实现无任何同步, 两个任务并发 ensure_env/install_packages 会同时
+        # 对同一环境跑 uv/pip 安装 → site-packages 损坏。RLock 可重入,
+        # ensure_env 内调 install_packages 不死锁; 环境就绪后缓存命中路径
+        # 持锁仅为几条路径判断, 开销可忽略。
+        self._env_lock = threading.RLock()
 
         # Respect the user's selected manager when checking the existing env.
         # Only explicit `auto` may discover either uv or conda.
@@ -244,6 +251,13 @@ class VirtualEnvManager:
         return self._requirements_ok(engine, envtool, existing[2])
 
     def install_packages(self, engine, envtool, envname=None, force_reinstall=False):
+        # [自研补丁 2026-09-03] 全程持锁, 串行化一切环境变更(报告 🔴2)
+        with self._env_lock:
+            return self._install_packages_locked(
+                engine, envtool, envname=envname,
+                force_reinstall=force_reinstall)
+
+    def _install_packages_locked(self, engine, envtool, envname=None, force_reinstall=False):
         if self.skip_install:
             print(f"⚠️ skip_install=True，不修改 {engine} 环境")
             return self.check_env(engine, envtool)
@@ -263,15 +277,29 @@ class VirtualEnvManager:
         return self.install_packages(engine, envtool)
 
     def ensure_env(self, engine):
+        # [自研补丁 2026-09-03] check-then-act 全程持锁(报告 🔴2):
+        # 缓存判定/环境发现/修复安装成为原子操作, 并发任务在此排队。
+        with self._env_lock:
+            return self._ensure_env_locked(engine)
+
+    def _ensure_env_locked(self, engine):
         cached = self.ensured_env.get(engine)
         if cached:
             tool, _, cached_path = cached
-            existing = self._existing(engine, tool)
-            if existing and str(existing[1]) == cached_path:
-                self.curr_envtool = tool
-                self.curr_envname = self.env_name.get(engine, ENGINE_ENV_NAMES[engine])
-                self.curr_env_path = cached_path
-                return True
+            # [自研补丁 2026-09-03] 缓存命中降级为廉价的路径存在性检查:
+            # 旧实现每次翻译都调 _existing(), conda 用户会因此 fork 一个
+            # `conda info --json` 子进程(数百 ms~秒级), 超时还可能误判环境
+            # 不存在而误入重装。环境真损坏时翻译子进程会自行失败, 下次重建。
+            try:
+                env_dir = Path(cached_path)
+                python_path = resolve_environment_python(env_dir)
+                if env_dir.exists() and python_path.exists():
+                    self.curr_envtool = tool
+                    self.curr_envname = self.env_name.get(engine, ENGINE_ENV_NAMES[engine])
+                    self.curr_env_path = cached_path
+                    return True
+            except Exception:
+                pass
             self.ensured_env[engine] = None
 
         # Discover first, mutate second. In auto mode a healthy existing conda
@@ -346,16 +374,23 @@ class VirtualEnvManager:
         return None
 
     def get_conda_bin_dir(self):
+        """[自研补丁 2026-09-03] 统一返回 Optional[str]; 旧实现 False/str/None 三态。"""
         if self.curr_envtool != "conda" or not self.curr_envname:
-            return False
+            return None
         env_path = self._get_conda_env_path(self.curr_envname)
         if not env_path:
-            return False
+            return None
         bin_dir = os.path.join(env_path, "Scripts" if self.is_windows else "bin")
-        return bin_dir if os.path.exists(bin_dir) else False
+        return bin_dir if os.path.exists(bin_dir) else None
 
-    def _resolved_command(self, command):
-        engine = "pdf2zh_next" if "pdf2zh_next" in " ".join(command).lower() else "pdf2zh"
+    def _resolved_command(self, command, engine=None):
+        # [自研补丁 2026-09-03] 引擎识别改为调用方显式传参; 旧实现
+        # `"pdf2zh_next" in " ".join(command)` 扫描整条命令行, 文件名含
+        # "pdf2zh_next" 的 PDF 会误判引擎, 非 str 元素还会 TypeError。
+        # 兜底仅检查命令首项(可执行名), 不扫描文件名参数。
+        if engine is None:
+            head = str(command[0]).lower() if command else ""
+            engine = "pdf2zh_next" if "pdf2zh_next" in head else "pdf2zh"
         if not self.ensure_env(engine):
             raise RuntimeError(
                 f"无法准备可用的 {engine} 托管翻译环境。Server 本身仍可运行，"
@@ -390,9 +425,9 @@ class VirtualEnvManager:
         )
         return final_cmd, env
 
-    def get_command_and_env(self, command):
+    def get_command_and_env(self, command, engine=None):
         try:
-            return self._resolved_command(command)
+            return self._resolved_command(command, engine)
         except Exception as exc:
             print(f"⚠️ 获取虚拟环境命令失败: {exc}")
             traceback.print_exc()

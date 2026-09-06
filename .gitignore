@@ -1,4 +1,4 @@
-﻿server/translated/
+server/translated/
 server/fonts/
 server/__pycache__/
 server/utils/__pycache__/
@@ -6,6 +6,7 @@ server/zip/
 server.zip
 # 密钥文件不入库（模板见 server/config/config.example.json）
 server/config/config.json
+server/config/config.json.task
 logs/*.log
 *.staging
 *.backup

@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import html
 import json
 import logging
@@ -445,6 +446,8 @@ class OpenAITranslator(BaseTranslator):
         self.add_cache_impact_parameters("prompt", self.prompt("", self.prompttext))
         think_filter_regex = r"^<think>.+?\n*(</think>|\n)*(</think>)\n*"
         self.add_cache_impact_parameters("think_filter_regex", think_filter_regex)
+        # [自研补丁 2026-09-03] 机械伤清洗版本号: 清洗规则变更后旧缓存自动失效
+        self.add_cache_impact_parameters("typo_clean", "v1")
         self.think_filter_regex = re.compile(think_filter_regex, flags=re.DOTALL)
         # 润色钩子配置: POLISH=1 开启, POLISH_GLOSSARY 为可选术语表 CSV, POLISH_MODEL 可选指定润色模型
         self._polish_enabled = str(self.envs.get("POLISH", "")).lower() in ("1", "true", "on")
@@ -506,12 +509,78 @@ class OpenAITranslator(BaseTranslator):
         if self._polish_reflect:
             self.add_cache_impact_parameters("polish_reflect", "on")
 
+        # [自研补丁 2026-09-03] 润色配置指纹进缓存键: 旧实现只登记了
+        # polish/anchor/reflect 三个开关, POLISH_MODEL/DOMAIN/GUIDELINE/
+        # FORMULA_MAP 开关及 terms.csv 内容变化后重翻仍命中旧缓存
+        # ("改了配置/术语表没生效")。文件用 mtime+size+内容 md5 做指纹。
+        if self._polish_enabled:
+            def _polish_file_fingerprint(path):
+                try:
+                    if not path:
+                        return "unset"
+                    st = os.stat(path)
+                    digest = hashlib.md5()
+                    with open(path, "rb") as fh:
+                        for chunk in iter(lambda: fh.read(65536), b""):
+                            digest.update(chunk)
+                    return f"{int(st.st_mtime)}_{st.st_size}_{digest.hexdigest()[:12]}"
+                except Exception:
+                    return "missing"
+
+            self.add_cache_impact_parameters(
+                "polish_model", str(self.envs.get("POLISH_MODEL") or ""))
+            self.add_cache_impact_parameters(
+                "polish_domain", self._polish_domain or "")
+            self.add_cache_impact_parameters(
+                "polish_formula_map", "on" if self._polish_formula_map else "off")
+            self.add_cache_impact_parameters(
+                "polish_formula_hint", "on" if self._polish_formula_hint else "off")
+            self.add_cache_impact_parameters(
+                "polish_glossary_fp",
+                _polish_file_fingerprint(self._polish_glossary_path))
+            self.add_cache_impact_parameters(
+                "polish_guideline_fp",
+                _polish_file_fingerprint(self._polish_guideline_path))
+
     @property
     def _polish_context(self):
         """线程局部的上下文窗口 (并发翻译时每条线程独立维护自己的前文)."""
         if not hasattr(self._tls, "polish_ctx"):
             self._tls.polish_ctx = deque(maxlen=3)
         return self._tls.polish_ctx
+
+    # --------------------------------------------------------------
+    # [自研补丁 2026-09-03] 中文排版机械伤清洗 (确定性正则, 不经 LLM, 幂等):
+    # 治两类高频观感伤 —— ① 汉字间残留连接符(PDF 断行词/合成词直译):
+    # "鱼类-式"→"鱼式"、"模型 - 化"→"模型化"; ② 汉字邻接的半角标点残留/
+    # 双标点: "变形,产生"→"变形，产生"、"系统.等"→"系统。等"、",，"→"，"。
+    # 负面清单(不触发): 数字小数点(3.12)、数字范围(1-3)、{vN} 公式占位符、
+    # 纯英文内部标点 —— 所有规则均要求至少一侧紧邻汉字。
+    @staticmethod
+    def _clean_cjk_typography(text: str) -> str:
+        if not text or not re.search(r"[\u4e00-\u9fff]", text):
+            return text
+        c = text
+        # ① 汉字-汉字(允许中间空白)的连接符删除; 英文复合词不受影响
+        c = re.sub(r"(?<=[\u4e00-\u9fff])\s*-\s*(?=[\u4e00-\u9fff])", "", c)
+        # ②a 汉字后(允许隔空白)紧跟的半角标点转全角 (左侧为数字的小数点不触发)
+        c = re.sub(r"(?<=[\u4e00-\u9fff])\s*,\s*", "，", c)
+        c = re.sub(r"(?<=[\u4e00-\u9fff])\s*;\s*", "；", c)
+        c = re.sub(r"(?<=[\u4e00-\u9fff])\s*:\s*", "：", c)
+        c = re.sub(r"(?<=[\u4e00-\u9fff])\s*\?\s*", "？", c)
+        c = re.sub(r"(?<=[\u4e00-\u9fff])\s*!\s*", "！", c)
+        # 句点: 汉字后(允许隔空白)的 '.' 仅当其后不是字母/数字时判为句尾残留
+        c = re.sub(r"(?<=[\u4e00-\u9fff])\s*\.(?![0-9A-Za-z])", "。", c)
+        # ②b 汉字前紧贴的半角逗号/分号 (如 ",但")
+        c = re.sub(r"\s*,\s*(?=[\u4e00-\u9fff])", "，", c)
+        c = re.sub(r"\s*;\s*(?=[\u4e00-\u9fff])", "；", c)
+        # ③ 含汉字的半角括号对转全角 (公式/纯英文括号不受影响)
+        c = re.sub(r"\(([^()]*[\u4e00-\u9fff][^()]*)\)", r"（\1）", c)
+        # ④ 标点归一: 连续同类标点收敛 + 常见错序对修正
+        c = re.sub(r"([，。；：！？、])\1+", r"\1", c)
+        c = re.sub(r"，、", "、", c)
+        c = re.sub(r"([。！？])，", r"\1", c)
+        return c
 
     @retry(
         retry=retry_if_exception_type(openai.RateLimitError),
@@ -533,7 +602,8 @@ class OpenAITranslator(BaseTranslator):
                 raise ValueError("Error response from Service", response.error)
         content = response.choices[0].message.content.strip()
         content = self.think_filter_regex.sub("", content).strip()
-        return content
+        # [自研补丁 2026-09-03] 机械伤清洗: 初译入库前整形(不开润色也生效)
+        return self._clean_cjk_typography(content)
 
     def _load_polish_glossary(self) -> dict:
         path = self._polish_glossary_path
@@ -771,6 +841,12 @@ class OpenAITranslator(BaseTranslator):
             + term_memory_block
             + self._polish_blocks(source, target, terms, context)
         )
+        # [自研补丁 2026-09-03] 排版规则提示(双保险之一): 确定性清洗
+        # _clean_cjk_typography 在译文出院前兜底, 此规则让 LLM 从源头少产出
+        typo_rule = (
+            "排版要求: 中文译文中不得残留半角标点(如 , . ; : ? !); 汉字之间不得出现连接符\"-\", "
+            "原文因 PDF 断行被拆开的英文合成词(如 fish-like 被拆成 fish- 与 like)应合并还原后再翻译。\n"
+        )
         # [自研补丁] 公式占位符可读性提示 (POLISH_FORMULA_HINT=1 时启用)
         formula_hint_rule = (
             "6. 若原文含 {v数字} 占位符(公式片段), 可在该占位符紧邻处用全角括号补一句极简短的"
@@ -815,6 +891,7 @@ class OpenAITranslator(BaseTranslator):
                     "3. 严禁修改任何形如 {{v数字}} 的占位符(公式/富文本标记), 必须原样保留;\n"
                     "4. 术语必须与术语表一致, 与前文译文译法保持一致;\n"
                     "5. 只输出修订后的译文, 不要任何解释或前后缀。\n"
+                    + typo_rule
                     + formula_hint_rule
                 )
                 content = self._polish_llm([
@@ -833,6 +910,7 @@ class OpenAITranslator(BaseTranslator):
                 "2. 严禁修改任何形如 {{v数字}} 的占位符(公式/富文本标记), 必须原样保留, 数量与编号都不能变。\n"
                 "3. 专业术语译法必须与术语表一致; 与前文译文中已采用的译法保持前后一致。\n"
                 "4. 只输出润色后的译文, 不要任何解释或前后缀。\n"
+                + typo_rule
                 + formula_hint_rule
             )
             content = self._polish_llm([
@@ -867,6 +945,8 @@ class OpenAITranslator(BaseTranslator):
         if src_ph != dst_ph:
             logger.warning("Polish broke placeholders, fall back to raw translation.")
             content = target
+        # [自研补丁 2026-09-03] 机械伤清洗: 润色/回退初译后的最终整形(幂等)
+        content = self._clean_cjk_typography(content)
         self._polish_context.append((source, content))
 
         # 审校报告与存疑清单落盘 (仅反思模式且批判有效时)

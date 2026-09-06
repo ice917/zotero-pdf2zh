@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -96,23 +97,32 @@ def remove_stale_thinking_fields(translator: dict, effective_model: str) -> None
 
 
 def strip_thinking_fields_from_config(config_path: str) -> None:
-    """Best-effort rollback for runtimes that do not understand V4 fields."""
+    """Best-effort rollback for runtimes that do not understand V4 fields.
+
+    [自研补丁 2026-09-03] 旧实现 toml.load→dump 全量重写 config.toml,
+    用户手写注释全部丢失。改为行级精准删除: 仅移除顶层键名为这两个字段
+    的行(字段名足够特殊, 不会误伤其他表), 保留全部注释与格式。
+    """
     try:
-        config_data = toml.load(config_path)
-        detail = config_data.get("deepseek_detail")
-        if not isinstance(detail, dict):
-            return
-        changed = False
-        for key in (THINKING_MODE_FIELD, REASONING_EFFORT_FIELD):
-            if key in detail:
-                detail.pop(key, None)
-                changed = True
-        if changed:
+        with open(config_path, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+        key_patterns = [
+            re.compile(rf"^{re.escape(THINKING_MODE_FIELD)}\s*="),
+            re.compile(rf"^{re.escape(REASONING_EFFORT_FIELD)}\s*="),
+        ]
+        new_lines = []
+        removed = 0
+        for line in lines:
+            if any(pat.match(line.strip()) for pat in key_patterns):
+                removed += 1
+                continue
+            new_lines.append(line)
+        if removed:
             with open(config_path, "w", encoding="utf-8") as handle:
-                toml.dump(config_data, handle)
+                handle.writelines(new_lines)
             print(
                 "🧹 [DeepSeek V4] 当前运行时不支持思考控制；"
-                "已从 config.toml 移除仅新版本支持的字段。"
+                f"已从 config.toml 行级移除 {removed} 个仅新版本支持的字段(注释保留)。"
             )
     except Exception as exc:
         print(f"⚠️ [DeepSeek V4] 清理不兼容配置字段失败: {exc}")

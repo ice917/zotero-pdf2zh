@@ -1,3 +1,4 @@
+import copy
 import json
 import os
 import threading
@@ -123,11 +124,15 @@ class TaskManager:
     def get_active_tasks_list(self):
         with self.lock:
             tasks = list(self.active_tasks.values())
-            return tasks
+        # [自研补丁 2026-09-03] 返回深拷贝快照: complete_task 会在 worker
+        # 线程往任务 dict 新增键, SSE json.dumps 无锁遍历共享 dict 会抛
+        # "dictionary changed size during iteration", 恰好发生在任务完成瞬间
+        return copy.deepcopy(tasks)
 
     def get_history(self):
         with self.lock:
-            return list(self.progress_history)
+            history = list(self.progress_history)
+        return copy.deepcopy(history)
 
     def _delayed_remove(self, task_id):
         time.sleep(30)

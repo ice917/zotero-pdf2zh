@@ -198,6 +198,10 @@ class Cropper():
         修复：奇数页时，最后一页单独放在左侧，右侧留白
         """
         print(f"🐲 开始合并(Compare): {input_path} -> {output_path}")
+        # [自研补丁 2026-09-03] 句柄泄漏: 旧代码异常路径不 close 文档,
+        # Windows 下文件被占用, 后续同名操作抛 PermissionError
+        dual_pdf = None
+        output_pdf = None
         try:
             dual_pdf = fitz.open(input_path)
             output_pdf = fitz.open()
@@ -245,13 +249,16 @@ class Cropper():
 
             output_pdf.save(output_path, garbage=4, deflate=True)
             print(f"✅ 合并成功: {output_path}")
-
-            output_pdf.close()
-            dual_pdf.close()
             return output_path
         except Exception as e:
             traceback.print_exc()
             return None
+        finally:
+            # 正常/异常路径都确保关闭
+            if output_pdf is not None:
+                output_pdf.close()
+            if dual_pdf is not None:
+                dual_pdf.close()
 
     # -----------------------------------------------------------
     # Split / Convert (LR <-> TB)
@@ -295,7 +302,11 @@ class Cropper():
                 if os.path.abspath(str(dual_path)) != os.path.abspath(TB_dual_path):
                     shutil.copyfile(dual_path, TB_dual_path)
                 source = TB_dual_path
-            self.merge_pdf(source, LR_dual_path)
+            merged = self.merge_pdf(source, LR_dual_path)
+            # [自研补丁] merge_pdf 失败返回 None 时旧代码照常返回路径,
+            # 调用方稍后才以难懂的 FileNotFoundError 暴露
+            if not merged or not os.path.exists(LR_dual_path):
+                raise RuntimeError(f"TB→LR 合并失败, 未生成: {LR_dual_path}")
             return LR_dual_path, TB_dual_path
 
         if from_mode == 'LR' and to_mode == 'TB':

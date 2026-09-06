@@ -40,6 +40,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -274,6 +275,15 @@ def openalex_search(term, max_results=5, timeout=8, context="", max_retries=4):
                     wait = 2 ** (attempt + 1)      # 2s, 4s, 8s
                     time.sleep(wait)
                     continue
+            return {"ok": False, "papers": [], "error": last_err}
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            # [自研补丁 2026-09-03] 超时/连接重置/网络抖动同样退避重试,
+            # 旧实现只覆盖 HTTP 429/5xx, 网络类错误立即放弃导致整词漏检
+            last_err = "%s: %s" % (type(e).__name__, e)
+            if attempt < max_retries - 1:
+                wait = 2 ** (attempt + 1)
+                time.sleep(wait)
+                continue
             return {"ok": False, "papers": [], "error": last_err}
         except Exception as e:
             return {"ok": False, "papers": [], "error": "%s: %s" % (type(e).__name__, e)}

@@ -39,6 +39,17 @@ from utils.execute import execute_with_progress
 
 _VALUE_ERROR_RE = re.compile(r'(?m)^ValueError:\s*(?P<msg>.+)$')
 
+# [自研补丁 2026-09-03] 自动质检并发上限: 每个翻译任务收尾都会起后台 QC 线程,
+# 不加限制时批量提交会瞬时起多个 pypdf 进程抢内存
+_QC_SEMAPHORE = threading.Semaphore(2)
+
+# [自研补丁 2026-09-03] 同名任务幂等去重(报告 🔴4): 上传与产物都是确定性
+# 文件名, 重复点击/异步重试会让后到请求截断正在被子进程读取的输入文件、
+# 产物互相覆盖。接收请求即在此登记 fileName->taskId, 同文件名的并发请求
+# 直接复用进行中的任务; 任务结束(成功/失败)释放。
+_SUBMIT_LOCK = threading.Lock()
+_INFLIGHT_FILES = {}
+
 __version__ = "4.1.7"
 update_log = "远程/Docker 优先 HTTP 挂附件；新旧插件协议兼容；进度条显示翻译百分比；加固附件文件名；补齐额外字段白名单，可从下拉添加 *_enable_json_mode（默认关闭）。请同时更新插件和 Server。"
 
@@ -100,6 +111,9 @@ class PDFTranslator:
 
     def __init__(self, args):
         self.app = Flask(__name__)
+        # [自研补丁 2026-09-03] 请求体上限: base64 PDF 全量驻留内存,
+        # 不设上限时远程/本机异常客户端可用超大 body 打爆内存(Flask 自动回 413)
+        self.app.config['MAX_CONTENT_LENGTH'] = 500 * 1024 * 1024
         if args.enable_venv:
             self.env_manager = VirtualEnvManager(config_path[venv], venv_name, args.env_tool, args.enable_mirror, args.skip_install, args.mirror_source)
         self.cropper = Cropper()
@@ -269,12 +283,21 @@ class PDFTranslator:
         file_content = data.get('fileContent', '')
         if not isinstance(file_content, str):
             raise ValueError("Invalid PDF content")
-        if file_content.startswith('data:application/pdf;base64,'):
-            file_content = file_content[len('data:application/pdf;base64,'):]
+        # [自研补丁 2026-09-03] data URL 前缀兼容变体: 旧代码只识别精确小写
+        # 'data:application/pdf;base64,', 大小写差异或缺 MIME 的变体会整串进
+        # b64decode 产生垃圾文件。统一按 ';base64,' 标记截断(大小写不敏感)。
+        if file_content.lower().startswith('data:'):
+            marker = re.search(r';base64,', file_content, flags=re.IGNORECASE)
+            if marker:
+                file_content = file_content[marker.end():]
         try:
             decoded = base64.b64decode(file_content)
         except Exception as exc:
             raise ValueError(f"Invalid PDF content: {exc}") from exc
+
+        # [自研补丁] 解码后校验 %PDF 魔数: 拒绝截断/伪装/非 PDF 内容落盘
+        if not decoded.startswith(b'%PDF'):
+            raise ValueError("文件内容不是有效的 PDF (缺少 %PDF 文件头), 请检查上传内容")
 
         with open(input_path, 'wb') as f:
             f.write(decoded)
@@ -491,12 +514,104 @@ class PDFTranslator:
 
     ############################# 核心逻辑 #############################
     # 翻译 /translate
+    @staticmethod
+    def _active_task_id_for_file(file_name):
+        """[自研补丁 2026-09-03] 同文件名且仍在进行中的任务 ID(无则 None)"""
+        if not file_name:
+            return None
+        try:
+            for task in task_manager.get_active_tasks_list():
+                if (task.get('fileName') == file_name
+                        and task.get('active')
+                        and not task.get('finished')):
+                    return task.get('taskId')
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _release_inflight(file_name, task_id):
+        """[自研补丁] 释放在途文件名登记(仅当登记者仍是本任务)"""
+        if not file_name:
+            return
+        with _SUBMIT_LOCK:
+            if _INFLIGHT_FILES.get(file_name) == task_id:
+                _INFLIGHT_FILES.pop(file_name, None)
+
+    def _register_inflight(self, task_id):
+        """[自研补丁 2026-09-03] 同名任务幂等去重(报告 🔴4)。
+        在落盘上传文件**之前**调用: 命中进行中任务返回 (dup_id, file_name);
+        否则占位登记返回 (None, file_name); 无文件名返回 (None, None)。"""
+        data = request.get_json(silent=True) or {}
+        fname = None
+        if isinstance(data, dict):
+            fname = self._safe_upload_filename(data.get('fileName')) or None
+        if not fname:
+            return None, None
+        with _SUBMIT_LOCK:
+            dup = self._active_task_id_for_file(fname) or _INFLIGHT_FILES.get(fname)
+            if dup and dup != task_id:
+                return dup, fname
+            _INFLIGHT_FILES[fname] = task_id
+            return None, fname
+
+    def _wait_for_task_payload(self, task_id, timeout=1800):
+        """[自研补丁] 旧插件同步协议下等待复用任务结束, 返回其 success
+        payload; 任务失败/超时返回 None。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            active_task = None
+            for task in task_manager.get_active_tasks_list():
+                if task.get('taskId') == task_id:
+                    active_task = task
+                    break
+            if active_task is None:
+                # 已移出活跃列表(完成 30s 后清理), 查历史
+                for hist in task_manager.get_history():
+                    if hist.get('taskId') == task_id:
+                        return hist.get('result') if hist.get('status') == 'success' else None
+                return None
+            if not active_task.get('active'):
+                return active_task.get('result') if active_task.get('status') == '完成' else None
+            time.sleep(2)
+        return None
+
     def translate(self):
         # 生成任务ID并记录开始时间（用于 index.html 前端进度显示）
         task_id = str(uuid.uuid4())
         start_time = datetime.now()
+        inflight_name = None
 
         try:
+            # [自研补丁 2026-09-03] 同名任务幂等去重(报告 🔴4): 必须在
+            # process_request 落盘之前判定, 否则后到请求会截断正在被子进程
+            # 读取的输入文件、产物互相覆盖。
+            dup_id, fname = self._register_inflight(task_id)
+            if dup_id:
+                print(f"ℹ️ [/translate] 同名文件「{fname}」已有进行中任务 {dup_id}，复用该任务")
+                if self._client_wants_async_job():
+                    return jsonify({
+                        'status': 'accepted',
+                        'taskId': dup_id,
+                        'message': '该文件正在翻译中，已复用现有翻译任务',
+                    }), 200
+                # 旧插件同步协议: 等待复用任务结束后返回它的产物
+                payload = self._wait_for_task_payload(dup_id)
+                if payload and payload.get('status') == 'success':
+                    return jsonify(payload), 200
+                if self._active_task_id_for_file(fname):
+                    # 等待超时但任务仍在跑: 不能重提(会覆盖输入), 交回任务列表
+                    return jsonify({
+                        'status': 'accepted', 'taskId': dup_id,
+                        'message': '该文件翻译仍在进行中，请稍后在任务列表查看结果',
+                    }), 200
+                # 复用任务确已失败: 登记本任务重新翻译
+                with _SUBMIT_LOCK:
+                    _INFLIGHT_FILES.setdefault(fname, task_id)
+                inflight_name = fname
+            else:
+                inflight_name = fname
+
             input_path, config = self.process_request()
             infile_type = self.get_filetype(input_path)
             engine = config.engine
@@ -505,15 +620,29 @@ class PDFTranslator:
             )
 
             if infile_type != 'origin':
+                # [自研补丁 2026-09-03] 校验失败的上传件已落盘, 清理避免孤儿文件
+                try:
+                    os.remove(input_path)
+                except OSError:
+                    pass
+                self._release_inflight(inflight_name, task_id)
                 return jsonify({'status': 'error', 'message': 'Input file must be an original PDF file.'}), 400
+
+            def _guarded_worker():
+                # [自研补丁] 任务结束(成功/失败/异常)一定释放在途登记
+                try:
+                    return self._execute_translate_job(task_id, input_path, config, engine)
+                finally:
+                    self._release_inflight(inflight_name, task_id)
 
             return self._start_accepted_job(
                 task_id,
                 task_info,
-                lambda: self._execute_translate_job(task_id, input_path, config, engine),
+                _guarded_worker,
                 '/translate',
             )
         except Exception as e:
+            self._release_inflight(inflight_name, task_id)
             task_manager.complete_task(task_id, 'failed', str(e), error=str(e))
             return self._handle_exception(e, context='/translate')
 
@@ -538,10 +667,14 @@ class PDFTranslator:
                 crop_compare_path = self.get_filename_after_process(dual_path, 'crop-compare', engine)
                 self.cropper.crop_pdf(config, dual_path, 'dual', crop_compare_path, 'crop-compare')
                 addFileList(fileList, crop_compare_path)
-            if config.compare and config.babeldoc == False: # babeldoc不支持compare
-                compare_path = self.get_filename_after_process(dual_path, 'compare', engine)
-                self.cropper.merge_pdf(dual_path, compare_path)
-                addFileList(fileList, compare_path)
+            if config.compare:
+                if config.babeldoc:  # babeldoc 不支持 compare
+                    # [自研补丁] 旧代码静默跳过, 用户不知道为何没产物, 补日志
+                    print("ℹ️ babeldoc(pdf2zh 1.x 实验内核) 不支持 compare, 已跳过该产物")
+                else:
+                    compare_path = self.get_filename_after_process(dual_path, 'compare', engine)
+                    self.cropper.merge_pdf(dual_path, compare_path)
+                    addFileList(fileList, compare_path)
 
         elif engine == pdf2zh_next:
             print("🔍 [Zotero PDF2zh Server] PDF2zh_next 开始翻译文件...")
@@ -556,12 +689,20 @@ class PDFTranslator:
             fileList = []
             retList = self.translate_pdf_next(input_path, config, task_id)
 
+            # [自研补丁 2026-09-03] 产物守卫: 引擎只产出 mono/dual 之一或
+            # 零产物时, 旧代码 retList[1] 直接 IndexError, 报错无业务含义
+            if not retList:
+                raise ValueError("pdf2zh_next 未产出任何 mono/dual 文件, 请查看引擎日志确认失败原因")
             if config.no_mono:
                 dual_path = retList[0]
             elif config.no_dual:
                 mono_path = retList[0]
                 fileList.append(mono_path)
             else:
+                if len(retList) < 2:
+                    raise ValueError(
+                        f"pdf2zh_next 只产出了 1 个文件({os.path.basename(retList[0])}), "
+                        "但当前设置要求同时生成 mono 和 dual, 请检查 no_dual/no_mono 配置")
                 mono_path, dual_path = retList[0], retList[1]
                 fileList.append(mono_path)
 
@@ -643,7 +784,77 @@ class PDFTranslator:
             output_dir=payload['outputDir'],
             result=payload,
         )
+
+        # [自研补丁 2026-09-03] 翻译后自动质检: 后台线程跑 pre_check(翻前体检)
+        # + post_check(质检门禁), 报告写入 translated/review/, 失败只打日志,
+        # 绝不影响翻译主流程与响应。
+        # 兼容两种产物命名: pdf2zh 1.x 的 name-mono.pdf 与
+        # pdf2zh_next(BabelDOC) 的 name.{lang}.mono.pdf
+        mono_for_qc = next(
+            (p for p in existing
+             if p.endswith(('-mono.pdf', '.mono.pdf'))), None)
+        if mono_for_qc:
+            # [自研补丁 2026-09-03] 把任务实际跳页数传给 post_check(报告 🔴5):
+            # 质检只豁免末尾连续 skipLastPages 个原文保留页, 封堵文献页失败误放行
+            qc_skip_last = int(getattr(config, 'skip_last_pages', 0) or 0)
+            threading.Thread(
+                target=self._run_auto_qc,
+                args=(input_path, mono_for_qc, qc_skip_last),
+                daemon=True,
+            ).start()
+
         return payload
+
+    def _qc_python(self):
+        """[自研补丁] 质检脚本解释器: 优先用 pdf2zh 托管 venv 的 python
+        (内有 pypdf); sys.executable 是 uv 基础解释器, 没有质检依赖。"""
+        try:
+            existing = self.env_manager._existing(
+                "pdf2zh", self.env_manager.curr_envtool)
+            if existing and existing[2]:
+                return str(existing[2])
+        except Exception:
+            pass
+        return sys.executable
+
+    def _run_auto_qc(self, input_path, mono_path, skip_last=0):
+        """[自研补丁] 翻译成功后自动执行翻前体检与质检门禁（后台线程调用）"""
+        # [自研补丁] 信号量限流: 批量翻译收尾时最多 2 个 QC 进程并发
+        with _QC_SEMAPHORE:
+            self._run_auto_qc_locked(input_path, mono_path, skip_last=skip_last)
+
+    def _run_auto_qc_locked(self, input_path, mono_path, skip_last=0):
+        tools_dir = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools')
+        qc_python = self._qc_python()
+        # [自研补丁 2026-09-03] post_check 带 --skip-last(报告 🔴5)
+        post_args = [mono_path]
+        if skip_last and skip_last > 0:
+            post_args += ['--skip-last', str(skip_last)]
+        commands = (('pre_check.py', [input_path]),
+                    ('post_check.py', post_args))
+        for script, script_args in commands:
+            try:
+                script_path = os.path.join(tools_dir, script)
+                if not os.path.isfile(script_path):
+                    print(f"⚠️ [自动质检] 缺少 {script_path}，跳过")
+                    continue
+                print(f"🧪 [自动质检] 运行 {script} ({qc_python}) ...")
+                proc = subprocess.run(
+                    [qc_python, '-X', 'utf8', script_path] + script_args,
+                    capture_output=True, text=True, encoding='utf-8',
+                    errors='replace', timeout=300)
+                if proc.returncode == 0:
+                    status = 'PASS'
+                elif proc.returncode == 1:
+                    status = 'FAIL'
+                else:
+                    status = f'异常退出码 {proc.returncode}'
+                out = (proc.stdout or '').strip()
+                tail = '\n'.join(out.splitlines()[-8:]) if out else '(无输出)'
+                print(f"🧪 [自动质检] {script} → {status}\n{tail}")
+            except Exception as exc:
+                print(f"⚠️ [自动质检] {script} 执行异常: {exc}")
 
     def _handle_exception(self, exc, status_code=500, context=None):
         return jsonify(self._exception_payload(exc, context=context)), status_code
@@ -798,7 +1009,7 @@ class PDFTranslator:
 
     def _execute_crop_compare_job(self, task_id, input_path, config, engine, infile_type):
         if infile_type == 'origin':
-            if engine == pdf2zh or engine != pdf2zh_next:
+            if engine != pdf2zh_next:  # [自研补丁] 去掉冗余布尔判断
                 config.engine = 'pdf2zh'
                 fileList = self.translate_pdf(input_path, config, task_id)
                 input_path = fileList[1]
@@ -875,7 +1086,7 @@ class PDFTranslator:
 
     def _execute_compare_job(self, task_id, input_path, config, engine, infile_type):
         if infile_type == 'origin':
-            if engine == pdf2zh or engine != pdf2zh_next:
+            if engine != pdf2zh_next:  # [自研补丁] 去掉冗余布尔判断
                 config.engine = 'pdf2zh'
                 fileList = self.translate_pdf(input_path, config, task_id)
                 input_path = fileList[1]
@@ -1000,7 +1211,7 @@ class PDFTranslator:
                     base = inpath[:-len(suffix)]
                     return base + (f'-{outtype}.pdf' if engine == pdf2zh else f'.{outtype}.pdf')
 
-        if engine == pdf2zh or engine != pdf2zh_next:
+        if engine != pdf2zh_next:  # [自研补丁] 去掉冗余布尔判断
             if intype == 'origin':
                 if outtype == 'origin-cut':
                     return inpath.replace('.pdf', '-cut.pdf')
@@ -1020,6 +1231,16 @@ class PDFTranslator:
             config.targetLang = 'zh'
         if config.sourceLang == 'zh-CN': # TOFIX, pdf2zh 1.x converter没有通过
             config.sourceLang = 'zh'
+        # [自研补丁 2026-09-03] 关键防御: pdf2zh 子进程的 ConfigManager 会把
+        # --config 指向的文件注册为自己的配置并在启动时"规范化"写回——实测会把
+        # POLISH 等未知键置 null 污染服务器主配置。因此传"临时副本"给子进程,
+        # 主配置永不被子进程触碰。
+        task_config_path = str(config_path[pdf2zh]) + '.task'
+        try:
+            shutil.copyfile(str(config_path[pdf2zh]), task_config_path)
+        except Exception as _e:
+            print(f"⚠️ 创建任务配置副本失败, 回退为直接传主配置: {_e}")
+            task_config_path = str(config_path[pdf2zh])
         cmd = [
             pdf2zh,
             input_path,
@@ -1028,7 +1249,7 @@ class PDFTranslator:
             '--service', str(config.service),
             '--lang-in', str(config.sourceLang),
             '--lang-out', str(config.targetLang),
-            '--config', str(config_path[pdf2zh]), # 使用默认的config path路径
+            '--config', task_config_path,
         ]
 
         # [自研补丁] 公式保护: pdf2zh 1.x 不识别 --formular-*-pattern,
@@ -1047,8 +1268,15 @@ class PDFTranslator:
             print(f"⚠️ 读取公式保护配方失败, 本次不加 -f/-c: {_e}")
 
         if config.skip_last_pages and config.skip_last_pages > 0:
-            end = len(PdfReader(input_path).pages) - config.skip_last_pages
-            cmd.append('-p '+str(1)+'-'+str(end))
+            total_pages = len(PdfReader(input_path).pages)
+            end = total_pages - config.skip_last_pages
+            if end < 1:
+                # [自研补丁] 边界守卫: 跳页数≥总页数会生成 '-p 1-0' 非法参数
+                raise ValueError(
+                    f"'最后几页跳过翻译'={config.skip_last_pages} 会跳过全部 {total_pages} 页, "
+                    "请在插件设置里调小该值后重试")
+            # [自研补丁] '-p' 与页码区间分两个 token, 旧写法 '-p 1-5' 单 token 内嵌空格属脆弱写法
+            cmd.extend(['-p', f'1-{end}'])
         if config.skip_font_subsets:
             cmd.append('--skip-subset-fonts')
         if config.babeldoc:
@@ -1062,7 +1290,9 @@ class PDFTranslator:
             print(f"⚠️ 翻译失败, 错误信息: {e}, 尝试跳过字体子集化, 重新渲染\n")
             cmd.append('--skip-subset-fonts')
             execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None)
-        fileName = os.path.basename(input_path).replace('.pdf', '')
+        # [自研补丁] 用 splitext 取 stem: 旧写法 .replace('.pdf','') 会替换
+        # 文件名中所有出现, 在 'a.pdf.b.pdf' 类名字上与 stem 语义分歧
+        fileName = os.path.splitext(os.path.basename(input_path))[0]
         if config.babeldoc:
             output_path_mono = os.path.join(output_folder, f"{fileName}.{config.targetLang}.mono.pdf")
             output_path_dual = os.path.join(output_folder, f"{fileName}.{config.targetLang}.dual.pdf")
@@ -1099,8 +1329,14 @@ class PDFTranslator:
         else:
             cmd.extend(['--watermark-output-mode', 'watermarked'])
         if config.skip_last_pages and config.skip_last_pages > 0:
-            end = len(PdfReader(input_path).pages) - config.skip_last_pages
-            cmd.extend(['--pages', f'{1}-{end}'])
+            total_pages = len(PdfReader(input_path).pages)
+            end = total_pages - config.skip_last_pages
+            if end < 1:
+                # [自研补丁] 边界守卫: 跳页数≥总页数会生成非法页码区间
+                raise ValueError(
+                    f"'最后几页跳过翻译'={config.skip_last_pages} 会跳过全部 {total_pages} 页, "
+                    "请在插件设置里调小该值后重试")
+            cmd.extend(['--pages', f'1-{end}'])
         if config.no_dual:
             cmd.append('--no-dual')
         if config.no_mono:
@@ -1130,7 +1366,8 @@ class PDFTranslator:
         if config.pool_size and config.pool_size > 1:
             cmd.extend(['--pool-max-worker', str(config.pool_size)])
 
-        fileName = os.path.basename(input_path).replace('.pdf', '')
+        # [自研补丁] splitext 取 stem, 理由同 pdf2zh 分支
+        fileName = os.path.splitext(os.path.basename(input_path))[0]
         no_watermark_mono = os.path.join(output_folder, f"{fileName}.no_watermark.{config.targetLang}.mono.pdf")
         no_watermark_dual = os.path.join(output_folder, f"{fileName}.no_watermark.{config.targetLang}.dual.pdf")
         watermark_mono = os.path.join(output_folder, f"{fileName}.{config.targetLang}.mono.pdf")
@@ -1416,7 +1653,14 @@ if __name__ == '__main__':
         print("   1. 根据上述提示修复问题后重新启动")
         print("   2. 忽略警告继续运行（可能遇到错误）")
 
-        user_input = input("\n是否继续启动？(y/n): ").strip().lower()
+        try:
+            user_input = input("\n是否继续启动？(y/n): ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            # [自研补丁 2026-09-03] 无控制台(start_all 隐藏窗口/后台)启动时
+            # input() 抛 EOFError 会直接 traceback 中断启动; 服务本应自行运行,
+            # 非交互场景默认继续。
+            user_input = 'y'
+            print("\n（未检测到交互输入，默认继续启动）")
         if user_input != 'y':
             print("👋 已取消启动，请修复问题后重试")
             sys.exit(0)
@@ -1424,29 +1668,28 @@ if __name__ == '__main__':
     print("="*60 + "\n")
     print("💡 请保持此窗口开启，翻译期间请勿关闭\n")
 
-    # 5. 拉取仓库通知（失败则跳过，不影响启动）
-    try:
-        fetch_and_show_notices(__version__, args.update_source)
-    except Exception:
-        pass
-
-    # 6. 启动时自动检查 Server 源码更新
-    if args.check_update:
-        print("🔍 开始检查 Server 更新...")
-        update_info = check_for_updates(__version__, args.update_source)
-        if update_info:
-            local_v, remote_v = update_info
-            print(f"🎉 发现新版本！当前版本: {local_v}, 最新版本: {remote_v}")
+    # [自研补丁 2026-09-03] 通知拉取与更新检查移到 daemon 线程:
+    # GitHub 被墙环境下同步网络检查最坏阻塞 1~2 分钟, 每次启动都卡住;
+    # 后台检查不阻塞 Flask 启动, 失败只在线程内打印。发现新版本时仅提示
+    # (后台线程不与 Flask 启动竞争 stdin/文件), 更新方式: 重启后按提示操作
+    # 或运行 python manage_packages.py / update_packages.py。
+    def _startup_remote_checks():
+        try:
+            fetch_and_show_notices(__version__, args.update_source)
+        except Exception as exc:
+            print(f"📢 项目通知检查失败，已跳过: {exc}")
+        if args.check_update:
             try:
-                answer = input("是否要立即更新? (y/n): ").lower()
-            except (EOFError, KeyboardInterrupt):
-                answer = 'n'
-                print("\n无法获取用户输入，已自动取消更新。")
+                update_info = check_for_updates(__version__, args.update_source)
+                if update_info:
+                    local_v, remote_v = update_info
+                    print(f"🎉 发现 Server 新版本！当前版本: {local_v}, 最新版本: {remote_v}")
+                    print("   请运行 python manage_packages.py 完成更新后重启服务。")
+            except Exception as exc:
+                print(f"⚠️ [自动更新] 后台检查失败: {exc}")
 
-            if answer in ['y', 'yes']:
-                perform_update_optimized(root_path, __version__, expected_version=remote_v, update_source=args.update_source)
-            else:
-                print("👌 已取消 Server 源码更新。")
+    threading.Thread(target=_startup_remote_checks, daemon=True,
+                     name='startup-remote-checks').start()
 
     # 7. 配置迁移 + 正常启动。VirtualEnvManager 会在这里对已有用户
     #    每个 Server 版本最多询问一次是否安全更新翻译环境。

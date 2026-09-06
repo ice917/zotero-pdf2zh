@@ -15,7 +15,9 @@ OWNER = "guaguastandup"
 REPO = "zotero-pdf2zh"
 USER_AGENT = "zotero-pdf2zh-server-updater"
 NOTICE_RELATIVE_PATH = "server/notice.json"
-NOTICE_TIMEOUT = 8
+# [自研补丁 2026-09-03] 启动网络检查超时收窄: 旧值在 GitHub 被墙环境会让
+# 后台通知/更新检查长时间挂起(配合 server.py 守护线程化, 不再阻塞启动)
+NOTICE_TIMEOUT = 6
 
 
 def _version_tuple(value):
@@ -311,7 +313,7 @@ def _latest_version_from_github():
     try:
         payload_bytes, content_type = _http_get(
             f"https://api.github.com/repos/{OWNER}/{REPO}/releases/latest",
-            timeout=30,
+            timeout=8,
         )
         if _payload_is_html(payload_bytes, content_type):
             raise RuntimeError("GitHub API 返回了 HTML")
@@ -323,7 +325,7 @@ def _latest_version_from_github():
     try:
         payload_bytes, content_type = _http_get(
             f"https://raw.githubusercontent.com/{OWNER}/{REPO}/main/server/server.py",
-            timeout=30,
+            timeout=8,
         )
         if _payload_is_html(payload_bytes, content_type):
             raise RuntimeError("GitHub raw 返回了 HTML")
@@ -342,7 +344,7 @@ def _latest_version_from_gitee():
     try:
         payload_bytes, content_type = _http_get(
             f"https://gitee.com/api/v5/repos/{OWNER}/{REPO}/releases/latest",
-            timeout=30,
+            timeout=8,
         )
         if _payload_is_html(payload_bytes, content_type):
             raise RuntimeError("Gitee API 返回了 HTML 安全验证页")
@@ -354,7 +356,7 @@ def _latest_version_from_gitee():
     try:
         payload_bytes, content_type = _http_get(
             f"https://gitee.com/{OWNER}/{REPO}/raw/main/server/server.py",
-            timeout=30,
+            timeout=8,
         )
         if _payload_is_html(payload_bytes, content_type):
             raise RuntimeError("Gitee raw 返回了 HTML 安全验证页")

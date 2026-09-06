@@ -4,7 +4,25 @@ import select
 import subprocess
 import sys
 import threading
+import time
 from datetime import datetime
+
+# [自研补丁 2026-09-03] 子进程看门狗: 翻译网络停滞时任务曾永久卡在 running
+# (实测 16 分钟无输出), 只能重启服务。加"总时长兜底 + 空闲超时"双保险,
+# 可用环境变量(秒)调整: PDF2ZH_TASK_TOTAL_TIMEOUT / PDF2ZH_TASK_IDLE_TIMEOUT
+TASK_TOTAL_TIMEOUT = float(os.environ.get("PDF2ZH_TASK_TOTAL_TIMEOUT", str(3 * 60 * 60)))
+TASK_IDLE_TIMEOUT = float(os.environ.get("PDF2ZH_TASK_IDLE_TIMEOUT", str(30 * 60)))
+
+
+class TaskTimeoutError(RuntimeError):
+    """翻译子进程触发看门狗(总超时或空闲超时)。"""
+
+
+# [自研补丁] Windows 控制台屏幕缓冲是进程级共享资源: 多个翻译任务同时挂
+# 控制台监视器会互相串读进度(把别人任务的 x/y 写到自己任务上)。同一时刻
+# 只允许一组监视器/宽度守护, 后来任务退化为"无实时进度"(与无控制台环境
+# 行为一致, 不影响翻译本身)。
+_windows_console_helpers_active = threading.Semaphore(1)  # [2026-09-06 修正] Event 无 acquire, 误用为锁导致首次翻译 AttributeError
 
 from utils.deepseek_thinking import prepare_deepseek_runtime_command
 from utils.environment_lifecycle import managed_python_env
@@ -143,12 +161,18 @@ def _child_terminal_size(cols, rows):
 
 
 def _decode_pty_utf8(data, leftover):
+    """[自研补丁 2026-09-03] 增量 UTF-8 解码: 末尾不完整的多字节字符留到
+    下一块; 若流中出现真正的非法字节(整包及回退 1~3 字节都无法解码),
+    用 errors='replace' 强制前进并清空 leftover——旧实现把非法字节永久
+    留在 leftover 头部, 之后每一块都解码失败, 输出/进度解析永久卡死。"""
     buf = leftover + data
-    try:
-        return buf.decode("utf-8"), b""
-    except UnicodeDecodeError as exc:
-        complete = buf[: exc.start].decode("utf-8", errors="replace")
-        return complete, buf[exc.start :]
+    for cut in range(0, 4):
+        head = buf[: len(buf) - cut] if cut else buf
+        try:
+            return head.decode("utf-8"), (buf[len(buf) - cut:] if cut else b"")
+        except UnicodeDecodeError:
+            continue
+    return buf.decode("utf-8", errors="replace"), b""
 
 
 def _write_pty_chunk(data, leftover, task_id):
@@ -181,7 +205,9 @@ def execute_with_progress(cmd, task_id, args, env_manager):
     _apply_terminal_size_env(final_env, child_cols, child_rows)
 
     if args.enable_venv and env_manager:
-        venv_cmd, venv_env = env_manager.get_command_and_env(cmd)
+        # [自研补丁] 引擎显式传参, 不再让 venv 模块靠全命令行子串嗅探
+        engine = 'pdf2zh_next' if str(final_cmd[0]).lower() == 'pdf2zh_next' else 'pdf2zh'
+        venv_cmd, venv_env = env_manager.get_command_and_env(final_cmd, engine)
         final_cmd = venv_cmd
         final_env.update(venv_env)
         final_env = managed_python_env(final_env)
@@ -249,6 +275,9 @@ def _parse_progress(text, task_id):
                 "status": "running",
                 "message": f"translate {curr}/{total}",
             })
+        # [自研补丁 2026-09-03] tqdm 命中即终态: 必须 return, 否则
+        # legacy 正则可能在同一文本上二次匹配并覆写进度
+        return
 
     # Legacy format
     match = LEGACY_PROGRESS_RE.search(clean)
@@ -334,14 +363,31 @@ def _execute_with_pty(final_cmd, final_env, task_id, cols, rows):
     os.close(slave_fd)
     leftover = b""
 
+    # [自研补丁] 看门狗: 总时长兜底 + 无输出空闲判定(POSIX 路径)
+    start_ts = time.monotonic()
+    last_activity = start_ts
+
     try:
         while True:
-            readable, _, _ = select.select([master_fd], [], [], 0.1)
+            now = time.monotonic()
+            if now - start_ts > TASK_TOTAL_TIMEOUT:
+                process.kill()
+                raise TaskTimeoutError(
+                    f"翻译总时长超过 {TASK_TOTAL_TIMEOUT / 60:.0f} 分钟, "
+                    "已终止子进程(可用环境变量 PDF2ZH_TASK_TOTAL_TIMEOUT 调整)")
+            if now - last_activity > TASK_IDLE_TIMEOUT:
+                process.kill()
+                raise TaskTimeoutError(
+                    f"翻译连续 {TASK_IDLE_TIMEOUT / 60:.0f} 分钟无任何输出, "
+                    "判定网络停滞, 已终止子进程(可用 PDF2ZH_TASK_IDLE_TIMEOUT 调整)")
+
+            readable, _, _ = select.select([master_fd], [], [], 0.5)
             if master_fd in readable:
                 try:
                     data = os.read(master_fd, 4096)
                     if not data:
                         break
+                    last_activity = time.monotonic()
                     leftover = _write_pty_chunk(data, leftover, task_id)
                 except OSError:
                     break
@@ -376,11 +422,14 @@ def _execute_with_pty(final_cmd, final_env, task_id, cols, rows):
         raise
 
 
-def _monitor_windows_console_translate_progress(task_id, stop_event):
+def _monitor_windows_console_translate_progress(task_id, stop_event, activity=None):
     """
     Windows-only monitor:
     Read console buffer and parse only "translate ... x/y".
     This keeps native progress bars untouched while enabling SSE updates.
+
+    [自研补丁] activity: 可选的 [最后活动时间戳, 是否曾解析到进度] 列表,
+    供空闲看门狗判断子进程是否真的在推进。
     """
     if task_id is None:
         return
@@ -543,6 +592,10 @@ def _monitor_windows_console_translate_progress(task_id, stop_event):
                             "status": "running",
                             "message": f"translate {curr}/{total}",
                         })
+                        # [自研补丁] 进度真实推进, 喂狗
+                        if activity is not None:
+                            activity[0] = time.monotonic()
+                            activity[1] = True
                         # _debug_progress_log(
                         #     "PARSE_PROGRESS",
                         #     task_id=task_id,
@@ -571,6 +624,10 @@ def _monitor_windows_console_translate_progress(task_id, stop_event):
                     "status": "running",
                     "message": latest_step,
                 })
+                # [自研补丁] 阶段切换也算活动, 喂狗
+                if activity is not None:
+                    activity[0] = time.monotonic()
+                    activity[1] = True
                 # _debug_progress_log("PARSE_STEP", task_id=task_id, step=latest_step)
         except Exception as e:
             err_text = str(e)
@@ -692,27 +749,59 @@ def _execute_with_inherit(final_cmd, final_env, task_id, cols):
     # _debug_progress_log("EXECUTE_START", task_id=task_id, cmd=" ".join(final_cmd))
 
     stop_event = threading.Event()
-    monitor_thread = threading.Thread(
-        target=_monitor_windows_console_translate_progress,
-        args=(task_id, stop_event),
-        daemon=True,
-    )
-    monitor_thread.start()
+    # [自研补丁 2026-09-03] 控制台监视器/宽度守护进程级唯一:
+    # 多任务同时挂监视器会串读同一屏幕缓冲, 进度互相覆盖
+    helpers_acquired = _windows_console_helpers_active.acquire(blocking=False)
+    monitor_thread = None
+    width_guard_thread = None
+    # [自研补丁] 空闲看门狗活动信号: [最后活动时间戳, 是否曾解析到进度]
+    activity = [time.monotonic(), False]
+    if helpers_acquired:
+        monitor_thread = threading.Thread(
+            target=_monitor_windows_console_translate_progress,
+            args=(task_id, stop_event, activity),
+            daemon=True,
+        )
+        monitor_thread.start()
 
-    width_guard_thread = threading.Thread(
-        target=_guard_windows_console_min_width,
-        args=(stop_event, cols),
-        daemon=True,
-    )
-    width_guard_thread.start()
+        width_guard_thread = threading.Thread(
+            target=_guard_windows_console_min_width,
+            args=(stop_event, cols),
+            daemon=True,
+        )
+        width_guard_thread.start()
+    else:
+        print("ℹ️ [进度] 已有翻译任务占用控制台监视器, 本任务不显示实时进度(不影响翻译)")
 
     return_code = None
+    start_ts = time.monotonic()
     try:
-        return_code = process.wait()
+        while True:
+            try:
+                return_code = process.wait(timeout=5)
+                break
+            except subprocess.TimeoutExpired:
+                now = time.monotonic()
+                if now - start_ts > TASK_TOTAL_TIMEOUT:
+                    process.kill()
+                    raise TaskTimeoutError(
+                        f"翻译总时长超过 {TASK_TOTAL_TIMEOUT / 60:.0f} 分钟, "
+                        "已终止子进程(可用环境变量 PDF2ZH_TASK_TOTAL_TIMEOUT 调整)")
+                # 仅在监视器确实解析到过进度后才启用空闲判定,
+                # 避免无控制台环境(监视器早退)误杀正常长任务
+                if activity[1] and now - activity[0] > TASK_IDLE_TIMEOUT:
+                    process.kill()
+                    raise TaskTimeoutError(
+                        f"翻译连续 {TASK_IDLE_TIMEOUT / 60:.0f} 分钟无进度更新, "
+                        "判定网络停滞, 已终止子进程(可用 PDF2ZH_TASK_IDLE_TIMEOUT 调整)")
     finally:
         stop_event.set()
-        monitor_thread.join(timeout=1.5)
-        width_guard_thread.join(timeout=1.0)
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=1.5)
+        if width_guard_thread is not None:
+            width_guard_thread.join(timeout=1.0)
+        if helpers_acquired:
+            _windows_console_helpers_active.release()
 
     # _debug_progress_log("EXECUTE_END", task_id=task_id, return_code=return_code)
 
