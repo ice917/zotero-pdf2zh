@@ -104,7 +104,11 @@ class BaseTranslator:
         if not (self.ignore_cache or ignore_cache):
             cache = self.cache.get(text)
             if cache is not None:
-                return cache
+                # [自研补丁 2026-09-06] 缓存读取同样过机械伤清洗: v1 时代的缓存
+                # 终稿可能带润色 LLM 重引入的半角标点/连字符(Melhani 实测全文
+                # 868+410 处), 读取时清洗即可零成本修复, 无需重译。清洗幂等。
+                cleaner = getattr(self, "_clean_cjk_typography", None)
+                return cleaner(cache) if cleaner is not None else cache
 
         translation = self.do_translate(text)
         # 润色钩子: 若 translator 定义了 polish 方法, 对初译结果做二次润色
@@ -114,6 +118,13 @@ class BaseTranslator:
                 translation = polish(text, translation)
             except Exception:
                 logger.exception("Polish hook failed, fall back to raw translation.")
+        # [自研补丁 2026-09-06] 润色输出同样过机械伤清洗: 实测 Melhani 摘要页
+        # 残留 17 处(汉字后半角标点×9/汉字间连字符×5/半角括号×3)——润色 LLM
+        # 重写稿重新引入, do_translate 内的清洗只保护初译, polish 返回值绕过它。
+        # 清洗为纯函数且幂等, 重复应用无副作用; 其他 translator 无此方法则跳过。
+        cleaner = getattr(self, "_clean_cjk_typography", None)
+        if cleaner is not None:
+            translation = cleaner(translation)
         self.cache.set(text, translation)
         return translation
 
@@ -447,6 +458,8 @@ class OpenAITranslator(BaseTranslator):
         think_filter_regex = r"^<think>.+?\n*(</think>|\n)*(</think>)\n*"
         self.add_cache_impact_parameters("think_filter_regex", think_filter_regex)
         # [自研补丁 2026-09-03] 机械伤清洗版本号: 清洗规则变更后旧缓存自动失效
+        # [2026-09-06 维持 v1] 读取路径已加清洗(见 translate), v1 缓存可直接复用,
+        # 升 v2 反而会作废 Melhani 全部缓存导致整本重译, 故不再递增。
         self.add_cache_impact_parameters("typo_clean", "v1")
         self.think_filter_regex = re.compile(think_filter_regex, flags=re.DOTALL)
         # 润色钩子配置: POLISH=1 开启, POLISH_GLOSSARY 为可选术语表 CSV, POLISH_MODEL 可选指定润色模型

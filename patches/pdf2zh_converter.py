@@ -379,6 +379,47 @@ class TranslateConverter(PDFConverterEx):
         ) as executor:
             news = list(executor.map(worker, sstk))
 
+        # [自研补丁 2026-09-06] 纯标点占位符消除(翻译后、排版前):
+        # 原文 PDF 的连字符/逗号/句点/括号若以 (cid:NN) 形式被 pdfminer 解出,
+        # 会命中 vflag 首条规则被判为公式, 包成 {vN} 占位符; LLM 只能围绕占位符
+        # 行文, 渲染时原字体标点回填到汉字之间, 形成"滤波-的""九-室""先,，"
+        # 等机械伤。该字符藏在占位符里, 译文清洗层不可见, 故在拿到译文后、
+        # 排版前, 将"内容为孤立半角标点且紧邻汉字(或全角标点)"的占位符就地
+        # 消除: 句读类转全角, 连字符/括号直接删除, 随后收敛重复标点。
+        # 安全性: 公式内容(含数字/字母/数学符号)不匹配; 英文/数字邻接不触发;
+        # 数学减号(U+2212, Sm 类)不在消除集; 修改发生在翻译之后, 翻译缓存键
+        # 不变, 已缓存段落全部命中; 未被引用的 var 条目不会被渲染, 无副作用。
+        def _strip_punct_placeholders(text: str) -> str:
+            def _norm(ch) -> str:
+                t = ch.get_text()
+                m = re.match(r"\(cid:(\d+)\)", t)
+                return chr(int(m.group(1))) if m else t
+
+            def repl(m):
+                idx = int(m.group(1))
+                if idx >= len(var):
+                    return m.group(0)
+                content = "".join(_norm(ch) for ch in var[idx]).strip()
+                if content not in ("-", ",", ".", ";", ":", "(", ")"):
+                    return m.group(0)
+                start, end = m.span()
+                left = text[start - 1] if start > 0 else ""
+                right = text[end] if end < len(text) else ""
+
+                def cjkish(c):
+                    return bool(c) and (
+                        "\u4e00" <= c <= "\u9fff" or c in "，。；：！？、《》（）"
+                    )
+
+                if not (cjkish(left) or cjkish(right)):
+                    return m.group(0)
+                return {"-": "", ",": "，", ".": "。", ";": "；", ":": "：", "(": "", ")": ""}[content]
+
+            return re.sub(r"\{v(\d+)\}", repl, text)
+
+        news = [_strip_punct_placeholders(n) for n in news]
+        news = [re.sub(r"([，。；：！？、])\1+", r"\1", n) for n in news]
+
         ############################################################
         # C. 新文档排版
         def raw_string(fcur: str, cstk: str):  # 编码字符串

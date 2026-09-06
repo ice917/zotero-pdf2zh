@@ -65,20 +65,21 @@ def parse_doubt_md(path):
     解析存疑清单，返回 [{'term': 术语, 'para': 段落号, 'note': 冲突描述}, ...]
 
     清单结构（由 pdf2zh 润色管线产出）：
-        ## 存疑段落 3
-        **原文**
-        ...
-        **初译(保持未动)**
+        ## 存疑段落 3            ← 旧版格式
         ...
         **存疑点**
         1. 术语"topology optimization"
            - 冲突点：...
-        ---
+
+        ## 段落 3                ← v18 humanize 新版格式
+        ...
+        【存疑】
+        1. 术语"Loewner order"：...
     """
     text = open(path, encoding="utf-8").read()
 
-    # 按 "## 存疑段落 N" 切块
-    chunks = re.split(r"^##\s*存疑段落\s*(\d+)\s*$", text, flags=re.M)
+    # 按 "## 存疑段落 N"(旧) / "## 段落 N"(v18 新) 切块
+    chunks = re.split(r"^##\s*(?:存疑段落|段落)\s*(\d+)\s*$", text, flags=re.M)
     # chunks = [前缀, 段号, 内容, 段号, 内容, ...]
     items = []
     seen = set()
@@ -87,18 +88,27 @@ def parse_doubt_md(path):
         para_no = chunks[i]
         body = chunks[i + 1]
 
-        # 只取 "**存疑点**" 之后的部分
-        m = re.search(r"\*\*存疑点\*\*(.*?)(?=\n---|\Z)", body, flags=re.S)
+        # 只取 "**存疑点**"(旧) / "【存疑】"(新) 之后的部分,
+        # 到下一个 --- 分隔线 / 下一个段落标题 / 文件尾为止
+        m = re.search(
+            r"(?:\*\*存疑点\*\*|【存疑】)(.*?)(?=\n---|\n##\s|\Z)",
+            body, flags=re.S,
+        )
         if not m:
             continue
         doubt_block = m.group(1)
 
-        # 提取术语：支持 术语"xxx" / 术语“xxx” / 专有名词"xxx"
+        # 提取术语：支持 术语"xxx" / 术语“xxx” / 专有名词"xxx" /
+        # v18 变体: 术语/表达："xxx" (关键词与引号间允许 ≤12 字符的修饰)
         for tm in re.finditer(
-            r'(?:术语|专有名词|短语)\s*["“"]([^"“”]{1,80})["”"]', doubt_block
+            r'(?:术语|专有名词|短语)[^"“\n]{0,12}["“"]([^"“”]{1,80})["”"]',
+            doubt_block,
         ):
             term = tm.group(1).strip()
-            if not term or term in seen:
+            # 含 {vN} 公式占位符的是占位符切分存疑, 非词汇表对象
+            if not term or re.search(r"\{v\d+\}", term):
+                continue
+            if term in seen:
                 continue
             seen.add(term)
 
