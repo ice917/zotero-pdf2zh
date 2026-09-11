@@ -389,6 +389,9 @@ class TranslateConverter(PDFConverterEx):
         # 安全性: 公式内容(含数字/字母/数学符号)不匹配; 英文/数字邻接不触发;
         # 数学减号(U+2212, Sm 类)不在消除集; 修改发生在翻译之后, 翻译缓存键
         # 不变, 已缓存段落全部命中; 未被引用的 var 条目不会被渲染, 无副作用。
+        # [自研补丁 2026-09-10 v22] 半/全角标点等价表: 邻接去重判定用,
+        # 使字面半角标点与映射出的全角标点可比较。
+        _NB2FULL = str.maketrans(",.;:()", "，。；：()")
         def _strip_punct_placeholders(text: str) -> str:
             def _norm(ch) -> str:
                 t = ch.get_text()
@@ -400,7 +403,17 @@ class TranslateConverter(PDFConverterEx):
                 if idx >= len(var):
                     return m.group(0)
                 content = "".join(_norm(ch) for ch in var[idx]).strip()
-                if content not in ("-", ",", ".", ";", ":", "(", ")"):
+                # [2026-09-10] 字符集扩充: 原文连字符常为 Unicode dash 变体
+                # (– — ‐ ‑ ‒), 仅 ASCII "-" 会漏网(实测 "侧向力-的项" 残留)。
+                # 数学减号 U+2212 不入删除集(公式语义), 但孤立夹汉字间时转"——"。
+                _DASH = "-\u2010\u2011\u2012\u2013\u2014\u2015"
+                if content in _DASH:
+                    return ""
+                if content == "\u2212":
+                    return "——"
+                if content in (",", ".", ";", ":", "(", ")"):
+                    pass
+                else:
                     return m.group(0)
                 start, end = m.span()
                 left = text[start - 1] if start > 0 else ""
@@ -413,7 +426,23 @@ class TranslateConverter(PDFConverterEx):
 
                 if not (cjkish(left) or cjkish(right)):
                     return m.group(0)
-                return {"-": "", ",": "，", ".": "。", ";": "；", ":": "：", "(": "", ")": ""}[content]
+                mapped = {",": "，", ".": "。", ";": "；", ":": "：", "(": "（", ")": "）"}[content]
+                # [自研补丁 2026-09-10 v22] 邻接冗余标点去重: LLM 重排句式后
+                # 自带标点, 占位符标点回填后与之相邻叠加(Melhani 实测
+                # "（（EKF））" ×35+"，。" ×14)。判定时半/全角等价
+                # (_NB2FULL), 同向括号或同类句读相邻 → 占位符标点冗余, 删除。
+                _nb = lambda ch: ch.translate(_NB2FULL) if ch else ch
+                if mapped in "（）":
+                    if _nb(left) == mapped or _nb(right) == mapped:
+                        return ""
+                else:
+                    if _nb(left) == mapped or _nb(right) == mapped:
+                        return ""
+                    if mapped in "，；：" and _nb(right) in "。，；":
+                        return ""
+                    if mapped in "，；：" and _nb(left) == "。":
+                        return ""
+                return mapped
 
             return re.sub(r"\{v(\d+)\}", repl, text)
 
@@ -423,26 +452,28 @@ class TranslateConverter(PDFConverterEx):
         # 夹在汉字之间形成机械伤(实例: "新泽西州, 2006." "步骤 3 ( 窗口")。
         # 本函数把这类混合段的**首尾标点**抽出来整形(句读转全角, 连字符/
         # 方括号删除, 圆括号转全角), 剩余主体重开 var 条目继续原字体回填。
-        # 安全边界: 中段标点不动(小数点/千分位/复合词天然安全); 主体缺失
-        # (纯标点)不动 —— 由 v20 处理; 含字母数字以外的主体结构(如希腊字母
-        # 上下标混排的真公式)不动; 邻接非汉字不动; 新增 var 条目只增不改,
-        # 原条目不再被引用即不会被渲染, 无副作用。
-        _MIX_PUNCT = "-[]{}.,;:()"
+        # [2026-09-10] 标点集扩充 Unicode dash 变体(– — ‐ ‑ ‒), 与 v20 对齐。
+        _MIX_PUNCT = "-\u2010\u2011\u2012\u2013\u2014\u2015[]{}.,;:()"
         _MIX_RE = re.compile(
-            r"([-\[\]{}.,;:()\s]*)([0-9A-Za-z][0-9A-Za-z\s]*[0-9A-Za-z%]|[0-9A-Za-z])([-\[\]{}.,;:()\s]*)"
+            r"([-\u2010\u2011\u2012\u2013\u2014\u2015\[\]{}.,;:()\s]*)([0-9A-Za-z][0-9A-Za-z\s]*[0-9A-Za-z%]|[0-9A-Za-z])([-\u2010\u2011\u2012\u2013\u2014\u2015\[\]{}.,;:()\s]*)"
         )
 
         def _map_head_punct(ch: str) -> str:
             # 段首标点: 句点多为编号/缩写点(Fig. / No.), 删除比转句号安全
+            # [2026-09-10 修正] 补 []{} 原样保留: 引用标号 "[23]" 的方括号
+            # 此前落入 dict.get 默认 "" 被整批删除, 导致质检引用对账
+            # 116→68 FAIL(版面标号丢失)。删除类只留断字符 "-"。
             return {
                 ",": "，", ";": "；", ":": "：", ".": "",
                 "(": "（", ")": "）",
+                "[": "[", "]": "]", "{": "{", "}": "}",
             }.get(ch, "")
 
         def _map_tail_punct(ch: str) -> str:
             return {
                 ",": "，", ".": "。", ";": "；", ":": "：",
                 "(": "（", ")": "）",
+                "[": "[", "]": "]", "{": "{", "}": "}",
             }.get(ch, "")
 
         def _split_mixed_placeholders(text: str) -> str:
@@ -458,17 +489,18 @@ class TranslateConverter(PDFConverterEx):
                 chars = var[idx]
                 content = "".join(_norm(c) for c in chars).strip()
                 if not content or re.fullmatch(
-                    r"[-\[\]{}.,;:()]+", content
+                    r"[-\u2010\u2011\u2012\u2013\u2014\u2015\[\]{}.,;:()]+", content
                 ):
-                    return m.group(0)  # 纯标点: 交给 v20
+                    return m.group(0)  # 纯标点: 交给 v20(已扩 Unicode dash)
                 mm = _MIX_RE.fullmatch(content)
                 if not mm:
                     return m.group(0)  # 含其他结构 → 真公式等, 不动
                 head_raw, _body, tail_raw = mm.group(1), mm.group(2), mm.group(3)
                 # 负数守卫: "-5" 的连字符是真负号, 删除会破坏语义
                 # (装饰断字符 "-level" 的 body 以字母开头, 不受影响)。
-                if (head_raw.rstrip().endswith("-") and _body[:1].isdigit()) or (
-                    tail_raw.lstrip().startswith("-") and _body[-1:].isdigit()
+                _D = "-\u2010\u2011\u2012\u2013\u2014\u2015"
+                if (head_raw.rstrip()[-1:] in _D and _body[:1].isdigit()) or (
+                    tail_raw.lstrip()[:1] in _D and _body[-1:].isdigit()
                 ):
                     return m.group(0)
                 head = "".join(_map_head_punct(c) for c in head_raw.strip())
@@ -503,6 +535,14 @@ class TranslateConverter(PDFConverterEx):
                 except Exception:
                     _l = vlen[idx]
                 vlen.append(_l)
+                # [自研补丁 2026-09-10 v22] 首尾映射标点与相邻字面标点同类即
+                # 冗余(半/全角等价, 与 v20 去重同规则): 逐个剥离首/尾重复标点。
+                _lft = left.translate(_NB2FULL) if left else "\x00"
+                _rgt = right.translate(_NB2FULL) if right else "\x00"
+                while head and head[0].translate(_NB2FULL) == _lft:
+                    head = head[1:]
+                while tail and tail[-1].translate(_NB2FULL) == _rgt:
+                    tail = tail[:-1]
                 return f"{head}{{v{new_id}}}{tail}"
 
             def _extract_body_chars(chars, body, norm):
