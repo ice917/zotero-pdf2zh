@@ -3,18 +3,26 @@
 # zotero-pdf2zh
 import json, toml
 import os
+import threading
+from pathlib import Path
 
 from utils.config_map import (
     pdf2zh_config_map,
     pdf2zh_next_config_map,
     pdf2zh_next_service_aliases,
 )
+from utils.config_migration import _atomic_write_text, migrate_config_file
 from utils.deepseek_thinking import (
     is_deepseek_v4_model,
     normalize_deepseek_extra_data,
     remove_stale_thinking_fields,
     validate_winexe_runtime_if_selected,
 )
+
+# [自研补丁 2026-09-03] 并发保护: config.json/config.toml 是所有翻译任务
+# 共享的单一文件, Flask threaded=True + 每任务一线程下, 无锁"读-改-写"会
+# 交错写坏配置(实测事故: POLISH 键被并发置 null)。进程内全局互斥。
+_config_write_lock = threading.Lock()
 
 pdf2zh = 'pdf2zh'
 pdf2zh_next = 'pdf2zh_next'
@@ -108,6 +116,11 @@ class Config:
             self.engine = pdf2zh
 
         if self.engine == pdf2zh:
+            # [v23] 缺省回落守卫: bing 静默回落曾致整文档换键重译(实测 341 段
+            # 4.5 分钟), 直提请求必须带全插件同等字段。回落时大声告警。
+            if 'service' not in request_data or not request_data.get('service'):
+                print("⚠️ [Config] 请求未带 service 字段, 回落缺省 'bing'!"
+                      " 直提 /translate 请带全插件同等配置(service=silicon/targetLang=zh-CN 等)")
             self.service = request_data.get('service', 'bing')
             if self.service in [None, ''] or len(self.service) < 3:
                 self.service = 'bing'
@@ -165,10 +178,12 @@ class Config:
 
         # 如果左右留白部分裁剪太多了, 可以调整pdf_w_offset和pdf_offset_ratio, 宽边裁剪值pdf_w_offset, 窄边裁剪值pdf_w_offset/pdf_offset_ratio
         # TODO: 将裁剪的逻辑添加到zotero配置页面
-        self.pdf_w_offset = int(request_data.get('pdf_w_offset', 40))
-        self.pdf_h_offset = int(request_data.get('pdf_h_offset', 20))
-        self.pdf_offset_ratio = float(request_data.get('pdf_offset_ratio', 5))
-        self.pdf_white_margin = int(request_data.get('pdf_white_margin', 0))
+        # [自研补丁 2026-09-03] 裁剪参数容错: 非数字输入回退默认值,
+        # 避免插件传入异常值时整个请求 500 (与 threadNum 同款守卫)
+        self.pdf_w_offset = self._int_opt(request_data, 'pdf_w_offset', 40)
+        self.pdf_h_offset = self._int_opt(request_data, 'pdf_h_offset', 20)
+        self.pdf_offset_ratio = self._float_opt(request_data, 'pdf_offset_ratio', 5.0)
+        self.pdf_white_margin = self._int_opt(request_data, 'pdf_white_margin', 0)
 
         self.mono = stringToBoolean(request_data.get('mono', True))
         self.dual = stringToBoolean(request_data.get('dual', True))
@@ -197,7 +212,8 @@ class Config:
         self.translate_table_text = stringToBoolean(request_data.get('translateTableText', False))
         self.only_include_translated_page = stringToBoolean(request_data.get('onlyIncludeTranslatedPage', False))
 
-        print("\n🔍 Config without llm_api: ", self.__dict__)
+        # [自研补丁 2026-09-03] 删除遗留调试 print(self.__dict__):
+        # 该输出含全部请求配置, 未来新增密钥类字段时有泄密风险。
 
         self.llm_api = {
             'apiKey': request_data.get('llm_api', {}).get('apiKey', ''),
@@ -207,25 +223,80 @@ class Config:
             'extraData': request_data.get('llm_api', {}).get('extraData', {})
         }
 
+    @staticmethod
+    def _int_opt(data, key, default):
+        """[自研补丁] 整数参数容错: 非法/缺失回退默认, 不抛 500。"""
+        try:
+            return int(data.get(key, default))
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _float_opt(data, key, default):
+        """[自研补丁] 浮点参数容错, 同 _int_opt。"""
+        try:
+            return float(data.get(key, default))
+        except (ValueError, TypeError):
+            return default
+
+    @staticmethod
+    def _load_config_with_heal(config_file, kind):
+        """[自研补丁 2026-09-03] 运行期配置自愈: 配置迁移只在启动时执行,
+        若运行中 config.json/toml 损坏(半截写/手工改坏), 这里兜底再迁移一次
+        (迁移逻辑会备份坏文件并恢复默认), 仍失败则抛业务错误而非裸 500。"""
+        try:
+            if kind == 'json':
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            with open(config_file, 'r', encoding='utf-8') as f:
+                return toml.load(f)
+        except (ValueError, OSError) as exc:
+            print(f"⚠️ 配置文件读取失败({exc}), 尝试迁移自愈: {config_file}")
+            try:
+                migrate_config_file(config_file)
+                if kind == 'json':
+                    with open(config_file, 'r', encoding='utf-8') as f:
+                        return json.load(f)
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    return toml.load(f)
+            except Exception as exc2:
+                raise RuntimeError(
+                    f"配置文件 {config_file} 无法读取且自愈失败: {exc2}") from exc2
+
     def update_config_file(self, config_file):
+        """[自研补丁 2026-09-03] 并发安全包装: 读-改-写全程持全局锁,
+        防止并发任务的配置互相覆盖/交错写坏。"""
+        with _config_write_lock:
+            return self._update_config_file_locked(config_file)
+
+    def _update_config_file_locked(self, config_file):
         service = self.service
         engine = self.engine
         if engine == pdf2zh:
             # 更新llm api config
             config_map = pdf2zh_config_map.get(service, {})
-            if not config_map: # 无需映射, 直接跳过
-                print(f"🔍 No config_map found for service: {service}, 如果是新的服务, 请联系开发者更新config_map, 如果不是请忽略")
-                return
 
-            with open(config_file, 'r', encoding='utf-8') as f:
-                old_config = json.load(f)
-
+            # [自研补丁 2026-09-03] 运行期自愈加载(替换裸 json.load)
+            old_config = self._load_config_with_heal(config_file, 'json')
             new_config = old_config.copy()
 
-            # 更新字体
+            # [自研补丁 2026-09-03] 字体路径是全局键(NOTO_FONT_PATH), 与具体
+            # 翻译服务无关: 必须在 config_map 判空之前写入并落盘, 否则
+            # bing/google 等无 config_map 的服务会让字体配置被静默忽略。
+            font_updated = False
             if os.path.exists(self.font_file):
                 new_config['NOTO_FONT_PATH'] = self.font_file
+                font_updated = True
                 print(f"✏️ 更新字体路径: {self.font_file}")
+
+            if not config_map: # 无需映射, 直接跳过
+                print(f"🔍 No config_map found for service: {service}, 如果是新的服务, 请联系开发者更新config_map, 如果不是请忽略")
+                if font_updated:
+                    _atomic_write_text(
+                        Path(config_file),
+                        json.dumps(new_config, indent=4, ensure_ascii=False))
+                    print(f"✏️ 更新 config file(仅字体): {config_file}")
+                return
 
             # 我们假设config.json文件的格式没有问题
             translator = None
@@ -257,7 +328,8 @@ class Config:
                         translator['envs'][mapped_key] = value
                         translator_keys.append(mapped_key)
                         if key == "apiKey":
-                            print(f"✏️ 更新 {key}: {mapped_key} = {'*' * 8 + value[-4:] if len(value) > 4 else '*' * len(value)}")
+                            # [自研补丁] 掩码复用 _safe_log_value, 非字符串值不再 len() 崩溃
+                            print(f"✏️ 更新 {key}: {mapped_key} = {_safe_log_value('apiKey', value)}")
                         else:
                             print(f"✏️ 更新 {key}: {mapped_key} = {value}") 
                     else:
@@ -279,11 +351,14 @@ class Config:
                         print(f"✏️ 跳过 extraData: {key} = {value} (empty or null)")
 
             # [自研补丁] 保护润色钩子配置: POLISH_* 键不被插件请求刷新删除,
-            # 并从 server 目录的 config.json 预置段补齐 (否则钩子静默失效)
+            # 从 config.json.example 托管默认读取 (config.json 会被插件推送/迁移反复覆写,
+            # POLISH 键可能被置 null, 以 example 为稳定事实源) (2026-09-02 改)
+            # 注意: 这是有意托管——POLISH_* 以 example 为准无条件回填,
+            # 插件 UI 对这些键的修改不会生效; 调整润色配置请改 config.json.example。
             try:
                 _server_cfg_path = os.path.join(
                     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    'config', 'config.json')
+                    'config', 'config.json.example')
                 with open(_server_cfg_path, 'r', encoding='utf-8') as f:
                     _server_cfg = json.load(f)
                 for _t_src in _server_cfg.get('translators', []):
@@ -303,9 +378,11 @@ class Config:
                     del translator['envs'][key]
                     print(f"✏️ 删除旧 {key}")
 
-            with open(config_file, 'w', encoding='utf-8') as f:
-                json.dump(new_config, f, indent=4, ensure_ascii=False)
-                print(f"✏️ 更新 config file: {config_file}")
+            # [自研补丁 2026-09-03] 原子写: 防止并发子进程读到半截 JSON
+            _atomic_write_text(
+                Path(config_file),
+                json.dumps(new_config, indent=4, ensure_ascii=False))
+            print(f"✏️ 更新 config file: {config_file}")
             
         elif engine == pdf2zh_next: # toml文件, 格式参考server/config/config.toml.example
             service = resolve_pdf2zh_next_service(service)
@@ -314,8 +391,8 @@ class Config:
                 print(f"✏️ No config_map found for service: {service}, 如果是新的服务, 请联系开发者更新config_map")
                 return
 
-            with open(config_file, 'r', encoding='utf-8') as f:
-                old_config = toml.load(f)
+            # [自研补丁 2026-09-03] 运行期自愈加载(替换裸 toml.load)
+            old_config = self._load_config_with_heal(config_file, 'toml')
 
             # A previous DeepSeek V4 attempt may have written 2.9-only fields.
             # For every non-DeepSeek request, scrub those fields before an older
@@ -357,7 +434,13 @@ class Config:
             # Keep request-scoped pdf2zh_next options in config.toml so they work
             # even when there is no dedicated CLI wiring in server.py.
             translation_config = new_config.setdefault('translation', {})
-            translation_config['pool_max_workers'] = self.pool_size if self.pool_size > 0 else 'null'
+            # [自研补丁 2026-09-03] TOML 没有 null 类型: 旧写法写入字符串 "null",
+            # 任何新消费者 int() 即崩。不写该键即表示"未设置", pdf2zh_next
+            # 会回退默认(worker 数跟随 qps)。
+            if self.pool_size > 0:
+                translation_config['pool_max_workers'] = self.pool_size
+            else:
+                translation_config.pop('pool_max_workers', None)
             pdf_config = new_config.setdefault('pdf', {})
             pdf_config['only_include_translated_page'] = self.only_include_translated_page
 
@@ -395,9 +478,10 @@ class Config:
                         translator[mapped_key] = value
                         translator_keys.append(mapped_key)
                         if key == "apiKey":
-                            print(f"✏️ 更新 {key}: {mapped_key} = {'*' * 8 + value[-4:] if len(value) > 4 else '*' * len(value)}")
+                            # [自研补丁] 掩码复用 _safe_log_value, 非字符串值安全
+                            print(f"✏️ 更新 {key}: {mapped_key} = {_safe_log_value('apiKey', value)}")
                         else:
-                            print(f"✏️ 更新 {key}: {mapped_key} = {value}") 
+                            print(f"✏️ 更新 {key}: {mapped_key} = {value}")
                     else:
                         translator_keys.append(mapped_key)
                         print(f"✏️ 跳过 {key}: {mapped_key} = {value} (empty or null)")
@@ -416,15 +500,15 @@ class Config:
                         print(f"✏️ 跳过 extraData: {key} = {value} (empty or null)")
 
             # 将translator中, 所有不在translator_keys中的key删除
-            print(translator.keys())
+            # [自研补丁 2026-09-03] 删除遗留调试 print(translator.keys())
             for key in list(translator.keys()):
                 if key not in translator_keys: 
                     del translator[key]
                     print(f"✏️ 删除旧 {key}")
 
-            with open(config_file, 'w', encoding='utf-8') as f:
-                toml.dump(new_config, f)
-                print(f"✏️ 更新 config file: {config_file}")
+            # [自研补丁 2026-09-03] 原子写(同 JSON 分支)
+            _atomic_write_text(Path(config_file), toml.dumps(new_config))
+            print(f"✏️ 更新 config file: {config_file}")
 
             # server.py in older releases uses a legacy singular pool flag.
             # The worker count is already persisted above, so suppress that CLI path.

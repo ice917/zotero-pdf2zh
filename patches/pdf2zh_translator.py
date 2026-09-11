@@ -95,6 +95,14 @@ class BaseTranslator:
         """
         self.cache.add_params(k, v)
 
+    def _cache_key_suffix(self, text: str) -> str:
+        """[v23] 每段缓存键后缀钩子, 默认无。
+
+        术语表翻译器覆写: 把"本段命中术语"的指纹编入键, 术语表局部修改
+        只作废含该术语的段落, 不再整表失效(灵敏度实测: +1 行 dummy 术语
+        曾致 23 段全 miss / 233s)。"""
+        return ""
+
     def translate(self, text: str, ignore_cache: bool = False) -> str:
         """
         Translate the text, and the other part should call this method.
@@ -102,7 +110,7 @@ class BaseTranslator:
         :return: translated text
         """
         if not (self.ignore_cache or ignore_cache):
-            cache = self.cache.get(text)
+            cache = self.cache.get(text, self._cache_key_suffix(text))
             if cache is not None:
                 # [自研补丁 2026-09-06] 缓存读取同样过机械伤清洗: v1 时代的缓存
                 # 终稿可能带润色 LLM 重引入的半角标点/连字符(Melhani 实测全文
@@ -125,7 +133,7 @@ class BaseTranslator:
         cleaner = getattr(self, "_clean_cjk_typography", None)
         if cleaner is not None:
             translation = cleaner(translation)
-        self.cache.set(text, translation)
+        self.cache.set(text, translation, self._cache_key_suffix(text))
         return translation
 
     def do_translate(self, text: str) -> str:
@@ -554,6 +562,41 @@ class OpenAITranslator(BaseTranslator):
             self.add_cache_impact_parameters(
                 "polish_guideline_fp",
                 _polish_file_fingerprint(self._polish_guideline_path))
+
+        # [v23] 术语表指纹渐进化: 整表 fp 从静态键移除(它使术语表 +1 行就
+        # 全文缓存失效, 灵敏度实测 23 段/233s), 改由 _cache_key_suffix 把
+        # "本段命中术语"指纹按段编入键。移除前快照当前形态为旧版回查键,
+        # 既有条目经回查继续命中(表未变时), 零重译迁移。
+        if self._polish_enabled and self._polish_glossary_path:
+            self.cache.snapshot_legacy_key()
+            self.cache.remove_param("polish_glossary_fp")
+
+    def _cache_key_suffix(self, text: str) -> str:
+        """[v23] 术语表按段指纹: 只哈希本段命中的术语条目。
+
+        与 prompt() 注入用同一套归一化匹配(_norm 剥离 {vN} 与非字母数字),
+        保证"注入了什么"与"键里编了什么"一致。未命中任何术语的段落用
+        显式空标记(与无后缀的旧形态键区分开)。"""
+        if not (self._polish_enabled and self._polish_glossary_path):
+            return ""
+        glossary = self._polish_glossary
+        if glossary is None and self._polish_glossary_path:
+            glossary = self._polish_glossary = self._load_polish_glossary()
+        if not glossary:
+            return ""
+
+        def _norm(s: str) -> str:
+            return re.sub(r"[^a-z0-9]", "", s.lower())
+
+        text_norm = _norm(re.sub(r"\{v\d+\}", "", text or ""))
+        matched = sorted(
+            (k, v) for k, v in glossary.items()
+            if _norm(k) and _norm(k) in text_norm
+        )
+        if not matched:
+            return "#g23:-"
+        blob = json.dumps(matched, ensure_ascii=False, sort_keys=True)
+        return "#g23:" + hashlib.md5(blob.encode("utf-8")).hexdigest()[:10]
 
     @property
     def _polish_context(self):
