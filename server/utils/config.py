@@ -116,6 +116,11 @@ class Config:
             self.engine = pdf2zh
 
         if self.engine == pdf2zh:
+            # [v23] 缺省回落守卫: bing 静默回落曾致整文档换键重译(实测 341 段
+            # 4.5 分钟), 直提请求必须带全插件同等字段。回落时大声告警。
+            if 'service' not in request_data or not request_data.get('service'):
+                print("⚠️ [Config] 请求未带 service 字段, 回落缺省 'bing'!"
+                      " 直提 /translate 请带全插件同等配置(service=silicon/targetLang=zh-CN 等)")
             self.service = request_data.get('service', 'bing')
             if self.service in [None, ''] or len(self.service) < 3:
                 self.service = 'bing'
