@@ -1,0 +1,31 @@
+{
+    "server": {
+        "host": "0.0.0.0",
+        "port": 8890
+    },
+    "zoteroPDF2zh": {
+        "url": "http://127.0.0.1:8890"
+    },
+    "translators": [
+        {
+            "name": "silicon",
+            "envs": {
+                "SILICON_API_KEY": "<在此填入你的硅基流动 API Key，sk- 开头>",
+                "SILICON_MODEL": "deepseek-ai/DeepSeek-V3.2",
+                "OPENAILIKED_API_KEY": "<备用 openailiked 服务的 Key>",
+                "OPENAILIKED_MODEL": "<备用模型名>",
+                "OPENAILIKED_BASE_URL": "<备用端点，如 https://dashscope.aliyuncs.com/compatible-mode/v1>",
+                "POLISH": null,
+                "POLISH_REFLECT": null,
+                "POLISH_DOMAIN": "<按论文领域填写，如 topology optimization / soft robotics；留空关闭>",
+                "POLISH_FORMULA_HINT": "0",
+                "POLISH_GLOSSARY": "D:/zotero-pdf2zh/server/glossary/terms.csv",
+                "POLISH_GUIDELINE": "D:/zotero-pdf2zh/server/glossary/guideline.txt",
+                "POLISH_REPORT_DIR": "D:/zotero-pdf2zh/server/translated/review",
+                "POLISH_ANCHOR": "1",
+                "POLISH_REPORT": "1"
+            }
+        }
+    ],
+    "NOTO_FONT_PATH": "D:\\zotero-pdf2zh\\server\\fonts\\LXGWNeoZhiSong.ttf"
+}

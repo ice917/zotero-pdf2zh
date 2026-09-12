@@ -1,0 +1,6 @@
+flask==3.1.3
+toml==0.10.2
+pypdf==6.16.1
+argparse
+PyMuPDF==1.25.2
+packaging==26.2

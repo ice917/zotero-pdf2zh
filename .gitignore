@@ -1,0 +1,41 @@
+server/translated/
+server/fonts/
+server/__pycache__/
+server/utils/__pycache__/
+server/zip/
+server.zip
+# 密钥文件不入库（模板见 server/config/config.example.json）
+server/config/config.json
+server/config/config.json.task
+logs/*.log
+*.staging
+*.backup
+
+# Python 缓存（项目根及任意层级，含 tools/）
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# 开源红线：版权译文/个人数据/交换目录 不入库（见 docs/OPEN_SOURCE_CHECKLIST.md）
+inbox/
+out/
+segflow/
+对照抽查点.md
+docs/
+zotero-pdf-2-zh-*.xpi
+
+# 开源红线二期: 含本机路径的工具/文档 (本地保留, 暂不开源)
+logs/
+UPGRADE_RUNBOOK.md
+server/md-translate/md2pdf.py
+tools/seam_review.py
+tools/seams_report.py
+tools/strategist.py
+tools/sync_patches.ps1
+tools/tests/
+zotero-pdf-2-zh-*.xpi
+
+# 密钥红线: 含真实 key 的配置 (模板 *.example 不受影响)
+server/config/config.toml
+server/md-translate/config.json
