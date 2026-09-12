@@ -184,6 +184,14 @@ def droppable_of(seg) -> set:
     return out
 
 
+def is_format_marker(issue: str) -> bool:
+    """[v26-L1] 模型偶尔把 prompt 里的格式编号(A/B)当成 issue 内容回吐。
+
+    实测 Cactaceae 一次运行: 25 条只报告项里 9 条 issue 仅为 "B", 且其 idx
+    都已被同段的内容条目覆盖 —— 纯噪声, 直接丢弃。"""
+    return bool(re.fullmatch(r"[A-Za-z]", (issue or "").strip()))
+
+
 def build_chunk_text(chunk) -> str:
     """[v26-L1] 组装送审文本: 段前标 [S<seq>], 跨页处置显式页边界标记, 段后
     附占位符图例与可删占位符清单。
@@ -258,6 +266,7 @@ def llm_review(client, model, chunk_text):
         "- 严禁在段首或段尾增删内容：跨页/跨段接缝不能靠补字接上，补了必然与\n"
         "  邻段或占位符内容重复；这类问题一律用 B 格式报告\n"
         "- find 不得跨越 {vN} 占位符（不得把它含在编辑区间内）\n"
+        "- issue 只写问题描述，不要只回吐 A/B 这类格式编号\n"
         "- 只报告确有必要的问题；没有问题则输出 []"
     )
     resp = client.chat.completions.create(
@@ -354,6 +363,8 @@ def llm_review_flow(segs, allow_drop: bool = False):
             replace = str(it.get("replace", "")).strip()
             if not find and not replace:
                 # [v24b.2] 只报告项 (跨页断句等无本地修复出口)
+                if is_format_marker(issue):
+                    continue                  # [v26-L1] 格式字母残条目: 丢弃
                 if issue:
                     reports.append({"idx": idx, "issue": issue})
                     print(f"  · S{idx} 只报告: {issue[:60]}")

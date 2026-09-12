@@ -10,7 +10,7 @@
     3. test_mirrors_sync.py      补丁镜像 MD5 门禁 (venv ↔ patches/)
     4. test_lookahead.py         v23.4 前瞻上下文单元测试 (10 例)
     5. test_docsummary.py        v24-A 文档摘要前置单元测试 (9 例)
-    6. test_strategist.py        v24b 军师层校验单元测试 (47 例, 含 v26-L1/L2)
+    6. test_strategist.py        v24b 军师层校验单元测试 (49 例, 含 v26-L1/L2)
 
 设计约定:
     - 全部 stdlib + venv 内 pdf2zh, 不需要 pytest

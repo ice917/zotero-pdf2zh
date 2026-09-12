@@ -8,6 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from strategist import (
     tokens_ok, extract_json_array, canon_remap, legend_of, load_segments,
     droppable_of, is_junk_glyph, build_chunk_text, PAGE_BREAK_MARK,
+    is_format_marker,
 )
 
 
@@ -130,6 +131,12 @@ def main():
     check("送审文本: 无页号不插标记",
           build_chunk_text([{**ch[0], "page": None},
                             {**ch[2], "page": None}]).count(PAGE_BREAK_MARK) == 0)
+
+    # [v26-L1] 报告噪声: 模型回吐格式编号(A/B)的残条目
+    check("噪声: 单字母格式标记识别", is_format_marker("B") and is_format_marker(" a "))
+    check("噪声: 真描述/空串不误判",
+          not is_format_marker("接缝断裂：段尾句子不完整")
+          and not is_format_marker("") and not is_format_marker(None))
 
     print(f"\n军师校验单元测试: {passed} PASS / {failed} FAIL")
     return 1 if failed else 0
