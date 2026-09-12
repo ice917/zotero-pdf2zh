@@ -14,6 +14,15 @@
   3) 物理切开 —— 两页译文拼读通顺。只报告, 不修 —— 补字必然与邻段开头重复;
   4) 排版如此 —— 原文本身断在参考文献作者名 / 跨多页表格处。只报告, 不动。
 
+[v26.3] 悬空功能词硬信号: 前段原文尾落在 in/of/and/were 这类词上 -> 送审文本里显式标注,
+prompt 禁止把带标注的接缝判成"物理切开"。起因: 模型把 S81 (`...fruit set in`) 判成
+"物理切开、无错误" —— 而 `in` 悬空恰恰证明该句并未结束。实测 25 条接缝 3 条带此信号
+(S81 漏判那条 / S87 已手术那条 / `In general` 良性一条)。信号一直在数据里, 缺的只是提示。
+实测效果 (15 条送审): S81 从"物理切开"纠正为"截断误译" ✔; 代价是 S114 / S130 被连带判为
+"截断误译"(人工已认定通顺/完整), 即**召回换精确** —— 且它们都因锚点校验失败停留在 reports
+层, 不写库, 人工多读两行即可排除。另实测模型会把建议写成 no-op(只复述一遍)或删掉非残渣
+占位符, 两类都已被 validate 拦下。
+
 产出: ~/.cache/pdf2zh/segflow/seam_review.json, 与军师报告同构
   {"corrections": [{idx, type, issue, find, replace}],
    "reports":     [{idx, type, issue}]}
@@ -22,6 +31,8 @@
     (脚本自身**不写缓存**; 军师看不到占位符背后的字形, 建议一律须人工过目)
   - reports 供 & $PY tools/seams_report.py --with-report --report <file> 交叉标注
   - 校验不过的 corrections 自动降级为 reports(附原因), 只损便利不丢信息
+  - "改哪一段"由模型用 which(前段/后段) 表达, 段号由脚本推出 —— 不采信模型自报的
+    段号 (实测模型把 idx 填成接缝序号 1, 于是这件事从设计上就不该交给模型)
 
 台账 (~/.cache/pdf2zh/segflow/surgery_log.json) 里登记过的接缝默认跳过 —— 已人工
 确认并处理过; --redo 可强制重审。
@@ -43,7 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from strategist import (load_segments, llm_client, extract_json_array,  # noqa: E402
                         legend_of, droppable_of, tokens_ok)
 from seams_report import (SIDECAR_DEFAULT, LOG_DEFAULT, collect_seams,  # noqa: E402
-                          sidecar_fp, load_ledger, kept_visible)
+                          sidecar_fp, load_ledger, kept_visible, dangling_word)
 
 REVIEW_DEFAULT = os.path.join(os.path.dirname(SIDECAR_DEFAULT), "seam_review.json")
 KINDS = ("截断误译", "头并句", "物理切开", "排版如此")
@@ -56,17 +67,22 @@ SYSMSG = (
     "切开, 前后两半分属不同页面(中间常隔着表格/图片, 因此两条接缝之间可能相隔很多段)。"
     "每条接缝给出四行对照: 前段原文尾 / 前段译文尾 / 后段原文头 / 后段译文头。\n\n"
     "逐条判定类型, 只输出 JSON 数组, 每条接缝一个对象:\n"
-    '{"seam": <接缝序号>, "idx": <需修正的段号, 无需修正写 0>, "type": "<类型>", '
+    '{"seam": <接缝序号>, "type": "<类型>", "which": "<前段|后段|无>", '
     '"issue": "<简述>", "find": "<该段译文中的连续片段>", "replace": "<修正后片段>"}\n\n'
     "type 必须是以下四种之一:\n"
     "1) 截断误译 —— 前段原文被切断, 译文尾是对残句的猜测, 与后段原文头语义不接。"
-    "可修: idx=前段号, find=前段译文尾那段错误译文;\n"
+    "可修: which=\"前段\", find=前段译文尾那段错误译文;\n"
     "2) 头并句 —— 后段译文头把本属前段的半句并了进来(与后段原文头不符)。"
-    "可修: idx=后段号, find=后段译文头多出来的片段;\n"
-    "3) 物理切开 —— 两页译文拼起来读得通, 没有错。idx 写 0;\n"
-    "4) 排版如此 —— 原文本身就断在参考文献作者名 / 跨多页表格处。idx 写 0。\n\n"
+    "可修: which=\"后段\", find=后段译文头多出来的片段;\n"
+    "3) 物理切开 —— 两页译文拼起来读得通, 没有错。which=\"无\";\n"
+    "4) 排版如此 —— 原文本身就断在参考文献作者名 / 跨多页表格处。which=\"无\"。\n\n"
+    "若某条带 ⟨前段原文尾是悬空功能词 …⟩ 标注: 前段原文尾落在 in / of / and / were 这类"
+    "词上, 该句后面必须还有成分 —— 这是句子被页边界硬切断的证据。带此标注的接缝"
+    "**不得判为 3) 物理切开**, 必须归入 1) 或 2)。\n\n"
     "硬性要求:\n"
-    "- 只有 1) 2) 才给 find/replace; 3) 4) 只写 type 与 issue\n"
+    "- which 只能是 \"前段\" / \"后段\" / \"无\" 三者之一 —— 要改的是前段还是后段; "
+    "绝不要写接缝序号或段序号, 段号由脚本按 which 推出\n"
+    "- 只有 1) 2) 才给 find/replace, 且 which 必须指向那段; 3) 4) 只写 type 与 issue\n"
     "- find 必须逐字复制自该段译文(含标点), 且在该段译文中唯一出现\n"
     "- 严禁靠增删段首/段尾内容来\"缝合\": 补进去的字必然与邻段或占位符内容重复。"
     "要修的是被切断后产生的错误译文, 不是接缝本身\n"
@@ -103,6 +119,10 @@ def seam_text(items, chars: int) -> str:
         lines = [head,
                  "前段原文尾: …" + a["raw"].rstrip()[-chars:],
                  "前段译文尾: …" + a["trans"].rstrip()[-chars:]]
+        dw = r.get("dangling") or dangling_word(a)
+        if dw:
+            lines.append(f"  ⟨前段原文尾是悬空功能词 '{dw}' —— 原文的句子在此处被硬切断, "
+                         f"并未结束; 后段头的内容很可能属于前一句⟩")
         lg = legend_of(a) or legend_of(b)
         if lg:
             lines.append(f"  ⟨占位符内容: {lg}⟩")
@@ -139,14 +159,12 @@ def call_llm(client, model, text: str):
     return extract_json_array(resp.choices[0].message.content) or []
 
 
-def validate(item, r, segs):
+def validate(idx, item, segs):
     """把一条修正建议对回原文/译文校验。返回 (ok, reason)。
 
-    复刻 strategist.load_curated 的三道关 (find 唯一 / 锚点 / 段号合法),
-    另加接缝专属约束: idx 必须是该接缝的前段或后段 —— 防止模型改到无关段。"""
-    idx = item.get("idx")
-    if idx not in (r["a"]["seq"], r["b"]["seq"]):
-        return False, f"idx={idx} 不属于该接缝(S{r['a']['seq']}/S{r['b']['seq']})"
+    复刻 strategist.load_curated 的两道关 (find 唯一 / 锚点), 以及段号合法。
+    idx 由脚本按 which 推出(前段/后段), 不采信模型自报的段号 —— 实测模型会把
+    idx 填成接缝序号 1, 于是"改哪一段"整件事从设计上就不该由模型表达。"""
     seg = next((s for s in segs if s["seq"] == idx), None)
     if seg is None:
         return False, f"S{idx} 段不存在"
@@ -154,6 +172,8 @@ def validate(item, r, segs):
     replace = str(item.get("replace") or "")
     if not find:
         return False, "find 为空"
+    if find == replace:
+        return False, "find 与 replace 相同(空操作)"   # 实测 S18: 模型只复述了一遍
     n = seg["trans"].count(find)
     if n != 1:
         return False, f"find 非唯一命中({n}次)"
@@ -237,12 +257,19 @@ def main() -> int:
                             "issue": f"(类型不合法) {issue}", "seam": head})
             continue
         if kind in FIXABLE:
-            ok, why = validate(it, r, segs)
+            which = str(it.get("which") or "").strip()
+            idx = {"前段": r["a"]["seq"], "后段": r["b"]["seq"]}.get(which)
+            if idx is None:
+                reports.append({"idx": r["a"]["seq"], "type": kind,
+                                "issue": f"(which={which!r} 无法定位到前段/后段) {issue}",
+                                "seam": head})
+                continue
+            ok, why = validate(idx, it, segs)
             if ok:
-                corrections.append({"idx": it["idx"], "type": kind, "issue": issue,
+                corrections.append({"idx": idx, "type": kind, "issue": issue,
                                     "find": str(it["find"]), "replace": str(it.get("replace") or "")})
                 continue
-            reports.append({"idx": r["a"]["seq"], "type": kind,
+            reports.append({"idx": idx, "type": kind,
                             "issue": f"(校验未过: {why}) {issue}", "seam": head})
             continue
         reports.append({"idx": r["a"]["seq"], "type": kind, "issue": issue, "seam": head})

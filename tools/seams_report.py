@@ -14,6 +14,8 @@
      永远找不到, 按"正文段相邻"就现形了;
   2. 标记: 前段译文尾无句末标点 -> "疑断"; 后段原文首为小写字母且前段原文尾
      无句末标点 -> "疑续"; 两条同时成立标 [!] (强疑断句), 单条成立标 [~];
+     前段原文尾若落在介词/连词/系动词上, 另标 [悬空词:in] —— 这是"句子在此处
+     被硬切断"的证据, 比前两条都硬 (实测它捞出了模型漏判的 S81);
   3. 高噪接缝(图注/章节标题/文献条目/短段密集区)默认折叠, --all 展开 —— 实测
      它们的标记几乎全是 [~], 人工一眼可排除, 却占了清单的一半; 台账登记过的
      不折叠 (已确认是真接缝, 不因"段短/含拉丁学名"再被藏起来);
@@ -59,6 +61,16 @@ _RAW_END_RE = re.compile(r"[.?!;:]\s*$")             # 原文句末标点
 _LOWER_RE = re.compile(r"^[a-z]")
 _CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
+# [v26.3] 悬空功能词: 前段原文尾落在介词/连词/冠词/系动词上 = 该句在页边界被切断的
+# **硬证据**(这些词后面必须还有成分)。实测 Cactaceae 25 条接缝里有 3 条带此信号:
+#   S81 `...fruit set in`      -> 模型漏判为"物理切开"的那条
+#   S87 `...indirect estimations were` -> 同一类型, 已手术
+#   S130 `...In`(In general)   -> 良性, 译文已正确合并
+# 即精确率 2/3 且恰好覆盖漏判 —— 信号一直在数据里, 只是没告诉模型去看。
+DANGLING_WORDS = frozenset((
+    "in on of to and or for with at by as from into during while when "
+    "that which the a an is are was were be been being").split())
+
 SHORT_SEG_CHARS = 45        # "短段"阈值: 文献条目普遍短于正文段
 DENSE_WINDOW = 3            # 短段密集区判定窗口 (前后各若干段)
 DENSE_NEED = 2              # 窗口内至少还有几个短段
@@ -72,6 +84,18 @@ TITLE_MAX_CHARS = 12        # 译文实义长度下限: 低于此值且无句末
 def body_text(raw: str) -> str:
     """剥掉 {vN} 后的实义文本: 用来识别表格/页脚/纯占位符段。"""
     return TOKEN_RE.sub("", raw or "").strip()
+
+
+def dangling_word(seg) -> str:
+    """前段原文尾的悬空功能词 (无则空串)。
+
+    先把 {vN} 换成空格再取末词, 这样 `estimations were{v97}` 也能识别出 `were`。"""
+    t = TOKEN_RE.sub(" ", seg.get("raw") or "").rstrip()
+    words = t.split()
+    if not words:
+        return ""
+    w = words[-1].strip(".,;:()[]\"'").lower()
+    return w if w in DANGLING_WORDS else ""
 
 
 def sidecar_fp(segs) -> str:
@@ -182,6 +206,7 @@ def collect_seams(segs, min_chars: int = 2):
         cont = bool(_LOWER_RE.match(rb)) and not _RAW_END_RE.search(ra)
         flag = "[!]" if (cut and cont) else ("[~]" if (cut or cont) else "[ ]")
         rows.append({"flag": flag, "a": a, "b": b, "gap": b["seq"] - a["seq"] - 1,
+                     "dangling": dangling_word(a),
                      "noise": _noise_kind(a, dense[i - 1]) or _noise_kind(b, dense[i])})
     return body, rows
 
@@ -257,6 +282,8 @@ def main() -> int:
         head = f"{r['flag']} S{a['seq']}(p{a['page']}) -> S{b['seq']}(p{b['page']})"
         if r["gap"]:
             head += f"   隔{r['gap']}段"
+        if r["dangling"]:
+            head += f"   [悬空词:{r['dangling']}]"
         if r["noise"]:
             head += f"   [{r['noise']}]"
         done = [ledger[i] for i in (a["seq"], b["seq"]) if i in ledger]
@@ -274,6 +301,7 @@ def main() -> int:
 
     out.append("")
     out.append("[!] = 前段译文无句末标点 且 后段原文以小写续接, 最可能是被切开的同一句话")
+    out.append("[悬空词:x] = 前段原文尾落在 in/of/and/were 这类词上 —— 句子被硬切断的铁证")
     out.append("逐条判定: 译文语义被扭曲 -> 截断误译必修; 两页拼读通顺 -> 默认不修;")
     out.append("          原文本身如此排版(参考文献作者名 / 跨多页表格) -> 不动。")
     out.append("处理完登记台账, 下次运行即标 [已手术]: --mark <段号> --note <说明>")
