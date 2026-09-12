@@ -8,6 +8,9 @@
     1. test_cache_canonical.py   缓存规范化单元测试 (10 例, 临时库)
     2. test_cache_integration.py v22→v23 迁移集成测试 (合成数据, 临时库)
     3. test_mirrors_sync.py      补丁镜像 MD5 门禁 (venv ↔ patches/)
+    4. test_lookahead.py         v23.4 前瞻上下文单元测试 (10 例)
+    5. test_docsummary.py        v24-A 文档摘要前置单元测试 (9 例)
+    6. test_strategist.py        v24b 军师层校验单元测试 (15 例)
 
 设计约定:
     - 全部 stdlib + venv 内 pdf2zh, 不需要 pytest

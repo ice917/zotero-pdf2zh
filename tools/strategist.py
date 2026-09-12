@@ -8,11 +8,12 @@
   3. 术语漂移 (同一概念前后译法不一致)
   4. 文风突变 (口语化/翻译腔突兀)
 
-用法:
-  干跑(只看修正建议):  venv python tools/strategist.py
-  应用修正:            venv python tools/strategist.py --apply
+用法 (解释器同 tools/tests/run_all.py; 仓库无 venv 目录, 用绝对路径):
+  PY = D:/Users/97638/anaconda3/envs/zotero-pdf2zh-venv/python.exe
+  干跑(只看修正建议):  & $PY tools/strategist.py
+  应用修正:            & $PY tools/strategist.py --apply
   指定 sidecar:        --sidecar <path>
-  人工裁剪后精准应用:  venv python tools/strategist.py --from-report <curated.json> --apply --allow-drop
+  人工裁剪后精准应用:  & $PY tools/strategist.py --from-report <curated.json> --apply --allow-drop
 
 安全机制:
   - 锚点校验: 修正译文的 {vN} 占位符多重集必须与原文完全一致, 否则丢弃
