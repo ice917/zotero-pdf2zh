@@ -55,6 +55,7 @@ class TranslationCache:
         ), "current cache require translate engine name less than 20 characters"
         self.translate_engine = translate_engine
         self.legacy_params_json = None
+        self.prev_params_json = None
         self._legacy_canon_index = None
         self.replace_params(translate_engine_params)
 
@@ -90,6 +91,15 @@ class TranslationCache:
         旧缓存条目按此形态命中, 实现零重译迁移。"""
         self.legacy_params_json = self.translate_engine_params
         self._legacy_canon_index = None   # 惰性构建
+
+    def snapshot_prev_key(self):
+        """[v24-A] 登记当前参数形态为"上代形态" (在加入新一代键参数前调用)。
+
+        与 legacy 的区别: prev 是紧接着的上一代 (如 doc_summary_fp 加入前的
+        形态, 即 v23 世代条目所在形态), legacy 是更早的大版本形态。get() 会
+        依次回查两种形态, 渐进化改造不再只有一层。"""
+        self.prev_params_json = self.translate_engine_params
+        self._legacy_canon_index = None   # 索引需含新旧两代, 重建
 
     def _legacy_index(self):
         """[v23] 旧条目规范化索引 (惰性, 每引擎一次)。
@@ -163,65 +173,64 @@ class TranslationCache:
     def get(self, original_text: str, key_suffix: str = "") -> Optional[str]:
         canon_text, cur_seq = self._canon_seq(original_text)
         pj = self._params_json(key_suffix)
-        # ① 新形态: 规范化文本键 (v23 写入形态)
-        row = _TranslationCache.get_or_none(
-            translate_engine=self.translate_engine,
-            translate_engine_params=pj,
-            original_text=canon_text,
-        )
-        # ② 新形态: 原文键 (防御; 规范键命中失败时文本级相同条目仍可用)
-        if row is None and canon_text != original_text:
-            row = _TranslationCache.get_or_none(
+        # [v23.4 泛化] 参数历史形态 (去重保序): 当前 → prev(上代, 如 doc fp
+        # 加入前) → legacy(更早, 整表 glossary fp)。渲染进程中参数可能演化
+        # (摘要 fp 首次加入即触发), 旧行停留在历史形态 —— 每种形态都要能
+        # 回查, 否则一次键演化 = 全文重译(实测 601s 教训)。
+        forms = [pj]
+        for extra in (getattr(self, "prev_params_json", None),
+                      getattr(self, "legacy_params_json", None)):
+            if extra and extra not in forms:
+                forms.append(extra)
+
+        def _direct(form, key_text):
+            return _TranslationCache.get_or_none(
                 translate_engine=self.translate_engine,
-                translate_engine_params=pj,
-                original_text=original_text,
+                translate_engine_params=form,
+                original_text=key_text,
             )
-        # ③ 旧形态回查 (v23 前条目): 参数 JSON 与当前不同才值得查。
-        # 术语表场景下旧形态含整表 fp, 表未变才能命中 → 天然安全门。
-        # sqlite 精确匹配找不到"规范化相等、原文不等"的旧行, 故先查
-        # 规范化内存索引; 命中后回写规范形态, 后续直查新形态键。
-        if row is None:
-            legacy = self.legacy_params_json
-            if legacy and legacy != pj:
-                idx = self._legacy_index()
-                hit = idx.get((legacy, canon_text))
+
+        def _migrate_store(row):
+            """[v23.3] 历史形态命中即回写当前形态; 译文规范化必须用
+            "存入时原文"的 seq (行内 token 是存入时全局编号)。"""
+            try:
+                canon_stored, stored_seq_s = self._canon_seq(row.original_text)
+
+                def _wb_repl(m):
+                    return stored_seq_s.get(m.group(0), m.group(0))
+
+                canon_trans = _TOKEN_RE.sub(_wb_repl, row.translation)
+                _TranslationCache.create(
+                    translate_engine=self.translate_engine,
+                    translate_engine_params=pj,
+                    original_text=canon_stored,
+                    translation=canon_trans,
+                )
+            except Exception as e:
+                logger.debug(f"Legacy migration write-back failed: {e}")
+
+        # ① 当前形态: 规范化文本键 → 原文键 (防御)
+        row = _direct(pj, canon_text)
+        if row is None and canon_text != original_text:
+            row = _direct(pj, original_text)
+        if row is not None:
+            return self._remap(row.original_text, row.translation, cur_seq)
+        # ② 历史形态回查: 规范化内存索引 (旧行以 raw 文本入库, sqlite 精确
+        # 匹配找不到"规范化相等、原文不等"的行) → 直查 → 命中回写迁移。
+        if len(forms) > 1:
+            idx = self._legacy_index()
+            for form in forms[1:]:
+                hit = idx.get((form, canon_text))
                 if hit is not None:
                     stored_original, stored_translation = hit
                     return self._remap(stored_original, stored_translation, cur_seq)
-                row = _TranslationCache.get_or_none(
-                    translate_engine=self.translate_engine,
-                    translate_engine_params=legacy,
-                    original_text=canon_text,
-                )
+                row = _direct(form, canon_text)
                 if row is None and canon_text != original_text:
-                    row = _TranslationCache.get_or_none(
-                        translate_engine=self.translate_engine,
-                        translate_engine_params=legacy,
-                        original_text=original_text,
-                    )
+                    row = _direct(form, original_text)
                 if row is not None:
-                    # [v23] 回写迁移: 旧形态命中即补写规范形态, 后续免回查。
-                    # 译文规范化必须用"存入时原文"的 seq (行内 token 是存入时
-                    # 全局编号, 与当前编号无关)。
-                    try:
-                        canon_stored, stored_seq_s = self._canon_seq(row.original_text)
-
-                        def _wb_repl(m):
-                            return stored_seq_s.get(m.group(0), m.group(0))
-
-                        canon_trans = _TOKEN_RE.sub(_wb_repl, row.translation)
-                        _TranslationCache.create(
-                            translate_engine=self.translate_engine,
-                            translate_engine_params=pj,
-                            original_text=canon_stored,
-                            translation=canon_trans,
-                        )
-                    except Exception as e:
-                        logger.debug(f"Legacy migration write-back failed: {e}")
+                    _migrate_store(row)
                     return self._remap(row.original_text, row.translation, cur_seq)
-        if row is None:
-            return None
-        return self._remap(row.original_text, row.translation, cur_seq)
+        return None
 
     def set(self, original_text: str, translation: str, key_suffix: str = ""):
         try:

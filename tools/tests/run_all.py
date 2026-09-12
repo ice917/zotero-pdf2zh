@@ -26,6 +26,7 @@ SUITES = [
     "test_cache_canonical.py",    # 单元
     "test_cache_integration.py",  # 集成
     "test_lookahead.py",          # v23.4 前瞻上下文
+    "test_docsummary.py",         # v24-A 文档摘要前置
 ]
 
 

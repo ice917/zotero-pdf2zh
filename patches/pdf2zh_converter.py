@@ -388,6 +388,24 @@ class TranslateConverter(PDFConverterEx):
 
         heads = [_lookahead_of(i) for i in range(len(sstk))]
 
+        # [自研补丁 2026-09-12 v24-A 文档摘要前置] 流式架构下翻译第 1 页时
+        # 全文尚未解析, 用首页文本(标题+摘要+引言, 信息密度最高)生成一次
+        # "文档画像", 此后每段 prompt 都携带全局上下文 —— 实现用户要求的
+        # "通读全文"意识而不破坏切片/缓存/版面三约束。摘要落盘
+        # (~/.cache/pdf2zh/docsummary/), 同文档永远复用同一份, 键不漂移;
+        # fp 经 add_params 进键, 旧条目走 v23 旧形态回查, 零重译迁移。
+        # 每文档仅执行一次(_doc_summary_done 门闩), 失败安全。
+        try:
+            _tr = self.translator
+            if (hasattr(_tr, "summarize_document")
+                    and not getattr(_tr, "_doc_summary_done", False)):
+                _tr._doc_summary_done = True
+                _txt = " ".join(s for s in sstk if len(s.strip()) > 40)[:4000]
+                if len(_txt) > 600:
+                    _tr.summarize_document(_txt)
+        except Exception:
+            pass
+
         @retry(wait=wait_fixed(1))
         def worker(s: str, head: str = ""):  # 多线程翻译
             if not s.strip() or re.match(r"^\{v\d+\}$", s):  # 空白和公式不翻译

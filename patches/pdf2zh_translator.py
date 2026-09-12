@@ -605,6 +605,62 @@ class OpenAITranslator(BaseTranslator):
         except Exception:
             return ""
 
+    def summarize_document(self, text: str) -> str:
+        """[v24-A 文档摘要前置] 全文画像: 翻译每一段前, 让 LLM 先"通读"过这篇论文。
+
+        由 converter 在首页派发翻译前调用 (首页含标题/摘要/引言, 信息密度最高)。
+        生成一次落盘 (~/.cache/pdf2zh/docsummary/<md5>.txt), 同文档后续渲染直接
+        读文件 —— 摘要稳定, 缓存键 (doc_summary_fp) 才稳定, 否则每次渲染摘要
+        漂移会作废整篇缓存。失败安全: 任何异常返回空串, 管线不受影响。"""
+        try:
+            text = (text or "").strip()
+            if len(text) < 400:
+                return getattr(self, "_doc_summary", "") or ""
+            key = hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
+            folder = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "docsummary")
+            os.makedirs(folder, exist_ok=True)
+            path = os.path.join(folder, key + ".txt")
+            summary = ""
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    summary = f.read().strip()
+            if not summary:
+                messages = [
+                    {"role": "system", "content": "You are a concise academic assistant."},
+                    {"role": "user", "content":
+                        "Read this beginning of an academic paper and write a compact "
+                        "context brief IN CHINESE (at most 120 Chinese characters) for "
+                        "translators who will translate the FULL paper sentence by "
+                        "sentence without seeing the whole document. Include: subject "
+                        "domain, paper type, core method/object, and key terminology "
+                        "conventions. Output ONLY the brief.\n\n" + text[:4000]},
+                ]
+                response = self.client.chat.completions.create(
+                    model=self.model, **self.options, messages=messages)
+                summary = response.choices[0].message.content.strip()
+                summary = self.think_filter_regex.sub("", summary).strip()
+                # 空摘要不落盘: 留待下次渲染重试, 避免空文件永久占位
+                if summary:
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write(summary)
+                    print(f"📄 [文档摘要] 已生成并落盘 ({len(summary)} 字): {summary[:50]}…", flush=True)
+                else:
+                    return ""
+            # [v24-A] fp 入键前快照当前形态为"上代形态": v23 世代条目(无 doc fp)
+            # 经该形态回查, 一次键演化不再触发全文重译
+            self.cache.snapshot_prev_key()
+            self._doc_summary = summary
+            fp = "docsummary:" + key + ":" + hashlib.md5(summary.encode("utf-8")).hexdigest()[:8]
+            self.add_cache_impact_parameters("doc_summary_fp", fp)
+            return summary
+        except Exception:
+            logger.exception("Document summarization failed, ignore it.")
+            return getattr(self, "_doc_summary", "") or ""
+
+    def _doc_context(self) -> str:
+        """[v24-A] 读取文档画像 (缺省空)。"""
+        return (getattr(self, "_doc_summary", "") or "").strip()
+
     def _cache_key_suffix(self, text: str) -> str:
         """[v23] 术语表按段指纹: 只哈希本段命中的术语条目。
 
@@ -779,6 +835,19 @@ class OpenAITranslator(BaseTranslator):
                             break
         except Exception:
             logging.exception("Init-prompt glossary injection failed, ignore it.")
+        # [v24-A] 文档画像前置: 每段翻译都带着"这篇论文在干什么"的全局意识
+        try:
+            doc_ctx = self._doc_context()
+            if doc_ctx:
+                block = ("[Document context] This segment is from the following "
+                         "academic paper — use it for domain awareness and "
+                         "terminology consistency:\n" + doc_ctx + "\n\n")
+                for m in messages:
+                    if m.get("role") == "user":
+                        m["content"] = block + m["content"]
+                        break
+        except Exception:
+            logging.exception("Doc-context injection failed, ignore it.")
         # [v23.4] 前瞻上下文注记 (跨页断句瓦片错落): 让残句按完整语义翻译
         try:
             self._inject_look_ahead(messages)
