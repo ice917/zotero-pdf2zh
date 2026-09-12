@@ -1368,7 +1368,9 @@ class PDFTranslator:
             '--lang-out', str(config.targetLang),
             '--config-file', str(config_path[pdf2zh_next]), # 使用默认的config path路径
         ]
-        # TODO: 增加术语表的地址
+        # [自研补丁 2026-09-04] 术语表改由 utils/config.py 写入 config.toml:
+        # babeldoc 只认带 source/target 表头的 CSV, 直传源术语表会在装载阶段
+        # 抛 ValueError, 故由配置层派生 terms.babeldoc.csv 后透传。
         if config.no_watermark:
             cmd.extend(['--watermark-output-mode', 'no_watermark'])
         else:
@@ -1400,8 +1402,10 @@ class PDFTranslator:
             cmd.append('--no-auto-extract-glossary')
         if config.dual_mode == 'TB': # TB or LR, LR是defualt的
             cmd.append('--use-alternating-pages-dual')
-        if config.translate_table_text:
-            cmd.append('--translate-table-text')
+        # [自研补丁 2026-09-04] 表格文字开关不再走 CLI: pdf2zh_next 的
+        # PDFSettings.translate_table_text 模型默认值是 True, build_args_parser
+        # 据此把它注册成 action="store_false", 传 --translate-table-text 反而
+        # 是把它关掉(上游语义反转 bug)。改由 utils/config.py 写入 config.toml。
         if config.ocr:
             cmd.append('--ocr-workaround')
         if config.auto_ocr:

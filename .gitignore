@@ -11,6 +11,9 @@ logs/*.log
 *.staging
 *.backup
 
+# pdf2zh_next 术语表派生副本（由 server/utils/config.py 每次请求重新生成）
+server/glossary/terms.babeldoc.csv
+
 # Python 缓存（项目根及任意层级，含 tools/）
 __pycache__/
 *.py[cod]

@@ -45,6 +45,52 @@ def _normalize_openai_send_temperature_key(values):
     values.pop(_OPENAI_SEND_TEMPERATURE_ALIAS, None)
 
 
+# [自研补丁 2026-09-12] pdf2zh_next 侧强制关闭思考模式的字段表(按服务分组)。
+# 字段语义实测自 pdf2zh_next 2.9.0:
+#   deepseek_thinking_mode="disabled" -> extra_body={"thinking": {"type": "disabled"}}
+#   siliconflow_enable_thinking=False + siliconflow_send_enable_thinking_param=True
+#       -> extra_body={"enable_thinking": False}
+# 注意 send_*_param=False 的语义是"根本不发这个参数", 服务商会按自己的默认值
+# 开启思考; 所以要真正关掉, 必须显式发送 False, 而不是靠不发送。
+_NEXT_THINKING_OFF = {
+    'deepseek': (
+        ('deepseek_thinking_mode', 'disabled'),
+        # reasoning_effort 只在 thinking=enabled 时有意义, 一并移除
+        ('deepseek_reasoning_effort', None),
+    ),
+    'siliconflow': (
+        ('siliconflow_enable_thinking', False),
+        ('siliconflow_send_enable_thinking_param', True),
+    ),
+}
+
+
+def _force_disable_next_thinking(service, llm_api):
+    """[自研补丁 2026-09-12] 无条件关闭 pdf2zh_next 的思考模式。
+
+    pdf2zh_next 的 LLM 路径要求模型返回结构化 JSON, 思考内容混进响应体有解析
+    失败风险, 且会显著增加 token 费用, 故在配置层覆盖插件里保存的设置(总是关闭)。
+    只处理当前服务自己的字段, 避免把别家服务的键写进无关的 *_detail 表。
+    """
+    rules = _NEXT_THINKING_OFF.get(service)
+    if not rules:
+        return
+    extra = llm_api.get('extraData')
+    extra = dict(extra) if isinstance(extra, dict) else {}
+    changed = []
+    for key, value in rules:
+        if value is None:
+            if extra.pop(key, None) is not None:
+                changed.append(f'{key}=已移除')
+            continue
+        if extra.get(key) != value:
+            changed.append(f'{key}={value}')
+        extra[key] = value
+    llm_api['extraData'] = extra
+    if changed:
+        print('🧠 [自研补丁] pdf2zh_next 强制关闭思考: ' + ', '.join(changed))
+
+
 def _safe_log_value(key, value):
     name = str(key or '').lower()
     if any(token in name for token in ('key', 'token', 'secret', 'password', 'auth')):
@@ -53,6 +99,42 @@ def _safe_log_value(key, value):
             return ''
         return ('*' * 8 + raw[-4:]) if len(raw) > 4 else ('*' * len(raw))
     return value
+
+
+_NEXT_GLOSSARY_HEADER = ('source', 'target')
+
+
+def _build_next_glossary():
+    """[自研补丁 2026-09-04] 为 pdf2zh_next 派生一份带表头的术语表副本。
+
+    babeldoc 的 Glossary.from_csv 用 csv.DictReader 解析, 并强制要求存在
+    source/target 两列; 本项目 glossary/terms.csv 是无表头的两列文件,
+    直接透传会抛 ValueError, 整篇翻译在配置装载阶段就失败。故派生一份
+    副本, 源文件保持不动(pdf2zh 1.x 的润色管线仍读源文件)。
+
+    返回可用的绝对路径字符串; 无术语表或派生失败时返回 None。
+    """
+    src = Path(__file__).resolve().parent.parent / 'glossary' / 'terms.csv'
+    if not src.is_file():
+        return None
+    try:
+        import csv
+        import io as _io
+        with src.open('r', encoding='utf-8-sig', newline='') as f:
+            rows = [r for r in csv.reader(f) if r and any(c.strip() for c in r)]
+        # 用户手工编辑时可能补上表头, 避免写出重复表头行
+        if rows and [c.strip().lower() for c in rows[0][:2]] == list(
+                _NEXT_GLOSSARY_HEADER):
+            body = rows
+        else:
+            body = [list(_NEXT_GLOSSARY_HEADER)] + rows
+        buf = _io.StringIO()
+        csv.writer(buf).writerows(body)
+        _atomic_write_text(src.with_name('terms.babeldoc.csv'), buf.getvalue())
+    except Exception as exc:
+        print(f"⚠️ 派生 pdf2zh_next 术语表失败, 本次不透传术语表: {exc}")
+        return None
+    return str(src.with_name('terms.babeldoc.csv'))
 
 
 def stringToBoolean(value):
@@ -411,23 +493,27 @@ class Config:
                     self.llm_api,
                     old_config,
                 )
-                if is_deepseek_v4_model(effective_deepseek_model):
-                    extra_data = self.llm_api.get("extraData") or {}
-                    thinking_mode = extra_data.get(
-                        "deepseek_thinking_mode", "disabled"
-                    )
-                    # winexe bypasses execute_with_progress(), so protect that
-                    # execution path here. uv/conda/system runtimes are checked
-                    # against the exact executable immediately before launch.
-                    write_thinking_fields = validate_winexe_runtime_if_selected(
-                        config_file,
-                        effective_deepseek_model,
-                        thinking_mode=thinking_mode,
-                    )
-                    if not write_thinking_fields:
-                        extra_data.pop("deepseek_thinking_mode", None)
-                        extra_data.pop("deepseek_reasoning_effort", None)
-                        self.llm_api["extraData"] = extra_data
+            # [自研补丁 2026-09-12] 强制关闭思考, 必须早于下面的 winexe 运行时校验:
+            # 否则插件里残留的 "enabled" 会先触发校验, 把整次翻译拦下来。
+            _force_disable_next_thinking(service, self.llm_api)
+            if service == 'deepseek' and is_deepseek_v4_model(
+                    effective_deepseek_model):
+                extra_data = self.llm_api.get("extraData") or {}
+                thinking_mode = extra_data.get(
+                    "deepseek_thinking_mode", "disabled"
+                )
+                # winexe bypasses execute_with_progress(), so protect that
+                # execution path here. uv/conda/system runtimes are checked
+                # against the exact executable immediately before launch.
+                write_thinking_fields = validate_winexe_runtime_if_selected(
+                    config_file,
+                    effective_deepseek_model,
+                    thinking_mode=thinking_mode,
+                )
+                if not write_thinking_fields:
+                    extra_data.pop("deepseek_thinking_mode", None)
+                    extra_data.pop("deepseek_reasoning_effort", None)
+                    self.llm_api["extraData"] = extra_data
 
             new_config = old_config.copy() # 我们假设config.toml文件的格式没有问题
 
@@ -443,6 +529,25 @@ class Config:
                 translation_config.pop('pool_max_workers', None)
             pdf_config = new_config.setdefault('pdf', {})
             pdf_config['only_include_translated_page'] = self.only_include_translated_page
+            # [自研补丁 2026-09-04] 表格文字开关必须以 config.toml 为准:
+            # pdf2zh_next 的 PDFSettings.translate_table_text 模型默认值是 True,
+            # build_args_parser 按默认值把它注册成 action="store_false", 于是
+            # CLI 传 --translate-table-text 反而会把它关掉(上游语义反转 bug),
+            # 实测 settings 里恒为 False。故不再走 CLI, 改在此写入权威值。
+            pdf_config['translate_table_text'] = self.translate_table_text
+
+            # [自研补丁 2026-09-04] 术语表透传(此前是 server.py 里的 TODO)。
+            # 无术语表时必须 pop, 否则会残留上一次请求的路径。
+            _next_glossary = _build_next_glossary()
+            if _next_glossary:
+                translation_config['glossaries'] = _next_glossary
+                print(f"✏️ 透传术语表: {_next_glossary}")
+            else:
+                translation_config.pop('glossaries', None)
+            # 有自有术语表时关掉自动抽取: 避免两套术语源互相打架, 同时省掉
+            # 全文档术语抽取那一整轮 LLM 调用(实测 34 页 4034 项)。
+            translation_config['no_auto_extract_glossary'] = (
+                bool(_next_glossary) or self.disable_glossary)
 
             translator = None 
             if f'{service}_detail' in new_config:
