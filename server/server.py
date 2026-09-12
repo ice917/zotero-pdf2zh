@@ -611,34 +611,51 @@ class PDFTranslator:
         inflight_name = None
 
         try:
+            # [自研补丁 2026-09-12 v23.3] force 直通道: 缓存手术/修复译文后,
+            # 同名重提会被历史去重拦成空操作(返回旧产物), 永远用不上新缓存。
+            # 请求带 "force": true 时跳过三类去重(活跃/在途/历史), 强制真渲染。
+            _req_data = request.get_json(silent=True) or {}
+            _force = isinstance(_req_data, dict) and bool(_req_data.get("force"))
+
             # [自研补丁 2026-09-03] 同名任务幂等去重(报告 🔴4): 必须在
             # process_request 落盘之前判定, 否则后到请求会截断正在被子进程
             # 读取的输入文件、产物互相覆盖。
-            dup_id, fname = self._register_inflight(task_id)
-            if dup_id:
-                print(f"ℹ️ [/translate] 同名文件「{fname}」已有进行中任务 {dup_id}，复用该任务")
-                if self._client_wants_async_job():
-                    return jsonify({
-                        'status': 'accepted',
-                        'taskId': dup_id,
-                        'message': '该文件正在翻译中，已复用现有翻译任务',
-                    }), 200
-                # 旧插件同步协议: 等待复用任务结束后返回它的产物
-                payload = self._wait_for_task_payload(dup_id)
-                if payload and payload.get('status') == 'success':
-                    return jsonify(payload), 200
-                if self._active_task_id_for_file(fname):
-                    # 等待超时但任务仍在跑: 不能重提(会覆盖输入), 交回任务列表
-                    return jsonify({
-                        'status': 'accepted', 'taskId': dup_id,
-                        'message': '该文件翻译仍在进行中，请稍后在任务列表查看结果',
-                    }), 200
-                # 复用任务确已失败: 登记本任务重新翻译
-                with _SUBMIT_LOCK:
-                    _INFLIGHT_FILES.setdefault(fname, task_id)
-                inflight_name = fname
+            if _force:
+                print("⚠️ [/translate] force=true: 跳过去重, 强制重新渲染")
+                fname = None
+                if isinstance(_req_data, dict):
+                    fname = self._safe_upload_filename(_req_data.get("fileName")) or None
+                if fname:
+                    with _SUBMIT_LOCK:
+                        _INFLIGHT_FILES[fname] = task_id
+                    inflight_name = fname
+                dup_id = None
             else:
-                inflight_name = fname
+                dup_id, fname = self._register_inflight(task_id)
+                if dup_id:
+                    print(f"ℹ️ [/translate] 同名文件「{fname}」已有进行中任务 {dup_id}，复用该任务")
+                    if self._client_wants_async_job():
+                        return jsonify({
+                            'status': 'accepted',
+                            'taskId': dup_id,
+                            'message': '该文件正在翻译中，已复用现有翻译任务',
+                        }), 200
+                    # 旧插件同步协议: 等待复用任务结束后返回它的产物
+                    payload = self._wait_for_task_payload(dup_id)
+                    if payload and payload.get('status') == 'success':
+                        return jsonify(payload), 200
+                    if self._active_task_id_for_file(fname):
+                        # 等待超时但任务仍在跑: 不能重提(会覆盖输入), 交回任务列表
+                        return jsonify({
+                            'status': 'accepted', 'taskId': dup_id,
+                            'message': '该文件翻译仍在进行中，请稍后在任务列表查看结果',
+                        }), 200
+                    # 复用任务确已失败: 登记本任务重新翻译
+                    with _SUBMIT_LOCK:
+                        _INFLIGHT_FILES.setdefault(fname, task_id)
+                    inflight_name = fname
+                else:
+                    inflight_name = fname
 
             input_path, config = self.process_request()
             infile_type = self.get_filetype(input_path)
