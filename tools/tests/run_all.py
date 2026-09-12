@@ -27,6 +27,7 @@ SUITES = [
     "test_cache_integration.py",  # 集成
     "test_lookahead.py",          # v23.4 前瞻上下文
     "test_docsummary.py",         # v24-A 文档摘要前置
+    "test_strategist.py",         # v24b 军师层校验
 ]
 
 

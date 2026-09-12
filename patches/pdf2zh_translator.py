@@ -650,8 +650,7 @@ class OpenAITranslator(BaseTranslator):
             # 经该形态回查, 一次键演化不再触发全文重译
             self.cache.snapshot_prev_key()
             self._doc_summary = summary
-            fp = "docsummary:" + key + ":" + hashlib.md5(summary.encode("utf-8")).hexdigest()[:8]
-            self.add_cache_impact_parameters("doc_summary_fp", fp)
+            self.add_cache_impact_parameters("doc_summary_fp", self._doc_summary_fp(text))
             return summary
         except Exception:
             logger.exception("Document summarization failed, ignore it.")
@@ -660,6 +659,13 @@ class OpenAITranslator(BaseTranslator):
     def _doc_context(self) -> str:
         """[v24-A] 读取文档画像 (缺省空)。"""
         return (getattr(self, "_doc_summary", "") or "").strip()
+
+    def _doc_summary_fp(self, text: str) -> str:
+        """[v24-A] 文档画像指纹 (摘要内容 + 文本键), 供缓存键/落盘复用。"""
+        t = (text or "").strip()
+        key = hashlib.md5(t.encode("utf-8")).hexdigest()[:16] if t else "-"
+        s = (getattr(self, "_doc_summary", "") or "").strip()
+        return f"docsummary:{key}:{hashlib.md5(s.encode('utf-8')).hexdigest()[:8] if s else 'none'}"
 
     def _cache_key_suffix(self, text: str) -> str:
         """[v23] 术语表按段指纹: 只哈希本段命中的术语条目。

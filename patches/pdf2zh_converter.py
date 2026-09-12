@@ -1,5 +1,7 @@
 import concurrent.futures
+import json
 import logging
+import os
 import re
 import unicodedata
 from enum import Enum
@@ -50,6 +52,9 @@ class PDFConverterEx(PDFConverter):
         rsrcmgr: PDFResourceManager,
     ) -> None:
         PDFConverter.__init__(self, rsrcmgr, None, "utf-8", 1, None)
+        # [v24b 军师层] 段序导出状态: 首页时截断 sidecar, 之后逐页追加
+        self._segflow_fresh = False
+        self._segflow_seq = 0
 
     def begin_page(self, page, ctm) -> None:
         # 重载替换 cropbox
@@ -449,6 +454,28 @@ class TranslateConverter(PDFConverterEx):
             max_workers=self.thread
         ) as executor:
             news = list(executor.map(worker, sstk, heads))
+
+        # [自研补丁 2026-09-12 v24b 军师层·段序导出] 全文档顺序的 (原文, 译文)
+        # 流水逐页追加到 sidecar (JSONL, 每行一页)。任务完成后军师脚本
+        # (tools/strategist.py) 串读全文, 输出跨段指代/接缝/术语/文风修正,
+        # 写回缓存后 force 重渲染生效。首页处理时截断旧文件(一子进程一文档)。
+        try:
+            if sstk:
+                _sf_dir = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow")
+                os.makedirs(_sf_dir, exist_ok=True)
+                _sf_path = os.path.join(_sf_dir, "latest.jsonl")
+                if not getattr(self, "_segflow_fresh", False):
+                    with open(_sf_path, "w", encoding="utf-8") as f:
+                        pass
+                    self._segflow_fresh = True
+                rec = {
+                    "pageid": ltpage.pageid,
+                    "segs": [{"raw": s, "trans": n} for s, n in zip(sstk, news)],
+                }
+                with open(_sf_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as _e:
+            print(f"⚠️ [军师·段序导出] 失败: {_e}", flush=True)
 
         # [自研补丁 2026-09-06] 纯标点占位符消除(翻译后、排版前):
         # 原文 PDF 的连字符/逗号/句点/括号若以 (cid:NN) 形式被 pdfminer 解出,
