@@ -43,6 +43,9 @@ prompt 禁止把带标注的接缝判成"物理切开"。起因: 模型把 S81 (
   实际送审:                   & $PY tools/seam_review.py
   连带审查台账已手术项:       & $PY tools/seam_review.py --redo
   放大对照字符数:             & $PY tools/seam_review.py --chars 240
+  换模型做对照实验(不动翻译引擎, key 只从环境变量读, 结果另存不覆盖):
+    & $PY tools/seam_review.py --out <对照.json> --base-url <端点> --model <模型名> --api-key-env <ENV>
+    例(豆包/火山方舟): --base-url https://ark.cn-beijing.volces.com/api/v3 --model doubao-... --api-key-env ARK_API_KEY
 """
 import argparse
 import json
@@ -159,6 +162,23 @@ def call_llm(client, model, text: str):
     return extract_json_array(resp.choices[0].message.content) or []
 
 
+def make_client(args):
+    """默认用 server config 的 silicon; 给了 --base-url/--model 则走对照实验端点。
+
+    对照实验(换模型重跑同一批接缝) 不该动翻译引擎, 也不该把 key 写进仓库 ——
+    key 只从环境变量读。"""
+    if not (args.base_url or args.model):
+        return llm_client()
+    from openai import OpenAI
+    env = args.api_key_env or "LLM_API_KEY"
+    key = os.environ.get(env, "")
+    if not key:
+        raise RuntimeError(f"对照实验需要环境变量 {env} 提供 API key")
+    if not args.model:
+        raise RuntimeError("对照实验需要 --model 指定模型名")
+    return OpenAI(api_key=key, base_url=args.base_url or "https://api.siliconflow.cn/v1"), args.model
+
+
 def validate(idx, item, segs):
     """把一条修正建议对回原文/译文校验。返回 (ok, reason)。
 
@@ -193,6 +213,9 @@ def main() -> int:
     ap.add_argument("--chars", type=int, default=DEFAULT_CHARS)
     ap.add_argument("--min-chars", type=int, default=2)
     ap.add_argument("--dry-run", action="store_true", help="只列清单, 不调用 LLM")
+    ap.add_argument("--base-url", default="", help="对照实验: 覆盖 LLM 端点")
+    ap.add_argument("--model", default="", help="对照实验: 覆盖模型名")
+    ap.add_argument("--api-key-env", default="", help="对照实验: 从该环境变量读 key")
     args = ap.parse_args()
 
     if not os.path.exists(args.sidecar):
@@ -229,7 +252,9 @@ def main() -> int:
         print("\n[dry-run] 未调用 LLM。")
         return 0
 
-    client, model = llm_client()
+    client, model = make_client(args)
+    print(f"模型: {model}"
+          + (f" @ {args.base_url}" if args.base_url else " (server config)"), flush=True)
     raw_items = []
     for k, ch in enumerate(chunks, 1):
         print(f"送审分块 {k}/{len(chunks)} ({len(ch)} 条)…", flush=True)
@@ -287,7 +312,8 @@ def main() -> int:
 
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:
-            json.dump({"corrections": corrections, "reports": reports},
+            json.dump({"model": model, "base_url": args.base_url or "siliconflow",
+                       "corrections": corrections, "reports": reports},
                       f, ensure_ascii=False, indent=1)
         print(f"已写入 {args.out}")
         if corrections:
