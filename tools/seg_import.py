@@ -96,14 +96,23 @@ def reanchor(seg_zh, raw, vars_):
         if val is None:
             continue
         pre, core, post = split_value(val)
-        if not core:
+        if not core or not re.search(r"[A-Za-z0-9]", core):
+            # 纯标点/纯符号字形(/ 等)按设计丢弃, 不参与搜索
             drops.append((vn, val))
             continue
+        match_len = len(core)
         idx = seg_zh.find(core, cursor)
+        if idx < 0 and re.search(r"\d,\d", core):
+            # 数字千分位弹性回退: 豆包可能写 2000 / 2,000 / 2,000 — 命中后仍以字形原值渲染
+            pat = re.escape(core).replace(",", "[,， ]?")
+            m = re.search(pat, seg_zh[cursor:])
+            if m:
+                idx = cursor + m.start()
+                match_len = m.end() - m.start()  # 实际命中长度(≠core长度, 修复吞字)
         if idx < 0:
             fails.append((vn, val))
             continue
-        s, e = idx, idx + len(core)
+        s, e = idx, idx + match_len
         if pre:
             k = s
             while k > 0 and seg_zh[k - 1] in PUNCT_CHARS and _fw(seg_zh[k - 1]) in pre:
