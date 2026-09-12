@@ -25,6 +25,7 @@ SUITES = [
     "test_mirrors_sync.py",       # 先跑环境一致性 (不依赖 venv, 失败早暴露)
     "test_cache_canonical.py",    # 单元
     "test_cache_integration.py",  # 集成
+    "test_lookahead.py",          # v23.4 前瞻上下文
 ]
 
 

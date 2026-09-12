@@ -343,8 +343,53 @@ class TranslateConverter(PDFConverterEx):
         # B. 段落翻译
         log.debug("\n==========[SSTACK]==========\n")
 
+        # [自研补丁 2026-09-12 v23.4] 跨页断句前瞻上下文(瓦片错落式重叠):
+        # 长段落被页界切成两段时, 前段以半句结尾(实测 "...three successful"),
+        # LLM 只见残文只能猜译(译成"三倍于")。此处检测"前段无句末标点 +
+        # 后段小写开头"的续接对, 把后段开头 ~120 字符作为**只读前瞻**注入
+        # prompt(不翻译不渲染, 不产生重复文字), 使残句按完整语义译出并在
+        # 原断点收住。前瞻指纹经 _cache_key_suffix 编入缓存键: 上下文不同
+        # 即重译, 上下文相同则稳定命中。
+        def _ends_mid_sentence(s: str) -> bool:
+            s = (s or "").rstrip()
+            if len(s) < 2 or re.match(r"^\{v\d+\}$", s):
+                return False
+            return s[-1] not in ".!?。！？…：;；:)]}\"”’"
+
+        def _starts_lowercase(s: str) -> bool:
+            s = (s or "").lstrip()
+            return bool(s) and "a" <= s[0] <= "z"
+
+        def _lookahead_of(i: int) -> str:
+            if i + 1 >= len(sstk):
+                return ""
+            if not _ends_mid_sentence(sstk[i]):
+                return ""
+            # 跨页对之间常夹着页码/页眉/页脚小段(实测 "198" "M.C. Mandujano
+            # et al."), 不能只看相邻段: 向前最多扫 3 段, 跳过短的非小写段,
+            # 遇到小写开头即认定续段; 遇到长的大写开头段判为真新段落放弃。
+            # 注意: sstk 按页重建, 跨页对分属两次 receive_layout, 本机制只能
+            # 覆盖"页内断句"场景; 跨页断句走缓存手术(改动记录 v23.3)。
+            for j in range(i + 1, min(i + 4, len(sstk))):
+                nxt = sstk[j]
+                if not nxt.strip() or re.match(r"^\{v\d+\}$", nxt.strip()):
+                    continue
+                if _starts_lowercase(nxt):
+                    head = nxt.lstrip()[:120]
+                    cut = head.rfind(" ")
+                    if cut > 40:
+                        head = head[:cut]
+                    print(f"[前瞻] 段{i} 尾…{sstk[i].rstrip()[-20:]!r} "
+                          f"→ 前瞻={head[:40]!r}", flush=True)
+                    return head.strip()
+                if len(nxt.strip()) > 80:
+                    return ""
+            return ""
+
+        heads = [_lookahead_of(i) for i in range(len(sstk))]
+
         @retry(wait=wait_fixed(1))
-        def worker(s: str):  # 多线程翻译
+        def worker(s: str, head: str = ""):  # 多线程翻译
             if not s.strip() or re.match(r"^\{v\d+\}$", s):  # 空白和公式不翻译
                 return s
             # [自研补丁] 占位符对照表注入: {vN} -> 公式原文(来自 var[id] 的字符流)。
@@ -365,6 +410,14 @@ class TranslateConverter(PDFConverterEx):
                         _tr._tls.formula_map = {}
             except Exception:
                 pass
+            # [v23.4] 前瞻上下文注入 (跨页断句瓦片错落): 每段无条件刷新,
+            # 防止线程复用把上一段的前瞻泄漏到本段。
+            try:
+                _tr = self.translator
+                if hasattr(_tr, "_tls"):
+                    _tr._tls.look_ahead = head or ""
+            except Exception:
+                pass
             try:
                 new = self.translator.translate(s)
                 return new
@@ -377,7 +430,7 @@ class TranslateConverter(PDFConverterEx):
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=self.thread
         ) as executor:
-            news = list(executor.map(worker, sstk))
+            news = list(executor.map(worker, sstk, heads))
 
         # [自研补丁 2026-09-06] 纯标点占位符消除(翻译后、排版前):
         # 原文 PDF 的连字符/逗号/句点/括号若以 (cid:NN) 形式被 pdfminer 解出,

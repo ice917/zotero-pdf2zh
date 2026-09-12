@@ -598,6 +598,66 @@ class OpenAITranslator(BaseTranslator):
         blob = json.dumps(matched, ensure_ascii=False, sort_keys=True)
         return "#g23:" + hashlib.md5(blob.encode("utf-8")).hexdigest()[:10]
 
+    def _look_ahead(self) -> str:
+        """[v23.4] 读取 converter 注入的本段前瞻上下文 (线程局部, 缺省空)。"""
+        try:
+            return (getattr(self._tls, "look_ahead", "") or "").strip()
+        except Exception:
+            return ""
+
+    def _cache_key_suffix(self, text: str) -> str:
+        """[v23] 术语表按段指纹: 只哈希本段命中的术语条目。
+
+        与 prompt() 注入用同一套归一化匹配(_norm 剥离 {vN} 与非字母数字),
+        保证"注入了什么"与"键里编了什么"一致。未命中任何术语的段落用
+        显式空标记(与无后缀的旧形态键区分开)。
+        [v23.4] 前瞻上下文一并编入键: 同一残句在不同前瞻下正确译法不同,
+        上下文变 → 键变 → 重译; 上下文同 → 稳定命中。"""
+        base = ""
+        if self._polish_enabled and self._polish_glossary_path:
+            glossary = self._polish_glossary
+            if glossary is None and self._polish_glossary_path:
+                glossary = self._polish_glossary = self._load_polish_glossary()
+            if glossary:
+                def _norm(s: str) -> str:
+                    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+                text_norm = _norm(re.sub(r"\{v\d+\}", "", text or ""))
+                matched = sorted(
+                    (k, v) for k, v in glossary.items()
+                    if _norm(k) and _norm(k) in text_norm
+                )
+                if matched:
+                    blob = json.dumps(matched, ensure_ascii=False, sort_keys=True)
+                    base = "#g23:" + hashlib.md5(blob.encode("utf-8")).hexdigest()[:10]
+                else:
+                    base = "#g23:-"
+        la = self._look_ahead()
+        if la:
+            base = (base + "|la:" if base else "#la:") + \
+                hashlib.md5(la.encode("utf-8")).hexdigest()[:10]
+        return base
+
+    def _inject_look_ahead(self, messages) -> None:
+        """[v23.4] 把前瞻上下文作为只读注记追加到 user 消息尾部。
+
+        语义: 告知 LLM 源文是残句且后续内容是什么, 用于理解未完成句;
+        只译本段、在同一点收住, 不翻译续文(渲染由下一段负责)。"""
+        la = self._look_ahead()
+        if not la or not messages:
+            return
+        note = (
+            "\n\n[Context note] The English source text is a fragment that "
+            "continues exactly with: \"" + la + "\" — use it only to understand "
+            "the unfinished sentence. Translate ONLY this segment, keep the "
+            "translation open-ended at the same point, and do NOT translate "
+            "the continuation."
+        )
+        for m in messages:
+            if m.get("role") == "user":
+                m["content"] = m["content"] + note
+                break
+
     @property
     def _polish_context(self):
         """线程局部的上下文窗口 (并发翻译时每条线程独立维护自己的前文)."""
@@ -719,6 +779,11 @@ class OpenAITranslator(BaseTranslator):
                             break
         except Exception:
             logging.exception("Init-prompt glossary injection failed, ignore it.")
+        # [v23.4] 前瞻上下文注记 (跨页断句瓦片错落): 让残句按完整语义翻译
+        try:
+            self._inject_look_ahead(messages)
+        except Exception:
+            logging.exception("Look-ahead injection failed, ignore it.")
         return messages
 
     def _load_polish_glossary(self) -> dict:
