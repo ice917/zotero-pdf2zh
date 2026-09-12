@@ -56,20 +56,42 @@ _PUNCT_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)   # 纯标点/符号占位�
 LEGEND_VALUE_MAX = 30            # 图例单值截断长度 (长表格/长串只留标识)
 CHUNK_CHAR_BUDGET = 42000        # 单次通读的字符预算 (DeepSeek 128K 上下文内)
 
+# [v26-L2] "排版残渣"占位符的字形集: 只收渲染层(converter 的
+# _strip_punct_placeholders / _split_mixed_placeholders)本就会"改写或删除"
+# 的字符 —— 连字符族(被删)、句读与圆括号(转全角或被判冗余后删)。方括号
+# 不在其中: 渲染层原样保留 [n] 引用标号, 删掉会丢引用。
+# Cactaceae 实测(军师 22 条建议里 5 条需人工删占位符): 被删字形的真实值
+# 是 '-' '.' '(' ')' —— 与渲染层删除集完全重合, 故可安全放宽。
+_DROPPABLE_GLYPHS = set(".,;:()") | set("-\u00ad\u2010\u2011\u2012\u2013\u2014\u2015\u2212")
+
+# [v26-L1] 页边界标记: 侧车每行是一页, 军师此前把"行"当成了语段边界。
+PAGE_BREAK_MARK = (
+    "⟨页边界: 上一页结束 / 下一页开始 —— 两侧可能是被排版切开的同一句话, "
+    "禁止在段首补字接续(会与邻段重复); 判定为断句请用 B 格式报告⟩")
+
 
 # ---------------------------------------------------------------- 工具函数
 def token_multiset(s: str):
     return Counter(TOKEN_RE.findall(s or ""))
 
 
-def tokens_ok(raw: str, revised: str, allow_drop: bool = False) -> bool:
+def tokens_ok(raw: str, revised: str, allow_drop: bool = False,
+              droppable=None) -> bool:
     """锚点校验。默认: 修正译文占位符多重集与原文完全一致。
     allow_drop=True: 放宽为"子集"—— 允许删除占位符(卡在词中间的 cid 垃圾),
-    仍禁止新增或改号。"""
+    仍禁止新增或改号。
+    droppable=<set>: [v26-L2] 只对集合内的占位符放宽为子集(排版残渣),
+    其余仍要求严格一一对应; 人工兜底开关 allow_drop 优先。
+    新增占位符与占位符复制在任何模式下都禁止。"""
     need, got = token_multiset(raw), token_multiset(revised)
+    if any(k not in need for k in got):
+        return False                      # 新增: 任何模式都禁止
+    if any(got[k] > need[k] for k in got):
+        return False                      # 复制: 任何模式都禁止
     if allow_drop:
-        return all(got[k] <= need[k] for k in got)
-    return need == got
+        return True                       # 只允许比原文"少"
+    allowed = set(droppable or ())
+    return all(k in allowed for k, n in need.items() if got.get(k, 0) < n)
 
 
 def canon_remap(text: str, seq: dict) -> str:
@@ -104,9 +126,10 @@ def load_segments(sidecar):
                 continue
             rec = json.loads(line)
             vmap = rec.get("vars") or {}   # [v24b.2] 页内图例, 逐段携带
+            pageno = rec.get("page")       # [v26-L1] 页号(老 sidecar 无此键)
             for s in rec.get("segs", []):
                 segs.append({"seq": len(segs), "raw": s["raw"], "trans": s["trans"],
-                             "vars": vmap})
+                             "vars": vmap, "page": pageno})
     return segs
 
 
@@ -131,6 +154,57 @@ def legend_of(seg) -> str:
             v = v[:LEGEND_VALUE_MAX] + "…"
         parts.append(f"{{v{i}}}={v}")
     return " ".join(parts)
+
+
+def _cid_decode(t: str) -> str:
+    """(cid:NN) 是 pdfminer 抽出的字形码位, 渲染层按 chr(NN) 还原。"""
+    m = re.match(r"^\(cid:(\d+)\)$", t or "")
+    return chr(int(m.group(1))) if m else (t or "")
+
+
+def is_junk_glyph(v: str) -> bool:
+    """[v26-L2] 该占位符字形是否为"排版残渣"(可随改写删除)。"""
+    t = _cid_decode(v)
+    if not t.strip():
+        return True                       # 空白/空字形
+    return all(ch in _DROPPABLE_GLYPHS for ch in t)
+
+
+def droppable_of(seg) -> set:
+    """[v26-L2] 该段中字形为排版残渣的占位符集合(如 {'{v39}', '{v40}'})。
+
+    只依赖侧车已带的图例(vars), 无需重新解析 PDF。老 sidecar 无 vars 时
+    返回空集 —— 即退回"一律不得删"的旧行为, 失败安全。"""
+    vmap = seg.get("vars") or {}
+    out = set()
+    for m in _VID_RE.finditer(seg.get("trans") or ""):
+        i = m.group(1)
+        if i in vmap and is_junk_glyph(vmap.get(i)):
+            out.add("{v%s}" % i)
+    return out
+
+
+def build_chunk_text(chunk) -> str:
+    """[v26-L1] 组装送审文本: 段前标 [S<seq>], 跨页处置显式页边界标记, 段后
+    附占位符图例与可删占位符清单。
+
+    页号缺失(老 sidecar)时不插标记 —— 与旧行为一致。"""
+    parts, prev_page = [], None
+    for s in chunk:
+        pg = s.get("page")
+        if pg is not None and prev_page is not None and pg != prev_page:
+            parts.append(PAGE_BREAK_MARK)
+        if pg is not None:
+            prev_page = pg
+        lines = [f"[S{s['seq']}] {s['trans']}"]
+        lg = legend_of(s)
+        if lg:
+            lines.append(f"⟨占位符内容: {lg}⟩")
+        drop = sorted(droppable_of(s), key=lambda t: int(t[2:-1]))
+        if drop:
+            lines.append("⟨可删占位符: " + " ".join(drop) + "⟩")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
 
 
 def llm_client():
@@ -162,6 +236,13 @@ def llm_review(client, model, chunk_text):
         "部分段落后附有一行 ⟨占位符内容: {v6}=3 {v7}=2⟩，表示该段译文中这些 "
         "{vN} 占位符将渲染出的真实字形（公式/数字/符号/英文原文）。"
         "这些内容已经存在于译文中，只是以占位符形式存在 —— 判断是否漏译时必须先看它。\n\n"
+        "文中还可能夹着 ⟨页边界…⟩ 标记：它只是排版分页，**不是语段边界**。"
+        "标记两侧的段可能是同一句话被切开（长段跨页）。判断某段结尾是否"
+        "漏内容前，必须先读标记另一侧的段开头；若确认是被切开的同一句，"
+        "用 B 格式报告，**绝不要在段首或段尾补字接续**（补的字必然与邻段重复）。\n\n"
+        "段后若附有 ⟨可删占位符: {v39} {v40}⟩，表示这些占位符的字形是排版"
+        "残渣（换行连字符 / 拆字产生的纯标点）。改写该句子时可以把它们删掉；"
+        "未列出的占位符仍必须原样保留。\n\n"
         "输出格式（JSON 数组，两种条目）：\n"
         "A. 可本地修正的（绝大多数）：\n"
         '{"idx": <段序号>, "issue": "<问题简述>", '
@@ -171,7 +252,8 @@ def llm_review(client, model, chunk_text):
         '{"idx": <段序号>, "issue": "<问题简述与建议>"}\n\n'
         "硬性要求:\n"
         "- find 必须是该段译文中的连续原文片段(逐字一致，含标点)\n"
-        "- find 与 replace 中的 {vN} 占位符必须原样保留，不得增删改\n"
+        "- find 与 replace 中的 {vN} 占位符必须原样保留；唯一例外是段后 "
+        "⟨可删占位符⟩ 列出的那些（排版残渣，可删），但任何情况下都不得新增占位符或改号\n"
         "- 严禁把 ⟨占位符内容⟩ 里的字面内容写进 find/replace（会与占位符渲染重复）\n"
         "- 严禁在段首或段尾增删内容：跨页/跨段接缝不能靠补字接上，补了必然与\n"
         "  邻段或占位符内容重复；这类问题一律用 B 格式报告\n"
@@ -212,8 +294,10 @@ def load_curated(path: str, segs, allow_drop: bool = False):
             print(f"  ✗ S{idx} find 非唯一命中({n}次): {find[:44]!r}")
             return None
         revised = seg["trans"].replace(find, replace, 1)
-        if not tokens_ok(seg["raw"], revised, allow_drop=allow_drop):
-            print(f"  ✗ S{idx} 锚点失败 (占位符新增/改号): {find[:40]!r}")
+        # [v26-L2] 只对"排版残渣"占位符放宽为子集 (人工清单同样受此约束)
+        if not tokens_ok(seg["raw"], revised, allow_drop=allow_drop,
+                         droppable=droppable_of(seg)):
+            print(f"  ✗ S{idx} 锚点失败 (占位符新增/改号/越权删除): {find[:40]!r}")
             return None
         out.append({"idx": idx, "issue": str(it.get("issue", "")),
                     "find": find, "replace": replace, "revised": revised})
@@ -244,14 +328,10 @@ def llm_review_flow(segs, allow_drop: bool = False):
 
     corrections, reports, seen = [], [], set()
     for ci, chunk in enumerate(chunks):
-        parts = []
-        for s in chunk:
-            # [v24b.2] 段后附占位符图例: 军师据此判断"是否真漏内容"
-            lg = legend_of(s)
-            parts.append(f"[S{s['seq']}] {s['trans']}"
-                         + (f"\n⟨占位符内容: {lg}⟩" if lg else ""))
+        # [v26-L1/L2] 组装送审文本: 段前 [S<seq>]、跨页插页边界标记、
+        # 段后附图例与"可删占位符"清单 (原为内联拼接, 抽成纯函数便于单测)
         try:
-            items = llm_review(client, model, "\n\n".join(parts))
+            items = llm_review(client, model, build_chunk_text(chunk))
         except Exception as e:
             print(f"  块{ci}: LLM 调用失败 {e}")
             continue
@@ -294,7 +374,10 @@ def llm_review_flow(segs, allow_drop: bool = False):
                 print(f"  ✗ S{idx} find 非唯一命中({trans.count(find)}次): {find[:50]!r}")
                 continue
             revised = trans.replace(find, replace, 1)
-            if not tokens_ok(seg["raw"], revised, allow_drop=allow_drop):
+            # [v26-L2] 只允许删掉 ⟨可删占位符⟩ 预标注的那些 (排版残渣),
+            # 其余占位符仍要求多重集全等
+            if not tokens_ok(seg["raw"], revised, allow_drop=allow_drop,
+                             droppable=droppable_of(seg)):
                 print(f"  ✗ S{idx} 锚点失败 (replace 改动了占位符)")
                 continue
             corrections.append({"idx": idx, "issue": issue,

@@ -483,7 +483,15 @@ class TranslateConverter(PDFConverterEx):
                         _legend[str(_i)] = "".join(c.get_text() for c in var[_i])
                     except Exception:
                         pass
+                # [自研补丁 2026-09-12 v26-L1] 页号: 军师把 sidecar 的行当成"语段"
+                # 而不是"页", 于是敢给页尾残句补字(实测 idx8 补"配子", 与下一页
+                # 首行原文重复)。receive_layout 每页回调一次, 故调用次序即页序
+                # (首页判定 _segflow_fresh 已在用同一假设)。页号随行导出, 军师侧
+                # 在页与页之间插显式页边界标记, 并声明"页边界≠语段边界"。
+                _pageno = getattr(self, "_segflow_pageno", 0) + 1
+                self._segflow_pageno = _pageno
                 rec = {
+                    "page": _pageno,
                     "pageid": ltpage.pageid,
                     "segs": [{"raw": s, "trans": n} for s, n in zip(sstk, news)],
                     "vars": _legend,
