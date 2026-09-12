@@ -26,6 +26,11 @@
   - [v24b.1] --from-report: LLM 建议必须经人工对照 raw 审计后再应用
     (军师只看译文, 看不到占位符背后的英文字形, 会提出"补配子/补3:2"类
     与续段重复、与字形内容重复的建议 —— Cactaceae 实测 22 条仅 16 条可用)
+  - [v24b.2] 占位符图例: 侧车携带 {vN}→真实字形(converter 从 var[] 零成本
+    导出, 等效"看"到占位符内容), 按段注入 prompt, 压缩上一类误判
+  - [v24b.2] 报告/修复分离: prompt 禁止段首尾增删与跨 {vN} 边界编辑;
+    跨页断句这类"只能发现、无法在缓存层修复"的问题走只报告项(reports),
+    不产生 find/replace, 不写缓存, 供人工做缓存手术
 """
 import argparse
 import glob
@@ -46,6 +51,9 @@ SRV_CFG = r"D:\zotero-pdf2zh\server\config\config.json"
 SIDEcar_DEFAULT = os.path.join(
     os.path.expanduser("~"), ".cache", "pdf2zh", "segflow", "latest.jsonl")
 TOKEN_RE = re.compile(r"\{v\d+\}")
+_VID_RE = re.compile(r"\{v(\d+)\}")
+_PUNCT_ONLY_RE = re.compile(r"^[\W_]+$", re.UNICODE)   # 纯标点/符号占位符: 无信息量
+LEGEND_VALUE_MAX = 30            # 图例单值截断长度 (长表格/长串只留标识)
 CHUNK_CHAR_BUDGET = 42000        # 单次通读的字符预算 (DeepSeek 128K 上下文内)
 
 
@@ -95,9 +103,34 @@ def load_segments(sidecar):
             if not line:
                 continue
             rec = json.loads(line)
+            vmap = rec.get("vars") or {}   # [v24b.2] 页内图例, 逐段携带
             for s in rec.get("segs", []):
-                segs.append({"seq": len(segs), "raw": s["raw"], "trans": s["trans"]})
+                segs.append({"seq": len(segs), "raw": s["raw"], "trans": s["trans"],
+                             "vars": vmap})
     return segs
+
+
+def legend_of(seg) -> str:
+    """[v24b.2] 该段译文用到的 {vN} 的真实字形图例, 如 '{v6}=3 {v7}=2'。
+
+    军师看不到占位符背后的字形, 会把"没有字面 3:2"误判为漏译而重复插入,
+    渲染层于是得到 '33:22'(实测 S12)。converter 手里本就有 var[] 字形,
+    导出后即可零成本消除该盲区, 无需多模态模型。
+
+    只保留有信息量的项: 纯标点占位符(, . ( ) -)不可能被误判为"漏内容",
+    却是数量最多的噪声 —— Cactaceae 实测全量图例占译文 81%, 过滤后大幅下降。"""
+    vmap = seg.get("vars") or {}
+    used = sorted({m.group(1) for m in _VID_RE.finditer(seg.get("trans") or "")},
+                  key=int)
+    parts = []
+    for i in used:
+        v = (vmap.get(i) or "").strip()
+        if not v or _PUNCT_ONLY_RE.match(v):
+            continue
+        if len(v) > LEGEND_VALUE_MAX:
+            v = v[:LEGEND_VALUE_MAX] + "…"
+        parts.append(f"{{v{i}}}={v}")
+    return " ".join(parts)
 
 
 def llm_client():
@@ -126,13 +159,23 @@ def llm_review(client, model, chunk_text):
         "2) 接缝断裂：某段开头/结尾因跨页切分导致句子不连贯\n"
         "3) 术语漂移：同一概念前后译法不一致\n"
         "4) 文风突变：某段口语化/翻译腔突兀\n\n"
-        "输出格式（最小编辑，严禁整段重写）：JSON 数组，每项:\n"
+        "部分段落后附有一行 ⟨占位符内容: {v6}=3 {v7}=2⟩，表示该段译文中这些 "
+        "{vN} 占位符将渲染出的真实字形（公式/数字/符号/英文原文）。"
+        "这些内容已经存在于译文中，只是以占位符形式存在 —— 判断是否漏译时必须先看它。\n\n"
+        "输出格式（JSON 数组，两种条目）：\n"
+        "A. 可本地修正的（绝大多数）：\n"
         '{"idx": <段序号>, "issue": "<问题简述>", '
         '"find": "<需修正的片段，必须逐字复制自该段译文>", '
         '"replace": "<修正后的片段>"}\n'
+        'B. 只能报告、无法本地修正的（如跨页断句：前后两半分属不同排版单元）：\n'
+        '{"idx": <段序号>, "issue": "<问题简述与建议>"}\n\n'
         "硬性要求:\n"
         "- find 必须是该段译文中的连续原文片段(逐字一致，含标点)\n"
         "- find 与 replace 中的 {vN} 占位符必须原样保留，不得增删改\n"
+        "- 严禁把 ⟨占位符内容⟩ 里的字面内容写进 find/replace（会与占位符渲染重复）\n"
+        "- 严禁在段首或段尾增删内容：跨页/跨段接缝不能靠补字接上，补了必然与\n"
+        "  邻段或占位符内容重复；这类问题一律用 B 格式报告\n"
+        "- find 不得跨越 {vN} 占位符（不得把它含在编辑区间内）\n"
         "- 只报告确有必要的问题；没有问题则输出 []"
     )
     resp = client.chat.completions.create(
@@ -179,7 +222,10 @@ def load_curated(path: str, segs, allow_drop: bool = False):
 
 # ---------------------------------------------------------------- LLM 通读流程
 def llm_review_flow(segs, allow_drop: bool = False):
-    """LLM 通读主流程: 分块送审 + 逐条锚点校验。返回采纳的修正列表。"""
+    """LLM 通读主流程: 分块送审 + 逐条锚点校验。
+
+    返回 (corrections, reports): 前者是可写库的最小编辑, 后者是只报告项
+    (如跨页断句 —— 只能发现, 缓存层无修复出口)。"""
     client, model = llm_client()
 
     # 分块通读 (字符预算内按段切, 相邻块重叠 1 段保持接缝视野)
@@ -196,11 +242,14 @@ def llm_review_flow(segs, allow_drop: bool = False):
         chunks.append(cur)
     print(f"通读分块: {len(chunks)} 块 (预算 {CHUNK_CHAR_BUDGET} 字符/块)")
 
-    corrections, seen = [], set()
+    corrections, reports, seen = [], [], set()
     for ci, chunk in enumerate(chunks):
         parts = []
         for s in chunk:
-            parts.append(f"[S{s['seq']}] {s['trans']}")
+            # [v24b.2] 段后附占位符图例: 军师据此判断"是否真漏内容"
+            lg = legend_of(s)
+            parts.append(f"[S{s['seq']}] {s['trans']}"
+                         + (f"\n⟨占位符内容: {lg}⟩" if lg else ""))
         try:
             items = llm_review(client, model, "\n\n".join(parts))
         except Exception as e:
@@ -220,8 +269,17 @@ def llm_review_flow(segs, allow_drop: bool = False):
                 print(f"  ✗ idx无法解析: {str(raw_idx)[:40]}")
                 continue
             idx = int(m.group())
+            issue = str(it.get("issue", it.get("问题", ""))).strip()
             find = str(it.get("find", "")).strip()
             replace = str(it.get("replace", "")).strip()
+            if not find and not replace:
+                # [v24b.2] 只报告项 (跨页断句等无本地修复出口)
+                if issue:
+                    reports.append({"idx": idx, "issue": issue})
+                    print(f"  · S{idx} 只报告: {issue[:60]}")
+                else:
+                    print(f"  ✗ 空条目: {str(it)[:60]}")
+                continue
             if not find or not replace:
                 print(f"  ✗ S{idx} find/replace 缺失: {str(it)[:80]}")
                 continue
@@ -239,13 +297,13 @@ def llm_review_flow(segs, allow_drop: bool = False):
             if not tokens_ok(seg["raw"], revised, allow_drop=allow_drop):
                 print(f"  ✗ S{idx} 锚点失败 (replace 改动了占位符)")
                 continue
-            corrections.append({"idx": idx, "issue": str(it.get("issue", it.get("问题", ""))),
+            corrections.append({"idx": idx, "issue": issue,
                                 "find": find, "replace": replace,
                                 "revised": revised})
             seen.add(idx)
             kept += 1
         print(f"  块{ci}: 建议 {len(items)} 条, 采纳 {kept} 条")
-    return corrections
+    return corrections, reports
 
 
 # ---------------------------------------------------------------- 主流程
@@ -270,6 +328,7 @@ def main():
     if not segs:
         return 1
 
+    reports = []
     if args.from_report:
         corrections = load_curated(args.from_report, segs,
                                    allow_drop=args.allow_drop)
@@ -278,11 +337,17 @@ def main():
             return 1
         print(f"裁剪清单: {len(corrections)} 条全部重校验通过")
     else:
-        corrections = llm_review_flow(segs, allow_drop=args.allow_drop)
+        corrections, reports = llm_review_flow(segs, allow_drop=args.allow_drop)
 
     print(f"\n军师修正总数: {len(corrections)}")
     for c in corrections:
         print(f"  S{c['idx']} [{c['issue'][:30]}] {c['revised'][:50]}…")
+
+    # [v24b.2] 只报告项: 缓存层无修复出口(跨页断句等), 供人工做缓存手术
+    if reports:
+        print(f"\n只报告项 (不可本地修正, 不写缓存): {len(reports)}")
+        for r in reports:
+            print(f"  S{r['idx']} {r['issue'][:70]}")
 
     # 写回缓存
     applied = 0
@@ -311,6 +376,7 @@ def main():
         with open(os.path.join(rep_dir, "strategist_report.json"), "w",
                   encoding="utf-8") as f:
             json.dump({"corrections": corrections,
+                       "reports": reports,
                        "applied": bool(args.apply and corrections)},
                       f, ensure_ascii=False, indent=1)
     return 0

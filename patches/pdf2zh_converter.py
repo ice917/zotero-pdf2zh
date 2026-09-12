@@ -468,9 +468,25 @@ class TranslateConverter(PDFConverterEx):
                     with open(_sf_path, "w", encoding="utf-8") as f:
                         pass
                     self._segflow_fresh = True
+                # [v24b.2] 占位符图例: {vN} → 背后真实字形文本。军师只看译文字符串,
+                # 永远不知道 {v6}/{v7} 其实就是数字 3/2, 会把"丢失的 3:2"当成漏译
+                # 而重复插入(实测渲染出 "33:22")。字形本就在 var[] 里, 一并导出
+                # 是零成本的"等效视觉", 不必为此上多模态模型。var 是页内局部表,
+                # 故图例按页携带(同号跨页含义可不同)。
+                _used = set()
+                for _s in list(sstk) + list(news):
+                    for _m in re.finditer(r"\{v(\d+)\}", _s or ""):
+                        _used.add(int(_m.group(1)))
+                _legend = {}
+                for _i in sorted(_used):
+                    try:
+                        _legend[str(_i)] = "".join(c.get_text() for c in var[_i])
+                    except Exception:
+                        pass
                 rec = {
                     "pageid": ltpage.pageid,
                     "segs": [{"raw": s, "trans": n} for s, n in zip(sstk, news)],
+                    "vars": _legend,
                 }
                 with open(_sf_path, "a", encoding="utf-8") as f:
                     f.write(json.dumps(rec, ensure_ascii=False) + "\n")

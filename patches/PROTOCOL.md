@@ -48,7 +48,7 @@ converter 解析 ──→ 原文段落串(含{vN}) ──→ translator/缓存 
 | `_tls.formula_map` | converter → translator | 报告可读化 ⟨公式:…⟩ | 仅展示用，逻辑不得依赖 |
 | `sstk` 段落栈 | converter 内部 | 段落组装 | 补丁闭包直接读局部 var，上游重构即碎 |
 | `polish_*` 参数族 | translator init → 缓存键 | 质量参数进键 | 文件指纹变更=旧键全失效(术语表已按段化, 指南未) |
-| `~/.cache/pdf2zh/segflow/latest.jsonl` | converter → tools/strategist.py | 军师层段序流水(逐页 raw/trans, 首页截断) | 行内序号是**渲染时 current 序号**(可乱序/非 0 起), 不是库内 canon 序号; 写回缓存前必须经 raw 的 `_canon_seq` 重排(v24b.1), 否则占位符整体错位。单文档假设: 并发多文档会互相追加到同一文件 |
+| `~/.cache/pdf2zh/segflow/latest.jsonl` | converter → tools/strategist.py | 军师层段序流水(逐页 raw/trans, 首页截断) | 行内序号是**渲染时 current 序号**(可乱序/非 0 起), 不是库内 canon 序号; 写回缓存前必须经 raw 的 `_canon_seq` 重排(v24b.1), 否则占位符整体错位。每行另带 `vars` = 该页 `{vN}`→真实字形图例(v24b.2, 取自页内局部表 `var[]`, **同号跨页含义可不同**, 故图例随页携带不可全局合并)。单文档假设: 并发多文档会互相追加到同一文件 |
 
 ## 4. 改动守则
 
