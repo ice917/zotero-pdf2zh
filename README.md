@@ -50,11 +50,54 @@ submit_result），注册进豆包「技能·连接器」后可省掉剪贴板�
 | `tools/post_check.py` | 翻译后质检门禁：汉化率 / 引用完整性 / 占位符残留 |
 | `tools/seams_report.py` 等 | 接缝台账 / 专项审查 / 对照实验 |
 
+## 部署：拿到仓库后先做三件事
+
+本仓库是**覆盖式补丁集**，不是独立可运行包——请先备好上游底座，再把补丁贴上去。
+
+### 1）备好上游底座
+
+- **Zotero 7 + 上游插件**：从 [guaguastandup/zotero-pdf2zh](https://github.com/guaguastandup/zotero-pdf2zh) 的 Release 获取 xpi（本仓库不含 xpi）。
+- **翻译环境**：conda 环境（Python 3.12）。依赖版本已钉死，见 `server/config/venv.json` 与 `server/requirements.txt`，按此安装即可，无需自行选版本。
+
+### 2）把 `patches/` 覆盖到对应位置
+
+`patches/` 下的文件按"前缀 → 目标"命名。**覆盖前请先备份原文件**：
+
+| 补丁文件 | 覆盖到 |
+|---|---|
+| `patches/server_server.py` | `server/server.py` |
+| `patches/server_utils_config.py` | `server/utils/config.py` |
+| `patches/server_utils_environment_lifecycle.py` | `server/utils/environment_lifecycle.py` |
+| `patches/server_config_venv.json` | `server/config/venv.json` |
+| `patches/server_requirements.txt` | `server/requirements.txt` |
+| `patches/pdf2zh_converter.py` | 虚拟环境 `site-packages/pdf2zh/converter.py` |
+| `patches/pdf2zh_translator.py` | 虚拟环境 `site-packages/pdf2zh/translator.py` |
+| `patches/pdf2zh_cache.py` | 虚拟环境 `site-packages/pdf2zh/cache.py` |
+| `patches/pdfminer_encodingdb.py` | 虚拟环境 `site-packages/pdfminer/encodingdb.py` |
+| `patches/pdfminer_pdffont.py` | 虚拟环境 `site-packages/pdfminer/pdffont.py` |
+| `patches/PROTOCOL.md` | **不是覆盖文件**：`{vN}` 占位符协议契约，改动前必读 |
+
+> 为什么要打补丁：上游 v4.1.7 的公式保护参数、中文字体路径与配置写入方式，默认状态下在 Windows 本地环境不能正常工作（逐项原理见 `改动记录.md` 第一节与第二节）。又因为上游升级会覆盖这些改动，本仓库同时关闭了上游的自动更新通道——因此**升级上游前请先读 `patches/PROTOCOL.md` 与 `改动记录.md` 第四节的更新决策流程**。
+
+### 3）配置与目录
+
+```powershell
+Copy-Item server/config/config.json.example server/config/config.json
+Copy-Item server/config/config.toml.example server/config/config.toml
+New-Item -ItemType Directory -Force inbox, out, segflow
+```
+
+- 在 `config.json` 中填入**自己的**翻译服务 API Key——本仓库不含任何 Key。
+- 将 `NOTO_FONT_PATH` 改成本机中文字体路径；官方默认是 Linux 路径，在 Windows 上会导致中文显示为方块字。
+- `server/glossary/terms.csv` 与 `guideline.txt` 是作者所用文献的术语表与翻译指南，请替换为自己的。
+- `inbox/`、`out/`、`segflow/` 是交换目录，不在版本库中，需按上面的命令自行创建。
+
 ## 快速开始（单篇论文 5 步）
 
 ```powershell
 # 0) 用上游流程把论文正常翻译一遍（生成缓存与侧车），并归档侧车防覆盖
-Copy-Item ~\AppData\Local\..\.cache\pdf2zh\segflow\latest.jsonl segflow\<书名>.jsonl
+#    侧车默认在 %USERPROFILE%\.cache\pdf2zh\segflow\latest.jsonl，每翻一篇会被覆盖，所以先归档
+Copy-Item "$env:USERPROFILE\.cache\pdf2zh\segflow\latest.jsonl" segflow\<书名>.jsonl
 
 # 1) 导出段落包并放入剪贴板
 python tools/seg_export.py --pages 2-4 --name payload_p2_p4 --sidecar segflow/<书名>.jsonl
@@ -88,6 +131,7 @@ python tools/verify_render.py --expect '<新译关键词>' --forbid '<旧译法>
 - 整页大表格保持英文原样（字形保优先于翻译，表格翻译是后续课题）
 - 豆包标点与字形标点并存处可能产生双重标点（吸收算法待改逐字符增量）
 - 纯拉丁段落不经过 CJK 清理规则
+- `seg_inject` 的文档指纹默认自动探测；若探测不到会回落到作者所用文献的兜底值，换文献使用时请显式传入 `--fp`
 
 ## 许可与致谢
 
