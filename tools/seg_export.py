@@ -75,13 +75,16 @@ def main():
     ap.add_argument("--force", action="store_true", help="续接检测失败也照常导出(逐段独立)")
     args = ap.parse_args()
 
-    lo, hi = (int(x) for x in args.pages.split("-")) if "-" in args.pages else \
-             tuple(int(x) for x in args.pages.split(","))[:2]
-    if "-" not in args.pages:
-        parts = [int(x) for x in args.pages.split(",")]
-        lo, hi = parts[0], parts[-1]
-    pages = load_pages(set(range(lo, hi + 1)), args.sidecar)
-    missing = [p for p in range(lo, hi + 1) if p not in pages]
+    # 页码解析: 支持 "2-4" / "2,3,4" / 混合 "1,21-22" (逗号分隔, 每项为单页或区间)
+    pages_want = set()
+    for tok in args.pages.split(","):
+        if "-" in tok:
+            a, b = (int(x) for x in tok.split("-"))
+            pages_want.update(range(a, b + 1))
+        else:
+            pages_want.add(int(tok))
+    pages = load_pages(pages_want, args.sidecar)
+    missing = [p for p in sorted(pages_want) if p not in pages]
     if missing:
         print("侧车缺页: %s" % missing)
         return 1
@@ -117,7 +120,8 @@ def main():
         ta = a["parts"][-1][2]
         tb = b["parts"][0][2]
         pa, pb = a["parts"][-1][0], b["parts"][0][0]
-        if pa != pb and tail(ta) not in TERMINAL and (tb[0].islower() or tb[0].isdigit()):
+        # 页码必须物理相邻才可能跨页续接; 离散页集(如 1,21-22)不得跨空隙合并
+        if pb == pa + 1 and tail(ta) not in TERMINAL and (tb[0].islower() or tb[0].isdigit()):
             a["parts"].append(b["parts"][0])
             a["merged"] = True
             items.pop(i + 1)
