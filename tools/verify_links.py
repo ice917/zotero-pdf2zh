@@ -14,12 +14,24 @@ resolve_links 只保证"目标页+坐标写死"; 但坐标写错(如原点方向
 用法:
   python tools/verify_links.py --target <成品.pdf> [--tol 45] [--report <报告>]
 """
-import argparse, io, re, sys, collections
+import argparse, io, re, sys, unicodedata, collections
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 import pymupdf
 
 norm = lambda s: re.sub(r"\s+", "", s or "")
+
+
+def fold(s):
+    """去重音/去非字母: 作者名在两版间的排版差异归并。
+    成品参考文献里连字符会被吞(Molina-Freaner -> MolinaFreaner), 重音也可能被合成,
+    不归并就会把"落点正确"误判成"缺作者"。
+    """
+    s = unicodedata.normalize("NFKD", s or "")
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    return re.sub(r"[^a-z]", "", s.lower())
+
+
 NAMEW = re.compile(r"^[\(\[]?([A-Z][A-Za-z\u00C0-\u024F'\-]{2,})")
 YEAR = re.compile(r"(1[6-9]\d\d|20\d\d)")
 
@@ -73,7 +85,10 @@ def main():
             stat["in_page"] += 1
             anchor = norm(page.get_text(clip=l["from"]))
             ym = YEAR.search(anchor)
-            if not ym or len(anchor) > 6:      # 非"年份"锚(表号/编号等)无法语义校验
+            # style_links 会把锚文本原位重绘为蓝色, 文本层因此出现重复(如 '19901990');
+            # 去掉年份后若只剩年份本身, 仍是引文锚; 剩别的字符(表号/编号)才算非年份锚。
+            rest = anchor.replace(ym.group(1), "") if ym else anchor
+            if not ym or (rest and not re.fullmatch(r"(?:1[6-9]\d\d|20\d\d)+", rest)):
                 stat["skip_symbol"] += 1
                 continue
             year = ym.group(1)
@@ -86,15 +101,18 @@ def main():
                 bad.append((pno + 1, "%s %s" % (author, year), dp + 1,
                             "落点 y=%.0f 越界(页高 %.0f)" % (y, page_h)))
                 continue
-            hay = norm(near_text(doc[dp], y, args.tol))
+            hay_raw = near_text(doc[dp], y, args.tol)
+            hay = norm(hay_raw)
+            fhay = fold(hay_raw)
             hit_year = year in hay
-            hit_auth = (author or "") in hay
+            hit_auth = bool(author) and (author in hay or fold(author) in fhay)
             if hit_year and (hit_auth or not author):
                 stat["hit"] += 1
                 continue
             mirror_y = page_h - y
-            mhay = norm(near_text(doc[dp], mirror_y, args.tol))
-            m_hit = (year in mhay) and ((author or "") in mhay or not author)
+            mraw = near_text(doc[dp], mirror_y, args.tol)
+            mhay = norm(mraw)
+            m_hit = (year in mhay) and ((not author) or author in mhay or fold(author) in fold(mraw))
             if m_hit:
                 stat["mirror"] += 1
             stat["miss"] += 1

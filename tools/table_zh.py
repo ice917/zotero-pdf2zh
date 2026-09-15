@@ -3,14 +3,24 @@
 v2: 按 rawdict 字符级 bbox 定位 + 行方向向量决定插入旋转 (landscape 表 rotate=90),
 短语/全词两级匹配, 物种名/作者缩写/亚科代码/数字/问号不在词表 => 自动保护。
 幂等: 重跑前先由 backfill_pages.py 恢复干净版。
+
+状态: **本产品未采用**。表格页是碎片字形, 没有"整段可采纳"的单元 —— 半翻译会
+产生中英混合 + 字体对撞 + 基线错位, 观感不如保留原版表格。仅作研究留存。
+
+用法:
+  python tools/table_zh.py [--pdf <成品.pdf>] [--font <CJK字体.otf>] [--pages "2,8-14"]
+  --pages 为 0 基页号(缺省用内置表: p3, p9-15)。
 """
-import io, re, sys, os
+import io, re, sys, os, argparse
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 import pymupdf
 
-FONT = r'D:\zotero-pdf2zh\server\fonts\NotoSerifCJKsc-Regular.otf'
-PDF = r'D:\zotero-pdf2zh\out\成品\Cactaceae2009_中文版.pdf'
-PAGES = [2, 8, 9, 10, 11, 12, 13, 14]  # 0 基: p3, p9-15
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEF_FONT = os.path.join(ROOT, 'server', 'fonts', 'NotoSerifCJKsc-Regular.otf')
+DEF_PDF = os.path.join(ROOT, 'out', '成品', 'Cactaceae2009_中文版.pdf')
+FONT = DEF_FONT                          # 由 --font 覆盖
+PDF = DEF_PDF                            # 由 --pdf 覆盖
+PAGES = [2, 8, 9, 10, 11, 12, 13, 14]    # 0 基: p3, p9-15; 由 --pages 覆盖
 
 PHRASES = {
     'Table 10.1': '表 10.1',
@@ -106,6 +116,23 @@ def insert_zh(page, rect, zh, d, font):
 
 
 def main():
+    global FONT, PDF, PAGES
+    ap = argparse.ArgumentParser(description='表格页定点中文化(可选, 本产品未采用)')
+    ap.add_argument('--pdf', default=DEF_PDF, help='成品 PDF(就地修改)')
+    ap.add_argument('--font', default=DEF_FONT, help='中日韩字体文件(.otf/.ttf)')
+    ap.add_argument('--pages', default='', help='0 基页号, 如 "2,8-14"; 缺省用内置表')
+    args = ap.parse_args()
+    FONT = args.font
+    PDF = args.pdf
+    if args.pages:
+        PAGES = []
+        for tok in args.pages.split(','):
+            if '-' in tok:
+                a, b = (int(x) for x in tok.split('-'))
+                PAGES.extend(range(a, b + 1))
+            else:
+                PAGES.append(int(tok))
+
     font = pymupdf.Font(fontfile=FONT)
     doc = pymupdf.open(PDF)
     n_ins = 0

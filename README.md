@@ -49,6 +49,14 @@ submit_result），注册进豆包「技能·连接器」后可省掉剪贴板�
 | `tools/verify_render.py` | 渲染验收：新串落页 / 旧串清零，13 项断言 |
 | `tools/post_check.py` | 翻译后质检门禁：汉化率 / 引用完整性 / 占位符残留 |
 | `tools/seams_report.py` 等 | 接缝台账 / 专项审查 / 对照实验 |
+| `tools/backfill_pages.py` | 成品回填：整页表格等"零可译段页"用原版页替换 |
+| `tools/relink_pages.py` | 链接热区重定位：译文重排后把链接框搬到锚文本新位置 |
+| `tools/resolve_links.py` | NAMED→GOTO：阅读器兼容 + 落点语义定位（顺带修原版错目标） |
+| `tools/verify_links.py` | 链接落点语义校验：锚的"作者+年份" vs 落点附近条目 |
+| `tools/appendix_species.py` | 物种中文名附录页 + 正文学名弹窗注释 |
+| `tools/style_links.py` | 链接可见性：锚文本原位叠绘为蓝色（无下划线） |
+| `tools/species_extract.py` | 拉丁学名清单提取（斜体字体通道，表 10.2 另配结构化解析） |
+| `tools/table_zh.py` | 表格页定点中文化（研究留存；本产品未采用，理由见下） |
 
 ## 部署：拿到仓库后先做三件事
 
@@ -116,6 +124,56 @@ python tools/force_rerender.py --pdf <原文.pdf> --force
 python tools/verify_render.py --expect '<新译关键词>' --forbid '<旧译法>'
 ```
 
+## 出成品：把译文做成可交付 PDF（6 步）
+
+渲染出来的 `-mono.pdf` 还不是能交付的东西：整页表格被重渲染打碎成竖排散字、
+超链接热区随重排失效（且多数阅读器不认 NAMED 链接）、拉丁学名读者不认识。
+下面 6 步把译文补成成品。**前置三样**：译版 mono、英文原版、侧车。
+
+```powershell
+$orig = "<原版.pdf>"                      # 英文原文
+$mono = "<译版-mono.pdf>"                 # 上游渲染产物: server/translated/<书名>-mono.pdf
+$sc   = "segflow\<书名>.jsonl"            # 侧车(归档的 latest.jsonl)
+$out  = "out\成品\<书名>_中文版.pdf"
+
+# 1) 回填: "零可译段页"(整页表格等)用原版对应页替换 —— 表格保持出版级排版
+python tools/backfill_pages.py --mono $mono --original $orig --out $out --sidecar $sc
+
+# 2) 链接热区重定位: 译文重排后, 把链接框搬到锚文本(年份/编号)的新位置
+python tools/relink_pages.py --target $out --original $orig --sidecar $sc --report out\_relink.txt
+
+# 3) NAMED 链接 -> 显式 GOTO, 并按"作者+年份"语义定位落点(顺带修原版错目标)
+python tools/resolve_links.py --target $out --original $orig --report out\_resolve.txt
+
+# 4) 落点校验(只读): 锚的"作者+年份" 是否出现在落点附近
+python tools/verify_links.py --target $out --report out\_links_bad.txt
+
+# 5) 可选: 物种中文名附录页 + 正文学名弹窗注释(就地修改, 建议先备份)
+python tools/appendix_species.py --pdf $out --data out\species_zh.json --redraw
+
+# 6) 链接可见性: 锚文本原位叠绘为蓝色(原版观感, 不加下划线)
+python tools/style_links.py --target $out --sidecar $sc
+```
+
+**为什么顺序不能乱**
+
+- `relink` 的锚文本取自"原版同页同矩形"，所以它的输入必须是**还没 relink 过**的成品——
+  重跑要从第 1 步开始，否则矩形已被搬移、锚文本取错。
+- `resolve` 负责把链接写死成"目标页+坐标"；此后阅读器才有得跳。
+- `style` 必须在最后：它给锚文本叠绘蓝色，文本层会出现一次重复（视觉无差异，
+  但复制该年份会得到 `19901990`）。之所以不用 redaction 做"替换"，是因为
+  `apply_redactions` 会清掉该页全部链接（实测 18 → 0），而它跑在挂链接之后。
+
+**链接为什么会"乱跳"**（三个坑，本仓库都已处理）
+
+1. 坐标系镜像：命名目标树给出的是 PDF 底部原点（y 向上），而写链接要顶部原点（y 向下）——
+   不换算则**全部**落点镜像，表现就是"点哪儿都跳错"。
+2. 排版漂移：目标坐标来自原版那一页，但成品重排+翻译过（文献页标题中文化、行距变化），
+   同一个 y 在两版指向不同条目。
+3. 原版目标树本身不可靠：实测原版 p13 有 4 条不同引文指向同一行，而那行是另一篇文献。
+   所以 `resolve_links` 不信目标坐标，改用"锚的（作者姓，年份）"到成品参考文献区
+   全书定位——这一步能反过来修正原版自己的错目标。
+
 ## 实测数据（M1，2026-09）
 
 | 指标 | 结果 |
@@ -126,12 +184,24 @@ python tools/verify_render.py --expect '<新译关键词>' --forbid '<旧译法>
 | 改字成本 | 45 秒 / 0 次 LLM（旧管线改一个术语 ≈ 重译 39 分钟） |
 | 翻译成本 | 0 元（豆包基础对话免费） |
 
+### 成品链实测（Cactaceae 2009 专著，34 页 + 1 页附录）
+
+| 指标 | 结果 |
+|---|---|
+| 超链接 | 328 条全部转显式 GOTO（Edge/Zotero 等简易阅读器均可点） |
+| 热区重定位 | 254 命中 / 0 未命中（防碰撞后无两条链接抢同一字形） |
+| 落点语义命中 | **279 / 303 = 92.1%**（镜像命中 **0**；余 25 条锚非年份，无法语义校验） |
+| 表格页 | 8 页回填原版（旋转表头/单元格保持出版级排版） |
+| 物种附录 | 68 物种；正文 171 处学名弹窗注释；锚文本 251 段 1004 字染蓝 |
+
 ## 已知限制
 
 - 整页大表格保持英文原样（字形保优先于翻译，表格翻译是后续课题）
 - 豆包标点与字形标点并存处可能产生双重标点（吸收算法待改逐字符增量）
 - 纯拉丁段落不经过 CJK 清理规则
 - `seg_inject` 的文档指纹默认自动探测；若探测不到会回落到作者所用文献的兜底值，换文献使用时请显式传入 `--fp`
+- `style_links` 是"叠绘"而非"替换"：视觉上与原版蓝字一致，但锚文本在 PDF 文本层重复一次（复制年份会得到 `19901990`）
+- 链接落点靠"（作者姓，年份）在成品文献区定位"修复；若原书引文与文献表本身就对不上（引用的年份在该作者名下不存在），则该条无法修复，只能保持原版落点。每次出成品后跑 `verify_links.py`，失配清单落在 `out\_links_bad.txt`
 
 ## 许可与致谢
 

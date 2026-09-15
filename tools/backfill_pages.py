@@ -13,7 +13,7 @@
       --out <输出.pdf> [--sidecar 侧车路径]
 页码 1:1 对应; 两侧页数不一致时拒绝执行。
 """
-import argparse, io, re, sys, warnings
+import argparse, io, json, re, sys, warnings
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 warnings.filterwarnings("ignore")
@@ -39,9 +39,6 @@ def zero_pages_from_sidecar(path):
         if not translatable:
             zero.append(o["page"])
     return zero
-
-
-import json  # 放函数后仅为可读性; 实际在 main 前执行
 
 
 def main():

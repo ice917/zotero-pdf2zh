@@ -1,20 +1,32 @@
 # -*- coding: utf-8 -*-
-"""species_extract.py — 用斜体字体特征提取全书拉丁学名清单
-学名在书中是斜体排版(rawdict span fontname 含 Italic), 连字 ﬁ/ﬂ 需归一。
-输出: out/species_inventory.json  [{name, pages:[1基页码]}], 附词组片段日志。
+"""species_extract.py — 提取全书拉丁学名清单(斜体字体特征 + 双名法正则)
+
+学名在书里通常是斜体排版(rawdict span fontname 含 Italic), 连字 ﬁ/ﬂ 需归一。
+注意: 若该书正文没有斜体字体(本书即是), 本通道会返回空清单 —— 此时改用表格
+结构化解析或人工清单作为 species_zh.json 的输入。
+
+用法:
+  python tools/species_extract.py [--pdf <PDF>] [--out <清单.json>]
+输出: [{name, pages:[1基页码]}], 附词组片段日志。
 """
-import io, json, re, sys, collections
+import io, json, re, sys, os, argparse, collections
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 import pymupdf
 
-PDF = r'D:\zotero-pdf2zh\out\成品\Cactaceae2009_中文版.pdf'
-OUT = r'D:\zotero-pdf2zh\out\species_inventory.json'
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEF_PDF = os.path.join(ROOT, 'out', '成品', 'Cactaceae2009_中文版.pdf')
+DEF_OUT = os.path.join(ROOT, 'out', 'species_inventory.json')
 
 norm = lambda s: (s or '').replace('ﬁ', 'fi').replace('ﬂ', 'fl').replace('ﬀ', 'ff').replace('ﬃ', 'ffi')
 
 
 def main():
-    doc = pymupdf.open(PDF)
+    ap = argparse.ArgumentParser(description='提取拉丁学名清单(斜体通道)')
+    ap.add_argument('--pdf', default=DEF_PDF, help='待提取的 PDF')
+    ap.add_argument('--out', default=DEF_OUT, help='清单输出路径')
+    args = ap.parse_args()
+
+    doc = pymupdf.open(args.pdf)
     occ = collections.defaultdict(set)   # name -> {页码}
     frag = collections.Counter()
     for pno in range(len(doc)):
@@ -42,12 +54,12 @@ def main():
                 for m in re.finditer(r"\b([A-Z])\. ([a-z][a-z\-]{2,})", text):
                     frag[m.group(0)] += 1
     inv = [{'name': k, 'pages': sorted(v)} for k, v in sorted(occ.items(), key=lambda x: -len(x[1]))]
-    json.dump(inv, open(OUT, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+    json.dump(inv, open(args.out, 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
     print('斜体片段 top15:', frag.most_common(15))
     print('独立条目:', len(inv))
     for it in inv[:20]:
         print('  %-34s 页%s' % (it['name'], it['pages'][:8]))
-    print('产出:', OUT)
+    print('产出:', args.out)
 
 
 if __name__ == '__main__':

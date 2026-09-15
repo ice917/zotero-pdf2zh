@@ -108,6 +108,74 @@ def seq_map_y(opage, oy, tpage):
     return trows[int(round(frac * (len(trows) - 1)))]
 
 
+def left_author(page, r):
+    """锚矩形左侧同一行的最近实词: 引用格式写作 '(Casas 2005)', 作者在年份左边。
+    锚矩形只覆盖年份, 故作者必须从邻词取 —— 这是"语义键"的另一半。
+    """
+    best = None
+    for x0, y0, x1, y1, w, *_ in page.get_text("words"):
+        if y1 <= r.y0 + 1 or y0 >= r.y1 - 1:      # 必须垂直重叠
+            continue
+        if x1 > r.x0 + 1 or r.x0 - x1 > 70:        # 必须在左侧且邻近
+            continue
+        m = SURNAME.match(w)
+        if not m:
+            continue
+        ww = m.group(1)
+        if ww.lower() in STOP or fold(ww) in ("reference", "references", "literature"):
+            continue
+        if best is None or x1 > best[1]:
+            best = (ww, x1)
+    return best[0] if best else None
+
+
+def key_from_name(n):
+    """原版命名目标的名字常自带语义: 'Nobel 1988' / 'Casas 2005'。
+    这比"从锚邻词猜作者"可靠得多 —— 实测原版的名字是准的, 坏的只是坐标树。
+    无意义 ID(如 'crlink_CR125_10'、'crlink_Tab1_10') 返回 (None, None)。
+    """
+    m = re.match(r"\s*([A-Za-z\u00C0-\u024F'\-]{3,})\s+(1[6-9]\d\d|20\d\d)\s*[a-z]?\s*$", n or "")
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def ref_start(doc):
+    """参考文献区起始页(0 基): 最后一处 References/参考文献 标题所在页"""
+    for pno in range(len(doc) - 1, -1, -1):
+        if re.search(r"References|REFERENCES|参考文献", doc[pno].get_text()[:600]):
+            return pno
+    return max(0, int(len(doc) * 2 / 3))
+
+
+def find_ref_entry(doc, ref0, author, year, prefer_page):
+    """按 (作者姓, 年份) 在成品参考文献区全书定位条目行。
+    为什么不看原版目标页: 原版目标树本身粗糙 —— 实测原版 p13 有 4 条不同引文
+    (Ackerman/Casas/Molina-Freaner/Moraes 2005) 指向同一行, 而那行是 Molina
+    Freaner (2004)。沿用原版目标只会把错误固化, 故全书搜语义键。
+    命中多解时优先 prefer_page, 其次取最靠前者。返回 (页码, y0) 或 None。
+    """
+    fa = fold(author) if author else ""
+    if not fa or not year:
+        return None
+    hits = []
+    for pno in range(ref0, len(doc)):
+        rows = lines_of(doc[pno])
+        n = len(rows)
+        for i, (y0, y1, txt) in enumerate(rows):
+            if fa not in fold(txt):
+                continue
+            # 条目跨行: 作者行之后 5 行内找年份(中文标题压缩后条目更短, 但年份
+            # 也可能被排到下几行)。记下"作者行到年份行的距离"作为可信度。
+            for j in range(i, min(n, i + 6)):
+                if year in rows[j][2]:
+                    hits.append((j - i, pno, y0))
+                    break
+    if not hits:
+        return None
+    # 距离最近者优先(最紧的作者-年份耦合), 同距离时优先原版目标页
+    hits.sort(key=lambda h: (h[0], h[1] != prefer_page, h[1], h[2]))
+    return (hits[0][1], hits[0][2])
+
+
 def main():
     import argparse
     ap = argparse.ArgumentParser()
@@ -119,6 +187,7 @@ def main():
     orig = pymupdf.open(args.original)
     names = orig.resolve_names()
     doc = pymupdf.open(args.target)
+    ref0 = ref_start(doc)          # 参考文献区起始页(语义定位的搜索范围)
     stat = collections.Counter()
     misses = []
 
@@ -141,39 +210,61 @@ def main():
             opage = orig[dp]
             oy = max(0.0, min(opage.rect.height, opage.rect.height - ty))
 
-            # --- 2/3) 候选条目投票: 唯一能精确重定位者胜, 多解取最近 ---
-            tpage = doc[dp]
-            cands = candidates_at(opage, oy)
-            best = None
-            for y0o, tline in cands:
-                sur, year = key_of(tline)
-                ny, lvl = find_row_y(tpage, sur, year, oy) if (sur or year) else (None, 0)
-                if lvl == 2:
-                    dist = abs(y0o - oy)
-                    if best is None or dist < best[0]:
-                        best = (dist, ny, 2, sur, year)
-            if best is None:                      # 兜底: 行序比例映射
-                seqy = seq_map_y(opage, oy, tpage)
-                if seqy is not None:
-                    ny = seqy
-                    stat["seqmap"] += 1
-                    misses.append((pno + 1, n, "行序映射 y=%.0f -> %.0f (文本键未中)" % (oy, seqy)))
-                else:
-                    ny = oy
-                    stat["fallback"] += 1
-                    misses.append((pno + 1, n, "未重定位, 回退坐标 y=%.0f" % oy))
+            # --- 2) 首选: 语义键(作者姓, 年份) 在成品参考文献区全书定位 ---
+            # 键的优先级: ① 命名目标名自带的语义(最可靠) ② 锚左侧邻词 + 锚文本年份
+            nsur, nyear = key_from_name(n)
+            author = nsur or left_author(page, l["from"])
+            am = YEAR.search(page.get_text(clip=l["from"]))
+            ayear = nyear or (am.group(1) if am else None)
+            if nsur:
+                stat["nam"] += 1
+            hit = find_ref_entry(doc, ref0, author, ayear, dp) if (author and ayear) else None
+            dpage = dp
+            if hit:
+                dpage, ny = hit
+                stat["semantic"] += 1
+                if dpage != dp:
+                    stat["fixpage"] += 1
+                    misses.append((pno + 1, "%s %s" % (author, ayear),
+                                   "语义改页: 原版目标 p%d -> p%d" % (dp + 1, dpage + 1)))
             else:
-                ny = best[1]
-                stat["reloc" if best[2] == 2 else "weak"] += 1
-                if best[2] == 1:
-                    misses.append((pno + 1, n, "仅年份(弱): %s %s" % (best[3] or "?", best[4])))
+                # --- 3) 次选: 原版目标页内候选条目投票: 唯一能精确重定位者胜 ---
+                tpage = doc[dp]
+                cands = candidates_at(opage, oy)
+                best = None
+                for y0o, tline in cands:
+                    sur, year = key_of(tline)
+                    ny2, lvl = find_row_y(tpage, sur, year, oy) if (sur or year) else (None, 0)
+                    if lvl == 2:
+                        dist = abs(y0o - oy)
+                        if best is None or dist < best[0]:
+                            best = (dist, ny2, 2, sur, year)
+                if best is None:                      # 兜底: 行序比例映射
+                    seqy = seq_map_y(opage, oy, tpage)
+                    if seqy is not None:
+                        ny = seqy
+                        stat["seqmap"] += 1
+                        misses.append((pno + 1, n, "行序映射 y=%.0f -> %.0f (文本键未中)" % (oy, seqy)))
+                    else:
+                        ny = oy
+                        stat["fallback"] += 1
+                        misses.append((pno + 1, n, "未重定位, 回退坐标 y=%.0f" % oy))
+                else:
+                    ny = best[1]
+                    stat["reloc"] += 1
+                    if best[2] == 1:
+                        stat["weak"] += 1
+                        misses.append((pno + 1, n, "仅年份(弱): %s %s" % (best[3] or "?", best[4])))
+
+            # --- 4) 收尾: 边界裁剪 + 写回 ---
+            tpage = doc[dpage]
             ny = max(0.0, min(tpage.rect.height, ny))
             if tx != 0:            # x=0 是"左对齐"语义, 保持即可
                 tx = min(max(tx, 0.0), tpage.rect.width)
 
             new = {k: v for k, v in l.items() if k not in ("nameddest", "name")}
             new["kind"] = pymupdf.LINK_GOTO
-            new["page"] = dp
+            new["page"] = dpage
             new["to"] = pymupdf.Point(tx, ny)
             page.delete_link(l)
             page.insert_link(new)
@@ -183,9 +274,13 @@ def main():
     doc.close()
     os.replace(tmp, args.target)
 
-    print("NAMED -> GOTO: %d | 行文本重定位: %d | 行序映射: %d | 回退坐标: %d | 目标树缺失: %d"
-          % (stat["reloc"] + stat["seqmap"] + stat["fallback"] + stat["fail"],
-             stat["reloc"], stat["seqmap"], stat["fallback"], stat["fail"]))
+    print("NAMED -> GOTO: %d | 语义定位(作者+年份): %d | 目标页内重定位: %d | 行序映射: %d | 回退坐标: %d | 目标树缺失: %d"
+          % (stat["semantic"] + stat["reloc"] + stat["seqmap"] + stat["fallback"] + stat["fail"],
+             stat["semantic"], stat["reloc"], stat["seqmap"], stat["fallback"], stat["fail"]))
+    if stat["fixpage"]:
+        print("  其中语义改页(修正原版错目标): %d" % stat["fixpage"])
+    print("  语义键来源: 目标名自带 %d | 锚邻词 %d" % (stat["nam"], stat["semantic"] - stat["nam"]))
+    print("  参考文献区起始页: p%d" % (ref0 + 1))
     for m in misses[:8]:
         print("  %s" % (m,))
     if args.report and misses:
