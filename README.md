@@ -9,6 +9,9 @@
 经过**段落对齐 → 数字/拉丁名回锚 → 缓存注入**三道机械工序装回原版面。
 此后"改字 = 改字"：45 秒重渲染，0 次 LLM 调用，13 项版面验收断言自动把关。
 
+> **第一次来、只想把论文跑出一份成品 PDF**：跳到 [新手照着做](#新手照着做从零到一份成品-pdfwindows)，
+> 那一节是给没写过代码的人写的，全程复制粘贴。原理和实测数据都在后面。
+
 ## 三堵墙与解法
 
 | 墙 | 解法 |
@@ -36,6 +39,195 @@
 可选自动化通道：`doubao_bridge.py` 是零依赖手写的 STDIO MCP 桥（list_inbox / get_payload /
 submit_result），注册进豆包「技能·连接器」后可省掉剪贴板（消耗 Agent 模式额度）。
 
+## 新手照着做：从零到一份成品 PDF（Windows）
+
+> 这一节假设你**没写过代码**。命令一律复制粘贴，在 **Anaconda Prompt** 里跑
+> （开始菜单搜 "Anaconda Prompt" 或 "Miniconda Prompt"）。**不要用普通 PowerShell**——
+> 实测它里面 `conda activate` 常常不生效，会导致 `python` 找错环境。
+> 跑完你会得到一份「中文译文 + 表格还是原版排版 + 超链接能点」的 PDF。
+> 为什么这么设计、踩过哪些坑，都在后面的章节，现在不用读。
+>
+> **先认识三个词**：**Zotero** 是你平时看论文的软件；**插件（xpi）** 是装进 Zotero 的扩展，
+> 负责把论文发给翻译服务；**翻译服务器**是本仓库里的程序，真正干翻译活的那个，
+> 跑起来就是一个不能关的黑窗口。
+
+### 第 1 步：装 Miniconda（只需一次）
+
+到 <https://docs.conda.io/en/latest/miniconda.html> 下载 Windows 版，一路「下一步」
+（已经装过 Anaconda 的跳过这步）。装完从开始菜单打开 **Anaconda Prompt**
+（或 **Miniconda Prompt**），验证：
+
+```powershell
+conda --version
+```
+
+能看到 `conda 24.x.x` 之类就成功了。**后面所有命令都在这个窗口里跑。**
+
+### 第 2 步：装 Zotero 7 + 插件
+
+1. 到 <https://www.zotero.org/download/> 装 Zotero 7。
+2. 到 <https://github.com/guaguastandup/zotero-pdf2zh/releases> 下载插件 `.xpi`
+   （**本仓库不含 xpi**，请从上游 Release 取）。
+3. Zotero → 工具 → 插件 → 右上角齿轮 → Install Plugin From File → 选那个 `.xpi`。
+
+### 第 3 步：把本仓库放到 `D:\zotero-pdf2zh`
+
+```powershell
+git clone <本仓库地址> D:\zotero-pdf2zh
+```
+
+没有 git 也不要紧：在仓库主页点 `Code → Download ZIP`，解压后把文件夹改名成 `zotero-pdf2zh`
+放到 D 盘根目录。**路径必须是 `D:\zotero-pdf2zh`**——配置文件里写死了这个路径。
+
+如果你确实想放到别处，先改配置里的写死路径（把 `D:/你的路径` 换成真实路径，注意是正斜杠）：
+
+```powershell
+cd D:\你的路径
+(Get-Content server\config\config.json.example -Raw -Encoding UTF8) -replace 'D:/zotero-pdf2zh', 'D:/你的路径' | Set-Content server\config\config.json.example -Encoding UTF8
+```
+
+### 第 4 步：建翻译环境（等 5~10 分钟）
+
+```powershell
+cd D:\zotero-pdf2zh\server\warmup
+.\install-with-conda.bat
+```
+
+它会自动创建 `zotero-pdf2zh-venv` 等两个 conda 环境并装好依赖。
+最后看到 `Conda 环境创建并安装完成！` 就是成功了。中途失败会自动重试 3 次。
+
+### 第 5 步：打补丁（**最容易漏的一步**）
+
+本仓库是「覆盖式补丁集」：下面这些文件要**覆盖**到上一步建好的环境里，
+否则公式保护、中文排版、缓存注入全都不生效。
+
+```powershell
+cd D:\zotero-pdf2zh
+
+# 5.1 服务器侧（5 个文件）
+Copy-Item patches\server_server.py                      server\server.py -Force
+Copy-Item patches\server_utils_config.py                server\utils\config.py -Force
+Copy-Item patches\server_utils_environment_lifecycle.py server\utils\environment_lifecycle.py -Force
+Copy-Item patches\server_config_venv.json               server\config\venv.json -Force
+Copy-Item patches\server_requirements.txt               server\requirements.txt -Force
+
+# 5.2 翻译引擎侧（5 个文件，要落进 conda 环境里）
+# 注意：这条会先打印一行 "not in git repo"，那是 babeldoc 的正常提示，不是错误。
+# 因为输出里可能混入这类杂音，所以用 SITE= 标记把它从输出中挑出来。
+$site = [regex]::Match((conda run -n zotero-pdf2zh-venv python -c "import pdf2zh,os;print('SITE='+os.path.dirname(os.path.dirname(pdf2zh.__file__)))" | Out-String), 'SITE=([^\r\n]+)').Groups[1].Value.Trim()
+Write-Output "site=$site"   # 应该形如 D:\...\anaconda3\envs\zotero-pdf2zh-venv\Lib\site-packages
+Copy-Item patches\pdf2zh_converter.py    "$site\pdf2zh\converter.py"     -Force
+Copy-Item patches\pdf2zh_translator.py   "$site\pdf2zh\translator.py"    -Force
+Copy-Item patches\pdf2zh_cache.py        "$site\pdf2zh\cache.py"         -Force
+Copy-Item patches\pdfminer_encodingdb.py "$site\pdfminer\encodingdb.py"  -Force
+Copy-Item patches\pdfminer_pdffont.py    "$site\pdfminer\pdffont.py"     -Force
+```
+
+验证补丁真的进去了（三条都应该回 `True`）：
+
+```powershell
+Test-Path "$site\pdf2zh\converter.py"                            # False 说明 $site 没取到
+Select-String -Path "$site\pdf2zh\translator.py" -Pattern "doc_summary_fp" -Quiet
+Select-String -Path "server\server.py" -Pattern "自研补丁" -Quiet
+```
+
+> `$site` 只在**当前这个窗口**里有效，关掉窗口就得重跑 5.2 的第一行。
+
+### 第 6 步：生成配置文件与交换目录
+
+```powershell
+cd D:\zotero-pdf2zh
+Copy-Item server\config\config.json.example server\config\config.json
+Copy-Item server\config\config.toml.example server\config\config.toml
+New-Item -ItemType Directory -Force inbox, out, segflow | Out-Null
+```
+
+### 第 7 步：启动翻译服务器
+
+```powershell
+cd D:\zotero-pdf2zh\server
+conda activate zotero-pdf2zh-venv
+python server.py
+```
+
+`conda activate` 成功时，命令提示符前面会出现 `(zotero-pdf2zh-venv)`。
+然后看到 `🌐 Server将启动在: http://127.0.0.1:8890` 就成了。
+**这个窗口在翻译期间不能关。** 第 10 步的工具命令也要在这个已激活的窗口里跑
+（工具依赖这个环境里的 PyMuPDF）。
+
+### 第 8 步：在 Zotero 里配好，翻译第一篇
+
+Zotero → 编辑 → 设置 → Zotero PDF2zh，需要填四项（界面上的措辞可能略有不同，按含义对应）：
+
+| 要填的 | 填什么 |
+|---|---|
+| 服务器地址 / 端口 | `127.0.0.1` / `8890`（默认端口） |
+| 翻译服务 + API Key | 任选一个服务（如 silicon / deepseek），填**你自己的** Key |
+| 中文字体文件 | `D:\zotero-pdf2zh\server\fonts\NotoSerifCJKsc-Regular.otf` |
+| 翻译引擎 | 选 pdf2zh（1.x）——本仓库的补丁是给它打的 |
+
+**不填字体路径，中文会显示成方块字。**
+
+然后右键一篇英文论文 → 用插件翻译。译文会出现在 `server\translated\`。
+
+> ⚠️ 不要动插件设置里的「自动更新」。上游一更新就会覆盖本仓库的补丁。
+> 升级上游之前请先读 `patches/PROTOCOL.md` 与 `改动记录.md` 第四节。
+
+### 第 9 步：把「侧车」存下来（每篇都要做，很容易漏）
+
+每次翻译都会生成一个记录「原文 ↔ 译文 ↔ 版面位置」的文件，**下一篇会把它覆盖掉**，
+所以每翻完一篇立刻归档（把 `论文名` 换成你的）：
+
+```powershell
+cd D:\zotero-pdf2zh
+Copy-Item "$env:USERPROFILE\.cache\pdf2zh\segflow\latest.jsonl" "segflow\论文名.jsonl"
+```
+
+### 第 10 步：出成品（按顺序，整段复制）
+
+先把前 4 行的路径改成你自己的，再整段贴进第 7 步那个窗口：
+
+```powershell
+$orig = "D:\论文\原版.pdf"                                      # 英文原文
+$mono = "D:\zotero-pdf2zh\server\translated\论文名-mono.pdf"    # 第 8 步翻出来的译版
+$sc   = "D:\zotero-pdf2zh\segflow\论文名.jsonl"                 # 第 9 步归档的侧车
+$out  = "D:\zotero-pdf2zh\out\成品\论文名_中文版.pdf"            # 成品输出位置
+
+cd D:\zotero-pdf2zh
+New-Item -ItemType Directory -Force out\成品 | Out-Null   # backfill 不会自建目录，先建好
+python tools\backfill_pages.py  --mono $mono --original $orig --out $out --sidecar $sc
+python tools\relink_pages.py    --target $out --original $orig --sidecar $sc --report out\_relink.txt
+python tools\resolve_links.py   --target $out --original $orig --report out\_resolve.txt
+python tools\style_links.py     --target $out --sidecar $sc
+python tools\verify_links.py    --target $out --report out\_links_bad.txt
+```
+
+`$out` 就是成品，可以直接拖进 Zotero 或 Edge 看。
+最后一条会打印「语义命中率」，90% 以上属正常（它只校验引文落点，不改文件）。
+
+**可选**：如果你有物种中文名数据 `out\species_zh.json`，在 `style_links` 之前加一条，
+给拉丁学名加附录页和弹窗注释（没有这个文件就跳过）：
+
+```powershell
+python tools\appendix_species.py --pdf $out --redraw
+```
+
+**顺序不能换**：`relink` 要从「还没 relink 过」的成品取锚文本；`style_links` 必须最后
+（它给锚文本叠绘蓝色，文本层会多一份副本）。想重跑就从第一条重新开始。
+
+### 常见报错对照
+
+| 现象 | 原因 | 怎么办 |
+|---|---|---|
+| `conda : 无法将"conda"项识别为...` | 在普通 PowerShell 里跑，那里没有 conda | 改用开始菜单的 Anaconda Prompt / Miniconda Prompt |
+| `conda activate` 后提示符没变（前面没出现环境名） | 同上，窗口不对 | 同上 |
+| 输出里出现 `not in git repo` | babeldoc 探测不到 git 版本时的正常提示，**不是错误** | 忽略 |
+| 中文全是方块字 | 字体路径没填或填错 | 回第 8 步填字体文件 |
+| `ModuleNotFoundError: No module named 'pymupdf'` | 没进 conda 环境 | 先 `conda activate zotero-pdf2zh-venv` |
+| `端口 8890 已被占用` | 上次的服务器还活着 | 任务管理器结束所有 `python` 进程；或换 `python server.py --port 8891`，插件里端口同步改 |
+| 译出来跟原文一样是英文 | 请求漏了配置，静默回落到 bing | 用 `python tools\force_rerender.py --pdf <原文.pdf> --force` 重渲染 |
+| 补丁好像没生效 | 覆盖到别的环境去了 | 重跑第 5 步，用那三条 `Test-Path` / `Select-String` 验证 |
+
 ## 增量清单（相对上游 v4.1.7）
 
 | 文件 | 作用 |
@@ -59,6 +251,9 @@ submit_result），注册进豆包「技能·连接器」后可省掉剪贴板�
 | `tools/table_zh.py` | 表格页定点中文化（研究留存；本产品未采用，理由见下） |
 
 ## 部署：拿到仓库后先做三件事
+
+> 新手不必读本节——[新手照着做](#新手照着做从零到一份成品-pdfwindows) 已经把这三件事写成了可复制命令。
+> 本节保留给需要分文件理解的开发者。
 
 本仓库是**覆盖式补丁集**，不是独立可运行包——请先备好上游底座，再把补丁贴上去。
 
@@ -96,7 +291,9 @@ New-Item -ItemType Directory -Force inbox, out, segflow
 ```
 
 - 在 `config.json` 中填入**自己的**翻译服务 API Key——本仓库不含任何 Key。
-- 将 `NOTO_FONT_PATH` 改成本机中文字体路径；官方默认是 Linux 路径，在 Windows 上会导致中文显示为方块字。
+- 中文字体：在 **Zotero 插件设置**里指定字体文件（如 `server/fonts/NotoSerifCJKsc-Regular.otf`）。
+  服务器收到请求时会把该路径写进 `config.json` 的全局键 `NOTO_FONT_PATH`（手改 config.json 没用，
+  它会被插件推送的请求值覆盖）。若这里留下的是官方的 Linux 路径，中文会显示成方块字。
 - `server/glossary/terms.csv` 与 `guideline.txt` 是作者所用文献的术语表与翻译指南，请替换为自己的。
 - `inbox/`、`out/`、`segflow/` 是交换目录，不在版本库中，需按上面的命令自行创建。
 
