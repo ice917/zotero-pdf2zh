@@ -140,7 +140,8 @@ TOOLS = [
     },
     {
         "name": "get_payload",
-        "description": "读取待译 payload 全文: 编号段落包, 每段以 #S编号 行开头; ⋮ 表示原文跨页断点",
+        "description": "读取待译 payload 全文: 编号段落包, 每段以 #S编号 行开头; ⋮ 表示原文跨页断点。"
+                       "若某段里有拿不准的术语, 先用 search_term 取该术语在用户库里的原文证据再定译法",
         "inputSchema": {
             "type": "object",
             "properties": {"name": {"type": "string", "description": "inbox 下的文件名, 如 payload_test.txt"}},
@@ -162,15 +163,20 @@ TOOLS = [
     {
         "name": "search_term",
         "description": (
-            "检索术语的真实用法证据（本地搜索工具）。定稿时拿不准某个术语该怎么译就调它："
-            "会去你 Zotero 库的 PDF 全文里找原文上下文，并查 OpenAlex 学术文献（标题 + 被引数），"
-            "返回一份证据报告。只出证据——不改译文、不写术语表，译名仍由你裁决。"
+            "从**用户自己的文献库**取术语的用法证据。这不是通用搜索——"
+            "你自带的联网搜索拿不到用户收藏的 PDF 原文，所以别用自己的知识或联网搜索代替它。"
+            "它做两件事：① 在用户 Zotero 库已收藏 PDF 的全文里找到该术语，"
+            "摘出它出现的那句原文上下文；② 查 OpenAlex 学术文献的标题与被引数。"
+            "返回一份可直接引用的证据报告（含来源标注）。"
+            "调用时机：用户要你核实某个术语的用法/译法、给某个译名找依据、"
+            "或者说了「查证」「找证据」「看看原文里是怎么用的」「这词在文献里怎么用的」时。"
+            "只出证据——不改译文、不写术语表，译名仍由用户裁决。"
             "一次查一个术语；中文术语不查 Zotero（其全文索引对汉字是字符级松散匹配，噪音大）。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
-                "term": {"type": "string", "description": "要查的术语，如 herkogamy"},
+                "term": {"type": "string", "description": "要查的术语，一次一个，如 herkogamy"},
                 "sources": {"type": "string",
                             "description": "检索源，逗号分隔或 all。默认 zotero,openalex（都零部署零代理）；"
                                            "wikidata 能直接给中文名，wikipedia 给定义性语境（后两者需代理）"},
