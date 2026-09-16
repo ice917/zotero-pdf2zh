@@ -6,6 +6,7 @@ tools/term_verify.py —— 存疑术语联网查证器（离线批处理，零�
   读取 zotero-pdf2zh 产出的「存疑清单.md」，提取其中的存疑术语，
   直连多个零 Key 公开数据源检索该术语的真实用法上下文，输出一份
   「术语 + 证据」报告，辅助人工（或 LLM）裁决译法。
+  也可以 `--term "xxx"` 即席查证单个术语（不必先有清单）。
 
 关键函数：
 - parse_doubt_md(path)              解析存疑清单，提取 (术语, 段落号, 冲突描述)
@@ -46,6 +47,11 @@ tools/term_verify.py —— 存疑术语联网查证器（离线批处理，零�
    - 短缩写（如 CM / TO）附"改用全称"提示；
    - 库内**译文** PDF 的命中标记为循环证据，不作为译名依据；
    - 存疑清单里的模板占位串（如「中文译名（英文原文）」）直接丢弃并计数。
+8. **即席查证入口**（v26.16）：`--term "xxx"` 可随手查一个词，不必先有存疑清单。
+   动因是实测发现**管线已基本不再产出存疑术语**（09-07 之后 15 份清单合计仅 5 个术语，
+   09-06 峰值 59 个）——"翻译后自动查证"收益趋零，真正的用法是"人卡在某个词上时
+   立刻取证据"。即席模式默认源为 zotero+openalex（都零部署、零代理），报告同时
+   打到屏幕上。
 
 用法：
   python tools/term_verify.py                             # 处理最新的存疑清单(默认 OpenAlex)
@@ -55,6 +61,11 @@ tools/term_verify.py —— 存疑术语联网查证器（离线批处理，零�
   python tools/term_verify.py <文件> --source zotero,openalex   # 本地库 + 学术库
   python tools/term_verify.py <文件> --source all         # 全源合并
   python tools/term_verify.py <文件> --source wikidata    # 维基数据(出中文名, 需代理)
+
+即席查证（不依赖存疑清单，随手查一个词；默认 zotero+openalex）：
+  python tools/term_verify.py --term herkogamy
+  python tools/term_verify.py --term herkogamy --term dichogamy   # 可重复给多个
+  python tools/term_verify.py --term "breeding system" --per-term 8
 """
 
 import argparse
@@ -873,7 +884,11 @@ def build_report(src_path, results, elapsed, sources=None, dropped=None, junk=0)
     lines = []
     lines.append("# 存疑术语查证报告")
     lines.append("")
-    lines.append("- 源清单：`%s`" % os.path.basename(src_path))
+    if os.path.isfile(src_path):
+        lines.append("- 源清单：`%s`" % os.path.basename(src_path))
+    else:
+        # 即席查证(--term)没有清单文件, 这里的 src_path 是个人类可读标签
+        lines.append("- 术语来源：%s" % src_path)
     lines.append("- 查证数据源：%s" % " + ".join(
         "%s（%s）" % (s, SOURCE_DESC.get(s, "自定义源")) for s in sources))
     if dropped:
@@ -1082,9 +1097,14 @@ def main():
                          "需环境变量 TERM_VERIFY_LLM_BASE / TERM_VERIFY_LLM_KEY；"
                          "直连 LLM 端点, 不经 8787/8788, 对 AI Butler 零影响。"
                          "采用保守策略: LLM 调用失败时保留全部结果不剔除")
-    ap.add_argument("--source", default=os.getenv("TERM_VERIFY_SOURCE", "openalex"),
+    ap.add_argument("--term", action="append", metavar="TERM",
+                    help="即席查证：直接查这个术语，可重复给多个 "
+                         "(例: --term herkogamy --term dichogamy)。"
+                         "与存疑清单路径互斥；此模式不必先有清单")
+    ap.add_argument("--source", default=None,
                     help="检索源，逗号可多选，或 all（全部）。可选：%s。"
-                         "默认 openalex（与改造前行为一致）。"
+                         "缺省：清单模式为 openalex（与改造前行为一致），"
+                         "即席模式为 zotero,openalex（都零部署、零代理）。"
                          "zotero 查自己库里的 PDF 全文并给原文上下文（无需网络、命中率最高），"
                          "wikidata 能直接给出中文名，wikipedia 给出定义性语境（后两者需代理）。"
                          "也可用环境变量 TERM_VERIFY_SOURCE 设置"
@@ -1098,25 +1118,45 @@ def main():
                     help="[方案 2] 在报告末尾附上术语表新增建议(仅强证据短语, 不含中文译名)")
     args = ap.parse_args()
 
+    adhoc = bool(args.term)
+    if adhoc and args.src:
+        print("[ERROR] --term 与存疑清单路径不能同时使用（即席查证不需要清单）",
+              file=sys.stderr)
+        return 2
+
+    # --source 缺省：清单模式保持 openalex（与改造前行为一致）；
+    # 即席模式用 zotero,openalex —— 两个都零部署、零代理，且本地库命中率最高。
+    src_spec = (args.source or os.getenv("TERM_VERIFY_SOURCE")
+                or ("zotero,openalex" if adhoc else "openalex"))
     try:
-        sources = resolve_sources(args.source)
+        sources = resolve_sources(src_spec)
     except ValueError as e:
         print("[ERROR] %s" % e, file=sys.stderr)
         return 2
 
-    src = args.src or find_latest_doubt_md(project_root)
-    if not src or not os.path.isfile(src):
-        print("[ERROR] 未找到存疑清单，请显式指定路径", file=sys.stderr)
-        return 2
-
-    print("[INFO] 源清单: %s" % src)
-    print("[INFO] 检索源: %s" % " + ".join(sources))
     stats = {}
-    items = parse_doubt_md(src, stats)
-    print("[INFO] 提取到 %d 个存疑术语" % len(items))
-    if stats.get("junk"):
-        print("[INFO] 丢弃 %d 个模板占位串（如「中文译名（英文原文）」），它们不是术语"
-              % stats["junk"])
+    if adhoc:
+        # 即席查证：术语直接来自命令行。去重但保持输入顺序（同一个词只查一次）。
+        seen_term, items = set(), []
+        for t in args.term:
+            t = " ".join((t or "").split())
+            if t and t not in seen_term:
+                seen_term.add(t)
+                items.append({"term": t, "para": "-", "note": "即席查证"})
+        src = "即席查证（--term）"
+        print("[INFO] 即席查证 %d 个术语" % len(items))
+    else:
+        src = args.src or find_latest_doubt_md(project_root)
+        if not src or not os.path.isfile(src):
+            print("[ERROR] 未找到存疑清单，请显式指定路径", file=sys.stderr)
+            return 2
+        print("[INFO] 源清单: %s" % src)
+        items = parse_doubt_md(src, stats)
+        print("[INFO] 提取到 %d 个存疑术语" % len(items))
+        if stats.get("junk"):
+            print("[INFO] 丢弃 %d 个模板占位串（如「中文译名（英文原文）」），它们不是术语"
+                  % stats["junk"])
+    print("[INFO] 检索源: %s" % " + ".join(sources))
     if not items:
         print("[WARN] 未提取到术语，检查清单格式是否变化", file=sys.stderr)
         return 1
@@ -1226,12 +1266,26 @@ def main():
                        % (total_rows, len(new_items),
                           len(proposals) - len(new_items)))
 
-    out = args.out or os.path.join(
-        os.path.dirname(src),
-        "术语查证报告_%s.md" % time.strftime("%Y%m%d_%H%M%S"),
-    )
+    if args.out:
+        out = args.out
+    elif adhoc:
+        # 即席模式没有"清单所在目录", 报告仍写进管线报告目录便于回看;
+        # 目录不存在(如全新克隆)时退回当前目录, 不为了写报告去建目录。
+        rev_dir = os.path.join(project_root, "server", "translated", "review")
+        out = os.path.join(rev_dir if os.path.isdir(rev_dir) else os.getcwd(),
+                           "术语查证报告_%s.md" % time.strftime("%Y%m%d_%H%M%S"))
+    else:
+        out = os.path.join(
+            os.path.dirname(src),
+            "术语查证报告_%s.md" % time.strftime("%Y%m%d_%H%M%S"),
+        )
     with open(out, "w", encoding="utf-8") as f:
         f.write(report)
+
+    if adhoc:
+        # 即席查证是"现在就想要答案"的用法, 报告直接打到屏幕上, 不用再去开文件
+        print("")
+        print(report)
 
     ok = sum(1 for r in results if r["res"]["ok"])
     n_skip = sum(1 for r in results
