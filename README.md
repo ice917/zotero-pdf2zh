@@ -39,6 +39,9 @@
 可选自动化通道：`doubao_bridge.py` 是零依赖手写的 STDIO MCP 桥（list_inbox / get_payload /
 submit_result），注册进豆包「技能·连接器」后可省掉剪贴板（消耗 Agent 模式额度）。
 
+旁路（不参与主流程）：`term_verify.py` 术语证据查证——卡在某个词的译法时取证据再裁决，
+详见 [术语查证](#术语查证先拿证据再裁决)。
+
 ## 新手照着做：从零到一份成品 PDF（Windows）
 
 > 这一节假设你**没写过代码**。命令一律复制粘贴，在 **Anaconda Prompt** 里跑
@@ -249,6 +252,7 @@ python tools\appendix_species.py --pdf $out --redraw
 | `tools/style_links.py` | 链接可见性：锚文本原位叠绘为蓝色（无下划线） |
 | `tools/species_extract.py` | 拉丁学名清单提取（斜体字体通道，表 10.2 另配结构化解析） |
 | `tools/table_zh.py` | 表格页定点中文化（研究留存；本产品未采用，理由见下） |
+| `tools/term_verify.py` | 术语证据查证：本地库 / OpenAlex / 维基系多源检索，出「术语 + 证据」报告（只出证据，不改译文） |
 
 ## 部署：拿到仓库后先做三件事
 
@@ -371,6 +375,47 @@ python tools/style_links.py --target $out --sidecar $sc
    所以 `resolve_links` 不信目标坐标，改用"锚的（作者姓，年份）"到成品参考文献区
    全书定位——这一步能反过来修正原版自己的错目标。
 
+## 术语查证：先拿证据再裁决
+
+冷门术语该翻成什么，靠猜不如靠证据。`tools/term_verify.py` 把术语丢给几个零 Key 的公开数据源，
+把命中文献、被引数和**能取到原文上下文**的摘录整理成报告，供你（或让 LLM 依据证据）裁决。
+它**只出证据**——不改译文、不写术语表。
+
+```powershell
+# A) 即席查证：随手查一个词，不必先有清单（默认源 zotero+openalex，都零部署零代理）
+python tools\term_verify.py --term herkogamy
+python tools\term_verify.py --term herkogamy --term dichogamy   # 可重复给多个
+python tools\term_verify.py --term "breeding system" --per-term 8
+
+# B) 批量查证：读翻译时产出的「存疑清单」（不带参数=取最新一份，默认源 openalex）
+python tools\term_verify.py
+python tools\term_verify.py server\translated\review\存疑清单_xxxx.md --limit 10
+python tools\term_verify.py <清单.md> --source zotero,openalex   # 本地库 + 学术库
+python tools\term_verify.py <清单.md> --source all               # 全源合并
+```
+
+报告默认落在存疑清单同目录（即席模式落在 `server\translated\review\`）；**即席模式同时打印到屏幕**。
+
+### 数据源（`--source`，逗号可多选）
+
+| 源 | 给什么证据 | 前置条件 |
+|---|---|---|
+| `zotero` | **自己库里 PDF 的原文上下文**——能直接回答"这词在本文里指什么" | Zotero 正在运行，且 设置→高级 勾选「允许本机其他应用与 Zotero 通信」 |
+| `openalex` | 论文标题 + 被引数（判断"这是不是领域通用译法"） | 无（零 Key，需外网） |
+| `wikipedia` | 条目摘要（定义性语境） | 需代理；**未对真实响应验证** |
+| `wikidata` | 实体 + 别名 + 中文标签（可直接给中文名，仍须人工确认） | 需代理；**未对真实响应验证** |
+
+开跑前会先用探针词真试一次各源，**剔除不可达的源并在报告头写明**；全部不可达则不产报告、退出码 2。
+维基两源在国内网络不可直连（DNS 污染 / SNI 阻断），要用请先启用代理（`urllib` 自动读 `HTTPS_PROXY`）。
+
+### 读报告时注意三点
+
+- **带 `[弱]` 或没有摘录的条目当噪音看**——只保证"召回了"，没取到原文上下文，不足以支撑裁决；
+- **中文术语不走 zotero**——Zotero 全文索引对汉字是字符级松散匹配（实测查"拓扑优化"返回 10 条，
+  9 条无关），报告头会写明跳过了什么；
+- **标了"循环证据"的条目不能用**——库里存着 pdf2zh 自己产出的中文译文 PDF，
+  命中它的摘录等于"拿旧译法验证旧译法"。
+
 ## 实测数据（M1，2026-09）
 
 | 指标 | 结果 |
@@ -399,6 +444,7 @@ python tools/style_links.py --target $out --sidecar $sc
 - `seg_inject` 的文档指纹默认自动探测；若探测不到会回落到作者所用文献的兜底值，换文献使用时请显式传入 `--fp`
 - `style_links` 是"叠绘"而非"替换"：视觉上与原版蓝字一致，但锚文本在 PDF 文本层重复一次（复制年份会得到 `19901990`）
 - 链接落点靠"（作者姓，年份）在成品文献区定位"修复；若原书引文与文献表本身就对不上（引用的年份在该作者名下不存在），则该条无法修复，只能保持原版落点。每次出成品后跑 `verify_links.py`，失配清单落在 `out\_links_bad.txt`
+- `term_verify` 的维基百科 / 维基数据两源解析**未对真实响应验证**（本机 DNS 污染 / SNI 阻断），待代理可用时复核；中文术语按设计跳过 `zotero` 源，若库里收藏了中文文献则查不到
 
 ## 许可与致谢
 
