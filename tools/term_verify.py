@@ -41,6 +41,11 @@ tools/term_verify.py —— 存疑术语联网查证器（离线批处理，零�
 5. **只读**：不修改任何翻译产物，不写入术语表，仅输出报告文件。
 6. **中文标签不等于裁决结果**：维基数据的 zh 标签只作为证据呈现，
    其质量参差（繁简混用、部分概念无中文标签），写入术语表仍须人工确认。
+7. **按术语形态选源/标注**（v26.15，来自 40 术语实战）：
+   - 中文术语不走 Zotero（下限见 SKIP_CJK_REASON），并在报告里写明跳过了什么；
+   - 短缩写（如 CM / TO）附"改用全称"提示；
+   - 库内**译文** PDF 的命中标记为循环证据，不作为译名依据；
+   - 存疑清单里的模板占位串（如「中文译名（英文原文）」）直接丢弃并计数。
 
 用法：
   python tools/term_verify.py                             # 处理最新的存疑清单(默认 OpenAlex)
@@ -84,6 +89,10 @@ ZOTERO_API = os.getenv("ZOTERO_LOCAL_API", "http://127.0.0.1:23119/api").rstrip(
 # users/0 即"本机登录用户自己的文库"（实测可正常返回；也可用 ZOTERO_LIBRARY 覆盖）
 ZOTERO_LIBRARY = os.getenv("ZOTERO_LIBRARY", "users/0")
 
+# 汉字（含扩展 A 区）。用来判断术语是不是中文（决定该不该走某些源），
+# 以及命中的摘录是不是来自中文译文。
+CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+
 REVIEW_DIRNAME = "review"
 
 
@@ -95,7 +104,14 @@ def project_root_env():
 # ----------------------------------------------------------------------
 # 解析
 # ----------------------------------------------------------------------
-def parse_doubt_md(path):
+# 存疑清单里 LLM 有时写的是**模板占位串**而不是真术语。实测 40 个术语里有 2 个
+# 是「中文译名（flow contrast）」「中文译名（英文原文）」—— 来自"首次出现应处理为
+# 中文译名（英文原文）"这条规则的措辞被当成术语名提了出来。拿去检索只会白跑，
+# 而且报告里会多出一节假术语，故直接丢弃并计数。
+JUNK_TERM_RE = re.compile(r"中文译名|英文原文")
+
+
+def parse_doubt_md(path, stats=None):
     """
     解析存疑清单，返回 [{'term': 术语, 'para': 段落号, 'note': 冲突描述}, ...]
 
@@ -110,6 +126,9 @@ def parse_doubt_md(path):
         ...
         【存疑】
         1. 术语"Loewner order"：...
+
+    模板占位串（JUNK_TERM_RE）会被丢弃；传入 stats 字典可拿到丢弃数量
+    （stats["junk"]），供报告如实写明。
     """
     text = open(path, encoding="utf-8").read()
 
@@ -142,6 +161,11 @@ def parse_doubt_md(path):
             term = tm.group(1).strip()
             # 含 {vN} 公式占位符的是占位符切分存疑, 非词汇表对象
             if not term or re.search(r"\{v\d+\}", term):
+                continue
+            # 模板占位串(如「中文译名（英文原文）」)不是术语, 丢弃并计数
+            if JUNK_TERM_RE.search(term):
+                if stats is not None:
+                    stats["junk"] = stats.get("junk", 0) + 1
                 continue
             if term in seen:
                 continue
@@ -606,8 +630,11 @@ def zotero_search(term, max_results=5, timeout=8, context="", max_retries=4):
     取不到全文（条目无索引、或是笔记）-> weak（只有搜索引擎的间接证据）。
 
     前置条件：Zotero 7 已运行，且 设置→高级 里勾选了「允许本机其他应用与 Zotero 通信」。
-    注：库里若同时存有**已翻译的中文版 PDF**，全文索引里可能是译文而非英文原文，
-    此时术语在译文中找不到 -> 自动降级为弱证据（不假装有原文）。
+
+    注：库里若同时存有 pdf2zh 产出的**中文译文 PDF**，附件全文就是译文本身。
+    此时用英文术语仍能命中（术语往往被保留未译），截出的上下文却是中文句子 ——
+    那是**循环证据**（拿旧译法验证旧译法），故给这类条目打 `translated` 标记，
+    由报告明示，避免被当成原文依据。中文术语则根本不走本源（见 SKIP_CJK_REASON）。
     """
     params = {
         "q": term,
@@ -643,12 +670,15 @@ def zotero_search(term, max_results=5, timeout=8, context="", max_retries=4):
 
         # 取全文索引, 截术语上下文; 失败只降级不中断
         snippet = ""
+        translated = False
         if att_key:
             ft, _ferr = _zotero_get("/%s/items/%s/fulltext" % (ZOTERO_LIBRARY, att_key),
                                     timeout=timeout, max_retries=1)
             content = (ft or {}).get("content") if isinstance(ft, dict) else None
             if content:
                 snippet = _context_snippet(content, term)
+                # 上下文是中文 -> 这个附件是 pdf2zh 产出的译文, 命中属循环证据
+                translated = bool(snippet) and bool(CJK_RE.search(snippet))
 
         cands.append({
             "title": title,
@@ -656,6 +686,7 @@ def zotero_search(term, max_results=5, timeout=8, context="", max_retries=4):
             "cited": None,              # 本地库没有被引数, 报告只显示年份
             "source": "zotero",
             "snippet": snippet,
+            "translated": translated,   # 摘录来自译文 PDF(循环证据), 供报告标注
             "relevance": "strong" if snippet else "weak",
         })
 
@@ -692,6 +723,19 @@ SOURCE_DESC = {
     "openalex": "OpenAlex 学术文献库，零 Key 公开 API，标题级用法证据",
     "wikipedia": "维基百科 MediaWiki 全文检索，条目摘要给出定义性语境，需代理且未验证",
     "wikidata": "维基数据实体标签，可直接给出中文名，需代理且未验证",
+}
+
+# 哪些源不该收中文术语，以及为什么（v26.15，40 术语实战实测）。
+# Zotero 的全文索引对汉字是**字符级松散匹配**：单独查 "拓扑优化" 返回 10 条，
+# 其中 9 条完全无关（仙人掌科、卡尔曼滤波、Attention Is All You Need、降雨建模…），
+# 而这 10 条要逐个回查父条目 + 取全文索引才判得出来，纯属空转。
+# 更关键的是：中文术语在本地库里唯一的强命中往往来自**我们自己产出的译文 PDF**
+# —— 那是循环证据，不能作为裁决依据（实测 7 个中文术语全无有效产出）。
+# 取舍：库里若真收藏了中文文献，这类术语就查不到了 —— 报告会写明跳过了什么，
+# 需要时改用其它源或人工在 Zotero 里检索。
+SKIP_CJK_REASON = {
+    "zotero": "Zotero 全文索引对汉字为字符级松散匹配，只会产出假召回；"
+              "且本地库中的中文命中多来自 pdf2zh 生成的译文（循环证据）",
 }
 
 
@@ -756,10 +800,17 @@ def search_multi(term, sources, max_results=5, timeout=8, context="", max_retrie
       - 每个源各自取 max_results 条，跨源按标题归一化去重，先到先得（即 --source 顺序）
       - 只要有一个源成功就 ok=True（优雅降级）；error 汇总各源失败原因供排查
       - hints 汇总各源补充线索，加 [源名] 前缀以便区分来源
+      - 中文术语跳过 SKIP_CJK_REASON 里列出的源，跳过了什么记在返回值的
+        `skipped`（{源名: 原因}）里，供报告如实写明，不计作失败
     """
     papers, hints, errors, any_ok = [], [], [], False
     seen = set()
+    skipped = {}
+    is_cjk = bool(CJK_RE.search(term))
     for name in sources:
+        if is_cjk and name in SKIP_CJK_REASON:
+            skipped[name] = SKIP_CJK_REASON[name]
+            continue
         res = SOURCES[name](term, max_results=max_results, timeout=timeout,
                             context=context, max_retries=max_retries)
         if res.get("ok"):
@@ -775,20 +826,50 @@ def search_multi(term, sources, max_results=5, timeout=8, context="", max_retrie
             if key:
                 seen.add(key)
             papers.append(p)
+    if not any_ok and skipped and not errors:
+        # 所有源都因术语是中文被跳过: 这不是失败, 但也确实没查
+        return {
+            "ok": False,
+            "papers": [], "hints": [],
+            "error": "中文术语，已跳过不适用于中文检索的源（%s）" % "、".join(skipped),
+            "skipped": skipped,
+        }
     return {
         "ok": any_ok,
         "papers": papers,
         "hints": hints,
         "error": "；".join(errors) if errors else None,
+        "skipped": skipped,
     }
 
 
 # ----------------------------------------------------------------------
 # 报告
 # ----------------------------------------------------------------------
-def build_report(src_path, results, elapsed, sources=None, dropped=None):
+def _is_short_abbrev(term):
+    """
+    是不是"短缩写"（≤3 字符、无空格、字母开头）—— 如 CM / TO / OCR。
+
+    为什么要单独提示：实测 `CM` 在 OpenAlex 上召回了 ICD-9-CM 疾病编码（被引 10840）、
+    cm⁻¹ 波数（被引 1179）这类完全无关的高被引条目，`TO` 也几乎全噪音。
+    这类术语不是查不到，而是**必须换全称或加领域限定词**才有意义。
+    """
+    return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9]{0,2}", term.strip()))
+
+
+def build_report(src_path, results, elapsed, sources=None, dropped=None, junk=0):
     sources = sources or ["openalex"]
     multi = len(sources) > 1
+
+    n_ok = sum(1 for r in results if r["res"]["ok"])
+    # 因术语是中文而整条跳过（没查，但也不算失败）
+    n_skip = sum(1 for r in results
+                 if not r["res"]["ok"] and r["res"].get("skipped"))
+    skip_stat = {}          # 源名 -> [次数, 原因]
+    for r in results:
+        for name, why in (r["res"].get("skipped") or {}).items():
+            skip_stat.setdefault(name, [0, why])[0] += 1
+
     lines = []
     lines.append("# 存疑术语查证报告")
     lines.append("")
@@ -798,11 +879,18 @@ def build_report(src_path, results, elapsed, sources=None, dropped=None):
     if dropped:
         lines.append("- ⚠️ 已剔除不可达源：%s（预检失败，本报告不含其证据）"
                      % "、".join("%s —— %s" % (n, e) for n, e in dropped))
-    lines.append("- 术语总数：%d ｜ 查询成功：%d ｜ 失败：%d ｜ 耗时：%.1fs"
-                 % (len(results),
-                    sum(1 for r in results if r["res"]["ok"]),
-                    sum(1 for r in results if not r["res"]["ok"]),
-                    elapsed))
+    if n_skip:
+        lines.append("- 术语总数：%d ｜ 查询成功：%d ｜ 跳过：%d ｜ 失败：%d ｜ 耗时：%.1fs"
+                     % (len(results), n_ok, n_skip,
+                        len(results) - n_ok - n_skip, elapsed))
+    else:
+        lines.append("- 术语总数：%d ｜ 查询成功：%d ｜ 失败：%d ｜ 耗时：%.1fs"
+                     % (len(results), n_ok, len(results) - n_ok, elapsed))
+    for name, (cnt, why) in skip_stat.items():
+        lines.append("- ℹ️ 已对 %d 个中文术语跳过 `%s` 源：%s" % (cnt, name, why))
+    if junk:
+        lines.append("- ℹ️ 已丢弃 %d 个模板占位串（如「中文译名（英文原文）」），"
+                     "它们不是术语" % junk)
     lines.append("")
     lines.append("> 本报告只提供**术语的真实用法证据**，不自动改译文。")
     lines.append("> 请据此人工裁决，确认后再写入术语表。")
@@ -815,8 +903,18 @@ def build_report(src_path, results, elapsed, sources=None, dropped=None):
         lines.append("- 存疑段落：%s" % para)
         if note:
             lines.append("- 冲突描述：%s" % note)
+        if _is_short_abbrev(term):
+            lines.append("- ⚠️ 该术语是**短缩写**，检索噪音极大（实测 `CM` 召回了 "
+                         "ICD-9-CM 疾病编码、`cm⁻¹` 波数这类高被引无关条目）——"
+                         "请改用全称，或用 `--context` 限定领域后重查")
         if not res["ok"]:
-            lines.append("- **查证失败**：%s" % res["error"])
+            if res.get("skipped"):
+                # 术语是中文 -> 主动跳过该源, 不是查证失败
+                lines.append("- 跳过：%s" % res["error"])
+                lines.append("  （如需检索本地库中的中文文献，请改用 `--source openalex` "
+                             "以外的途径，或直接在 Zotero 里检索）")
+            else:
+                lines.append("- **查证失败**：%s" % res["error"])
             lines.append("")
             continue
         if not res["papers"]:
@@ -850,6 +948,9 @@ def build_report(src_path, results, elapsed, sources=None, dropped=None):
                 # 上限 400: 本工具截的上下文是"术语前后各 150 字"(约 300+),
                 # 截太短会把术语本身或后半句切掉, 那就失去"原句就在眼前"的意义了
                 lines.append("    - 摘录：%s" % p["snippet"][:400])
+            if p.get("translated"):
+                lines.append("    - ⚠️ 此摘录来自库内的**译文** PDF —— 属循环证据"
+                             "（拿旧译法验证旧译法），不可作为译名依据")
             if p.get("llm_reason"):
                 lines.append("    - LLM 判据：%s" % p["llm_reason"])
         if res.get("hints"):
@@ -1010,8 +1111,12 @@ def main():
 
     print("[INFO] 源清单: %s" % src)
     print("[INFO] 检索源: %s" % " + ".join(sources))
-    items = parse_doubt_md(src)
+    stats = {}
+    items = parse_doubt_md(src, stats)
     print("[INFO] 提取到 %d 个存疑术语" % len(items))
+    if stats.get("junk"):
+        print("[INFO] 丢弃 %d 个模板占位串（如「中文译名（英文原文）」），它们不是术语"
+              % stats["junk"])
     if not items:
         print("[WARN] 未提取到术语，检查清单格式是否变化", file=sys.stderr)
         return 1
@@ -1068,7 +1173,9 @@ def main():
                 res["llm_note"] = "LLM 过滤不可用/失败，已保留全部结果"
             else:
                 kept = []
-                dropped = []
+                # 注意: 变量名不能叫 dropped —— 外层 dropped 是预检剔除的源清单,
+                # 重名会把报告头那行"已剔除不可达源"污染成 LLM 剔除的条目。
+                llm_dropped = []
                 for p in res["papers"]:
                     v = verdict.get(p["title"])
                     if v is None:
@@ -1078,11 +1185,11 @@ def main():
                         p["llm_reason"] = v["reason"]
                         kept.append(p)
                     else:
-                        dropped.append((p["title"], v["reason"]))
+                        llm_dropped.append((p["title"], v["reason"]))
                 res["papers"] = kept
-                res["llm_dropped"] = dropped
+                res["llm_dropped"] = llm_dropped
                 res["llm_note"] = ("LLM 过滤：保留 %d 条，剔除 %d 条"
-                                   % (len(kept), len(dropped)))
+                                   % (len(kept), len(llm_dropped)))
         elif use_llm:
             res["llm_note"] = "无检索结果，跳过 LLM 过滤"
 
@@ -1094,7 +1201,7 @@ def main():
             time.sleep(args.delay)
     elapsed = time.time() - t0
 
-    report = build_report(src, results, elapsed, sources, dropped)
+    report = build_report(src, results, elapsed, sources, dropped, stats.get("junk", 0))
 
     # [方案 2] 术语表新增建议(只提英文术语+证据, 中文译名留人工/LLM 裁决)
     if args.propose:
@@ -1127,9 +1234,15 @@ def main():
         f.write(report)
 
     ok = sum(1 for r in results if r["res"]["ok"])
+    n_skip = sum(1 for r in results
+                 if not r["res"]["ok"] and r["res"].get("skipped"))
     print("[DONE] 报告已生成: %s" % out)
-    print("[DONE] 成功 %d / 共 %d ｜ 耗时 %.1fs" % (ok, len(results), elapsed))
-    return 0 if ok else 1
+    if n_skip:
+        print("[DONE] 成功 %d ｜ 跳过 %d ｜ 共 %d ｜ 耗时 %.1fs"
+              % (ok, n_skip, len(results), elapsed))
+    else:
+        print("[DONE] 成功 %d / 共 %d ｜ 耗时 %.1fs" % (ok, len(results), elapsed))
+    return 0 if (ok or n_skip == len(results)) else 1
 
 
 if __name__ == "__main__":
