@@ -206,7 +206,7 @@ python tools\verify_links.py    --target $out --report out\_links_bad.txt
 最后一条会打印「语义命中率」，90% 以上属正常（它只校验引文落点，不改文件）。
 
 **可选**：如果你有物种中文名数据 `out\species_zh.json`，在 `style_links` 之前加一条，
-给拉丁学名加附录页和弹窗注释（没有这个文件就跳过）：
+给拉丁学名加附录页和荧光笔注释（没有这个文件就跳过）：
 
 ```powershell
 python tools\appendix_species.py --pdf $out --redraw
@@ -245,7 +245,7 @@ python tools\appendix_species.py --pdf $out --redraw
 | `tools/relink_pages.py` | 链接热区重定位：译文重排后把链接框搬到锚文本新位置 |
 | `tools/resolve_links.py` | NAMED→GOTO：阅读器兼容 + 落点语义定位（顺带修原版错目标） |
 | `tools/verify_links.py` | 链接落点语义校验：锚的"作者+年份" vs 落点附近条目 |
-| `tools/appendix_species.py` | 物种中文名附录页 + 正文学名弹窗注释 |
+| `tools/appendix_species.py` | 物种中文名附录页 + 正文学名荧光笔注释 |
 | `tools/style_links.py` | 链接可见性：锚文本原位叠绘为蓝色（无下划线） |
 | `tools/species_extract.py` | 拉丁学名清单提取（斜体字体通道，表 10.2 另配结构化解析） |
 | `tools/table_zh.py` | 表格页定点中文化（研究留存；本产品未采用，理由见下） |
@@ -345,7 +345,7 @@ python tools/resolve_links.py --target $out --original $orig --report out\_resol
 # 4) 落点校验(只读): 锚的"作者+年份" 是否出现在落点附近
 python tools/verify_links.py --target $out --report out\_links_bad.txt
 
-# 5) 可选: 物种中文名附录页 + 正文学名弹窗注释(就地修改, 建议先备份)
+# 5) 可选: 物种中文名附录页 + 正文学名荧光笔注释(就地修改, 建议先备份)
 python tools/appendix_species.py --pdf $out --data out\species_zh.json --redraw
 
 # 6) 链接可见性: 锚文本原位叠绘为蓝色(原版观感, 不加下划线)
@@ -389,7 +389,7 @@ python tools/style_links.py --target $out --sidecar $sc
 | 热区重定位 | 254 命中 / 0 未命中（防碰撞后无两条链接抢同一字形） |
 | 落点语义命中 | **279 / 303 = 92.1%**（镜像命中 **0**；余 25 条锚非年份，无法语义校验） |
 | 表格页 | 8 页回填原版（旋转表头/单元格保持出版级排版） |
-| 物种附录 | 68 物种；正文 171 处学名弹窗注释；锚文本 251 段 1004 字染蓝 |
+| 物种附录 | 68 物种；正文 171 处学名荧光笔注释；锚文本 251 段 1004 字染蓝 |
 
 ## 已知限制
 

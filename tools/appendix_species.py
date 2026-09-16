@@ -1,9 +1,12 @@
 # -*- coding: utf-8 -*-
 """appendix_species.py — 物种中文名对照: 书末附录页 + 正文学名弹窗注释
 1) 若缺附录页则追加(第 35 页, 不插页不动页码): 学名-中文名对照表, 置信度分级。
-2) 全书学名位置挂弹窗注释(矩形钉成 4pt 小点, 无可见图标): 点击弹中文名, 原地
-   不跳转、不遮挡正文。
-幂等: 重跑先清旧注释/链接(仅物种类), 附录页存在则跳过绘制。
+2) 全书学名位置挂黄色荧光笔高亮(Highlight 注释, 半透明底纹, 文字透出可读):
+   点击弹出中文名, 原地不跳转、不遮挡正文。
+   注: 早先用 add_text_annot(便签注释) 把矩形钉成 4pt 小点, 意图是"图标不可见",
+   但 Edge/Zotero 等阅读器对无外观流的 Text 注释按默认样式渲染成**黄色实心方块**,
+   反而挡住学名 —— 故改为 Highlight。荧光笔同样能挂 content 弹窗, 功能不减。
+幂等: 重跑先清旧注释(Text 便签与 Highlight 都清)/链接(仅物种类), 附录页存在则跳过绘制。
 数据: species_zh.json (中文名来自 iPlant/PPBC/多肉联萌/中文维基, 置信度高/中/低;
 查无通行名如实标注 null —— 红线: 绝不编造)。
 
@@ -87,7 +90,9 @@ def main():
     removed = 0
     for pno in range(min(len(doc), APP_PAGE)):
         page = doc[pno]
-        for a in list(page.annots(types=[pymupdf.PDF_ANNOT_TEXT])):
+        # Text 便签是旧版留下的(会渲染成黄色方块), 一并清除
+        for a in list(page.annots(types=[pymupdf.PDF_ANNOT_TEXT,
+                                         pymupdf.PDF_ANNOT_HIGHLIGHT])):
             page.delete_annot(a)
             removed += 1
         for l in list(page.get_links()):
@@ -107,7 +112,7 @@ def main():
     else:
         print('附录页: 已存在, 跳过绘制')
 
-    # ---------- 2) 学名 -> 弹窗注释(矩形钉成小点: 图标不可见级别, 点击弹中文名) ----------
+    # ---------- 2) 学名 -> 荧光笔高亮(半透明黄底, 文字透出; content 存中文名供点击弹出) ----------
     n_annot = 0
     for idx, (latin, d) in enumerate(sorted(data.items())):
         zh = d.get('zh')
@@ -120,12 +125,13 @@ def main():
             page = doc[pno]
             for v in variants(latin):
                 for r in page.search_for(v):
-                    pt = pymupdf.Point(r.x1 + 1, r.y0 + 1)
-                    a = page.add_text_annot(pt, tip, icon='Note')
-                    a.set_rect(pymupdf.Rect(pt.x, pt.y, pt.x + 4, pt.y + 4))
+                    a = page.add_highlight_annot(r)
+                    a.set_colors(stroke=(1, 1, 0))     # 荧光笔黄
+                    a.set_opacity(0.35)                # 半透明: 学名仍清晰可读
+                    a.set_info(content=tip)            # 点击弹出中文名
                     a.update()
                     n_annot += 1
-    print('学名弹窗注释: %d 处' % n_annot)
+    print('学名荧光笔高亮: %d 处' % n_annot)
 
     tmp = args.pdf + '.tmp'
     doc.save(tmp, garbage=3, deflate=True)
