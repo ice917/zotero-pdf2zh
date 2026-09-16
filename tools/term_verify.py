@@ -69,6 +69,7 @@ tools/term_verify.py —— 存疑术语联网查证器（离线批处理，零�
 """
 
 import argparse
+import datetime
 import glob
 import html
 import json
@@ -79,6 +80,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 
 OPENALEX_API = "https://api.openalex.org/works"
 # 礼貌池：带 mailto 进优先通道（可选，留空也能用）
@@ -317,6 +319,41 @@ def llm_judge_relevance(term, titles, context="", timeout=30):
     return out if out else None
 
 
+# 429 附带 Retry-After 超过这个秒数就放弃重试：远大于整条退避阶梯（2+4+8=14s），
+# 撞下去只是空等。阈值取得比阶梯宽，短时限流仍按原样重试。
+RETRY_AFTER_GIVEUP = 60
+
+
+def _retry_after_seconds(e):
+    """从 HTTPError 的 Retry-After 头取秒数；无该头或解析不出返回 None。
+
+    Retry-After 有两种合法形式：秒数（如 `56941`）与 HTTP-date（如
+    `Wed, 16 Sep 2026 12:00:00 GMT`）。前者是绝大多数 API 的用法。
+    """
+    raw = (e.headers.get("Retry-After") if e.headers else None)
+    if not raw:
+        return None
+    raw = raw.strip()
+    if raw.isdigit():
+        return int(raw)
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.timezone.utc)
+        return max(0, int((dt - datetime.datetime.now(datetime.timezone.utc)).total_seconds()))
+    except Exception:
+        return None
+
+
+def _human_wait(sec):
+    """把秒数说成人话，用于错误信息（让人一眼知道该等多久）。"""
+    if sec >= 3600:
+        return "约 %.1f 小时" % (sec / 3600.0)
+    if sec >= 60:
+        return "约 %d 分钟" % (sec // 60)
+    return "%d 秒" % sec
+
+
 def _http_json(url, headers=None, timeout=8, max_retries=4):
     """
     带退避重试的 GET + JSON 解析，供所有检索源复用。
@@ -327,6 +364,11 @@ def _http_json(url, headers=None, timeout=8, max_retries=4):
       - HTTP 429(限流) / 5xx(服务端错误)
       - 网络类错误 URLError / TimeoutError / OSError（连接重置、DNS 抖动）
     退避 2s / 4s / 8s；4xx 等客户端错误立即放弃（重试无意义）。
+
+    例外：429 若带 Retry-After 且远大于整条退避阶梯（合计 14s），重试就是空撞。
+    2026-09-16 实测 OpenAlex 返回 `Retry-After: 56941`（≈15.8 小时，IP 级配额耗尽，
+    与 UA/mailto 无关——带邮箱、换浏览器 UA、裸请求三种身份全是 429），
+    此时直接放弃并把服务器要求的时间回传，交给调用方/报告去说明。
     这段逻辑原先内联在 openalex_search 里，抽出来是为了让新源不必重复实现。
     """
     req = urllib.request.Request(url, headers=headers or {"User-Agent": USER_AGENT})
@@ -337,6 +379,11 @@ def _http_json(url, headers=None, timeout=8, max_retries=4):
                 return json.loads(resp.read().decode("utf-8")), None
         except urllib.error.HTTPError as e:
             last_err = "HTTP %s: %s" % (e.code, e.reason)
+            if e.code == 429:
+                wait = _retry_after_seconds(e)
+                if wait is not None and wait > RETRY_AFTER_GIVEUP:
+                    return None, ("HTTP 429: Too Many Requests（服务器要求 %s 后再试，"
+                                  "配额已耗尽，已跳过重试）" % _human_wait(wait))
             if e.code == 429 or 500 <= e.code < 600:
                 if attempt < max_retries - 1:
                     time.sleep(2 ** (attempt + 1))      # 2s, 4s, 8s
