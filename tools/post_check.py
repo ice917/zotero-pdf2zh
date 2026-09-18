@@ -3,7 +3,7 @@
 tools/post_check.py —— 翻译后质检门禁（零 API 成本，只读）
 
 模块职责：
-  翻译完成后，将 mono 译文与原始 PDF 逐页对比，执行三项自动断言，
+  翻译完成后，将 mono 译文与原始 PDF 逐页对比，执行四项自动断言，
   把"翻车但没人发现"变成"翻车自动报警"。断言项（参照 BabelDOC
   ACL 2026 论文的 Untranslated Blocks 质检指标设计）：
 
@@ -13,10 +13,14 @@ tools/post_check.py —— 翻译后质检门禁（零 API 成本，只读）
                      偏差超限 → 版面错乱/文献混排（参考文献页事故
                      的典型特征就是标号丢失或重复）
     3. 占位符残留    译文中残留 {vN} 公式占位符 → 公式回填失败
+    4. 文献区禁汉化  原文的参考文献页（编号制行首 [n] 条目密集，或
+                     作者-年份制条目密集，判据见 REF_DENSITY）
+                     在译文中被中文化（人名/期刊名/标题被翻成中文）
+                     → 学术文献表不可用。文献条目必须整条原样保留。
 
-  特别处理：skipLastPages 跳过的参考文献页在译文中保持英文原版，
-  属预期行为——通过"行首条目式[n]密集"特征识别为"原文保留页"，
-  标记为通过而非失败。
+  特别处理：参考文献条目按规定整条保持英文，所以"文献页译文汉字为零"
+  是预期结果而非翻译失败——断言4 反向把关（条目里出现汉字才算事故），
+  断言1 对该类页面直接豁免。skipLastPages 跳过的末尾页同理豁免。
 
   结论写入 server/translated/review/翻译后质检_*.md，并给出
   总体门禁判定：PASS（可交付）/ FAIL（存在高危问题需处理）。
@@ -55,9 +59,43 @@ REVIEW_DIRNAME = "review"
 
 CJK_FAIL = 0.05          # 原文实质内容页译文汉字占比低于该值 → 翻译缺失
 MIN_SUBSTANTIAL = 500    # 原文页可提取字符数超过该值才算"实质内容页"
-REF_ENTRY_MIN = 3        # 行首条目式 [n] 数达到该值 → 判定原文保留页(跳过页)
 CITE_TOL_ABS = 5         # 引用标号数量对账的绝对容差
 CITE_TOL_REL = 0.2       # 引用标号数量对账的相对容差（20%）
+# [自研补丁 2026-09-19] 第四断言(文献区禁汉化)口径
+REF_ZH_MIN = 2           # 单页"被汉化的文献条目"数达到该值 → 该页文献被翻成中文
+REF_DENSITY = 2.5        # 文献页判据: 原文每千字的**文献条目**数达到该值。
+                         # 条目按引用体例取其一: 编号制数行首 [n], 作者-年份制
+                         # 数"姓名 (年)"(见 REF_AY) —— 两种体例同阈值。
+                         # 实测 EgoPhys: 纯文献页 4.31/4.46/4.60, 而"正文末页
+                         # + 文献开头"的第 9 页只有 1.77 —— 用密度而不是"条目数
+                         # >= 3"才能把那半页正文排除在文献判据之外(否则正文的
+                         # 中文会被当成文献被汉化)。
+                         # 不变量: 判据一律取**原文页**的密度。译文页不可用 ——
+                         # 条目一旦被汉化/换成中文标点, 行首 [n] 会被 pypdf 拆散,
+                         # 实测 CLAP 第15页原文密度 3.18 而译文只剩 0.40。
+REF_ZH_WINDOW = 200      # 条目块截断长度(字符): 一个文献条目极少超过 200 字符,
+                         # 截断可防止"文献区末尾 + 同页后续正文"被算进最后一条。
+# [自研补丁 2026-09-19] 作者-年份制文献页(整表无行首 [n])的判据与汉化计数。
+# 事故: Wang 2026 第15页是"R. Olfati-Saber and R. M. Murray (2004). ..."
+# 体例, 行首 [n] 密度恒为 0 → 既不被识别为文献页(断言1 误判"翻译缺失"),
+# 也不受断言4 保护(硅基首轮把整表条目汉化仍 PASS)。
+# 实测分离度: Wang 文献页 (年)密度 2.93/3.58, 其余 11 篇 PDF 正文页最高 0.7,
+# 编号制文献页恒为 0.00 —— 与 REF_DENSITY 同阈值即可分离。
+REF_AY = re.compile(r"(?m)^\s*(?:[A-Z]\.\s*){1,4}[A-Z][A-Za-z\-'\u4e00-\u9fff]+"
+                    r"[\s\S]{0,80}?\((?:19|20)\d{2}[a-z]?\)")
+                         # 原文侧: "R. Olfati-Saber and R. M. Murray (2004)."
+                         # 行首姓名 + 其后 80 字符内出现年份 → 一个条目。
+                         # 正文引用"(Olfati-Saber and Murray, 2004)"不在此列
+                         # (它不是行首姓名), 实测正文页密度 ≤0.7。
+AY_AUTHOR = re.compile(r"(?:[A-Z]\.\s*){1,4}[A-Z\u4e00-\u9fff]"
+                       r"[A-Za-z\-'\u4e00-\u9fff]+")
+                         # 译文侧姓名锚: LLM 改写文献条目时姓名(首字母缩写+姓)
+                         # 最常原样保留(实测 "R. Olfati-Saber 与 R. M. Murray"),
+                         # 故用它切块。姓首字允许汉字(姓被汉化后仍能锚住
+                         # "R. 奥法蒂"), 但不允许小写拉丁开头 —— 否则英文正文
+                         # 里的 "R. and"、"a. b" 之类会被误当姓名。
+REF_AY_SPAN_CAP = 400    # 两姓名锚之间的跨度上限(字符): 超长视为正文夹缝,
+                         # 不是条目内容, 不计入(防止正文中文被当文献汉化)。
 PLACEHOLDER = re.compile(r"\{v\d+\}")   # pdf2zh 公式占位符 {v1} {v2} ...
 REF_ENTRY = re.compile(r"(?m)^\s*\[\d{1,3}\]")
 CITE_ANY = re.compile(r"\[\d{1,3}\]")
@@ -73,10 +111,51 @@ def review_dir():
 
 
 # ---------------------------------------------------------------- 页面特征
+def count_zh_ref_blocks(text):
+    """统计"被汉化的文献条目"条数。
+
+    [自研补丁 2026-09-19] 按行首 [n] 切块: 每块从 [n] 起, 到下一个 [n] 或
+    块首 + REF_ZH_WINDOW 截断为止, 块内含汉字即该条被汉化。截断是必需的
+    —— 文献区末尾那条后面若紧跟同页正文, 不截断会把正文的中文算进最后
+    一条(EgoPhys 第9页: 文献开头 + 正文末尾同页)。
+    """
+    hits = list(REF_ENTRY.finditer(text))
+    n = 0
+    for k, m in enumerate(hits):
+        end = hits[k + 1].start() if k + 1 < len(hits) else m.start() + REF_ZH_WINDOW
+        if CJK.search(text[m.start():end]):
+            n += 1
+    return n
+
+
+def count_zh_ay_blocks(text):
+    """统计"被汉化的作者-年份制文献条目"条数。
+
+    [自研补丁 2026-09-19] 作者-年份制文献表（见 REF_AY）没有行首 [n]，条目
+    被整条改写后编号/年份也不复存在 —— 行首 [n] 判据恒为 0，断言4 在此类
+    页面上形同虚设（Wang 2026 第15页注入前条目被整条汉化仍判 PASS）。
+    改以**译文中幸存的姓名锚**切块：相邻两锚之间的跨度即两条目之间的内容，
+    含汉字则前一条被汉化。首锚之前 / 末锚之后不计 —— 那是正文或附录，不是
+    条目内容（Wang 第15页文献区之后就是中文的附录证明）。
+    """
+    hits = list(AY_AUTHOR.finditer(text))
+    n = 0
+    for a, b in zip(hits, hits[1:]):
+        span = text[a.end():b.start()]
+        if len(span) > REF_AY_SPAN_CAP:
+            continue
+        if CJK.search(span):
+            n += 1
+    return n
+
+
 def page_features(reader, idx):
     """提取第 idx 页（0 基）的质检特征，失败返回 error"""
     feat = {"page": idx + 1, "chars": 0, "cjk": 0, "alnum": 0, "cites": 0,
-            "ref_entries": 0, "placeholders": 0, "error": None}
+            "ref_entries": 0, "ref_density": 0.0,
+            "ref_ay_entries": 0, "ref_ay_density": 0.0,
+            "ref_zh_blocks": 0, "ref_zh_blocks_ay": 0,
+            "placeholders": 0, "error": None}
     try:
         text = reader.pages[idx].extract_text() or ""
         feat["chars"] = len(text.strip())
@@ -84,6 +163,13 @@ def page_features(reader, idx):
         feat["alnum"] = len(re.findall(r"[A-Za-z0-9]", text))
         feat["cites"] = len(CITE_ANY.findall(text))
         feat["ref_entries"] = len(REF_ENTRY.findall(text))
+        feat["ref_ay_entries"] = len(REF_AY.findall(text))
+        if feat["chars"]:
+            feat["ref_density"] = feat["ref_entries"] * 1000.0 / feat["chars"]
+            feat["ref_ay_density"] = (feat["ref_ay_entries"] * 1000.0
+                                      / feat["chars"])
+        feat["ref_zh_blocks"] = count_zh_ref_blocks(text)
+        feat["ref_zh_blocks_ay"] = count_zh_ay_blocks(text)
         feat["placeholders"] = len(PLACEHOLDER.findall(text))
     except Exception as exc:
         feat["error"] = str(exc)[:120]
@@ -95,10 +181,19 @@ def cjk_ratio(feat):
     return feat["cjk"] / total if total else 0.0
 
 
+def is_ref_page(feat):
+    """该页（原文特征）是否为文献页：编号制或作者-年份制条目密集即算。
+
+    [自研补丁 2026-09-19] 两种体例共用 REF_DENSITY。判据只认原文页 ——
+    译文页的条目被汉化/换标点后, 行首 [n] 与年份都会被 pypdf 拆散。
+    """
+    return max(feat["ref_density"], feat["ref_ay_density"]) >= REF_DENSITY
+
+
 # ---------------------------------------------------------------- 断言
 def run_checks(orig_feats, trans_feats, skip_last=0):
     """
-    三项断言。返回 (findings, verdict)
+    四项断言。返回 (findings, verdict)
       findings: [(级别, 页码或全局, 描述), ...]  级别: 高/中/提示/通过
       verdict:  "PASS" / "FAIL"
       skip_last: 任务实际配置的 skipLastPages(由服务端传入); 仅末尾连续
@@ -112,7 +207,11 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
     # 译文特征(行首 [n] 密集 + 无汉字)豁免, LLM 对文献行原样回显英文、或
     # 跳页数小于实际文献区页数时, 失败页会被静默放行。现在: 末尾
     # skip_last 页且无汉字 → 预期豁免; 豁免区外的无汉字页一律判失败。
-    fail_pages, kept_pages = [], []
+    # [自研补丁 2026-09-19] 追加文献页豁免: 文献条目按规定整条保留英文,
+    # 该页译文"汉字为零"是预期结果, 不判翻译缺失 —— 反过来由第 4 断言
+    # (文献区禁汉化)把关。EgoPhys 第10/11/12页曾因此误报; 作者-年份制
+    # 文献页(Wang 第15页, 无行首 [n])同理, 见 is_ref_page。
+    fail_pages, kept_pages, ref_pages = [], [], []
     for i in range(n):
         o, t = orig_feats[i], trans_feats[i]
         if o["error"] or t["error"]:
@@ -120,6 +219,9 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
         if o["chars"] < MIN_SUBSTANTIAL:
             continue  # 原文页无实质内容（封面/图表页），不参与断言
         cjk_low = cjk_ratio(t) < CJK_FAIL
+        if cjk_low and is_ref_page(o):
+            ref_pages.append(t["page"])    # 文献页, 英文原样保留属预期
+            continue
         if skip_last > 0 and i >= n - skip_last and cjk_low:
             kept_pages.append(t["page"])   # 任务明确跳过的末尾页, 原文保留
             continue
@@ -134,6 +236,10 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
         findings.append((
             "通过", f"第{','.join(map(str, kept_pages))}页",
             f"原文保留页（任务 skipLastPages={skip_last} 豁免的末尾页），预期行为"))
+    if ref_pages:
+        findings.append((
+            "通过", f"第{','.join(map(str, ref_pages))}页",
+            "文献页条目原样保留（译文汉字占比低属预期，条目是否被汉化由第 4 断言把关）"))
     if skip_last <= 0:
         findings.append((
             "提示", "全局",
@@ -177,6 +283,41 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
     else:
         findings.append(("通过", "全文", "占位符残留检查通过：无 {vN} 残留"))
 
+    # ---------- 4. 参考文献区不得汉化 ----------
+    # [自研补丁 2026-09-19] 事故背景: EgoPhys(2026) 首轮 LLM 直译把文献表整条
+    # 中文化(K. Zhang→"K. 张"、K. Hauser→"K. 豪泽"、期刊名加书名号), 174 处,
+    # 而当时三项断言全 PASS —— 汉化率只查"汉字太少", 不查"英文该留的没留"。
+    # 口径: 文献页判据取原文侧密度(见 REF_DENSITY/is_ref_page), 命中后再按
+    # 条目块数汉字 —— 只有条目本身被译成中文才算事故; 同页正文的中译不计入
+    # (条目块已按 REF_ZH_WINDOW 截断)。
+    # [自研补丁 2026-09-19] 两种体例各用一条计数臂: 编号制锚行首 [n](编号在
+    # 译文里必然幸存); 作者-年份制无 [n], 锚译文中幸存的姓名(见
+    # count_zh_ay_blocks)。仅当该页确为作者-年份制文献页时才启用后者, 否则
+    # 正文里的拉丁人名会让中文正文被误算成"被汉化的条目"(实测 CLAP 第15-17页
+    # 编号制文献页 + 中文正文: 误报 27/53/17 条)。
+    zh_ref_pages, zh_ref_why, n_ref_pages = [], [], 0
+    for i in range(n):
+        o, t = orig_feats[i], trans_feats[i]
+        if o["error"] or t["error"] or not is_ref_page(o):
+            continue
+        n_ref_pages += 1
+        zh_n = t["ref_zh_blocks"]
+        if o["ref_ay_density"] >= REF_DENSITY:
+            zh_n += t["ref_zh_blocks_ay"]
+        if zh_n >= REF_ZH_MIN:
+            zh_ref_pages.append(t["page"])
+            zh_ref_why.append(f"第{t['page']}页({zh_n}条)")
+    if zh_ref_pages:
+        findings.append((
+            "高", f"第{','.join(map(str, zh_ref_pages))}页",
+            "文献区汉化断言失败：原文的参考文献条目在译文中被翻译成中文"
+            f"（{('、'.join(zh_ref_why))}）。文献条目必须整条原样保留——"
+            "人名/标题/期刊名被汉化后文献表不可用，且无法据此回溯原文"))
+    elif n_ref_pages:
+        findings.append((
+            "通过", "全文",
+            f"文献区禁汉化检查通过：{n_ref_pages} 个文献页的条目均保持原样"))
+
     # ---------- 页数一致性 ----------
     if len(orig_feats) != len(trans_feats):
         findings.append((
@@ -211,9 +352,13 @@ def build_report(mono_path, orig_path, n_pages, findings, verdict, skip_last=0):
     for level, loc, desc in findings:
         lines.append(f"- {icon.get(level, '⚪')} **[{level}]** {loc}：{desc}")
     lines += ["", "## 断言项说明", "",
-              "1. **汉化率**：原文实质内容页的译文汉字占比（排除跳过的文献页）",
+              "1. **汉化率**：原文实质内容页的译文汉字占比（排除跳页与文献保留页）",
               "2. **引用完整性**：原文/译文 [n] 标号逐页对账，超容差=版面错乱",
               "3. **占位符残留**：{vN} 公式占位符未回填即失败",
+              "4. **文献区禁汉化**：原文文献页（编号制行首 [n] 密度，或作者-年份"
+              f"制条目密度 ≥ {REF_DENSITY} 条/千字）的条目在译文中被翻成中文即失败"
+              "（人名/标题/期刊名必须原样保留）；反之文献页译文无汉字属预期，"
+              "不计入汉化率断言",
               "", "---", "",
               "> 由 tools/post_check.py 自动生成，阈值可在文件头部常量区调整。"]
     return "\n".join(lines)
