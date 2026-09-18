@@ -40,7 +40,7 @@
             "envs": {
                 "SILICON_API_KEY": "",
                 "SILICON_MODEL": "deepseek-ai/DeepSeek-V3",
-                "POLISH": "1",
+                "POLISH": "0",
                 "POLISH_REFLECT": "1",
                 "POLISH_GLOSSARY": "D:/zotero-pdf2zh/server/glossary/terms.csv",
                 "POLISH_GUIDELINE": "D:/zotero-pdf2zh/server/glossary/guideline.txt",
