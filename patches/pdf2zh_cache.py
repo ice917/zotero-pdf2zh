@@ -12,6 +12,32 @@ logger = logging.getLogger(__name__)
 
 _TOKEN_RE = re.compile(r"\{v\d+\}")
 
+# [v27] 已退役的键参数前缀: 润色钩子(POLISH)退场后, 其键参数不再区分缓存世代。
+#
+# 背景: polish / polish_anchor / polish_reflect / polish_model / polish_domain /
+# polish_formula_map / polish_formula_hint / polish_glossary_fp /
+# polish_guideline_fp 这 9 个键曾参与缓存键(translator L518-564)。把 POLISH 置 0
+# 后这些键不再写入 —— 若不设回查通道, 既有译文(键里带 polish*)会**整篇失配重译**,
+# 且豆包回灌进库的定稿译文会被新译者覆盖。
+#
+# 为什么不用 snapshot_legacy_key()(v23 的"渐进化键改造"通道): 那条路要求把某个
+# 历史键形态原样登记下来回查, 而润色世代的形态**无法重建** —— 其中
+# polish_guideline_fp 是"每篇论文一份的翻译指南"文件指纹, 随文档而变; 且库里
+# 同时存在 pre-v23(带 polish_glossary_fp) 与 post-v23(该键已被 remove_param 移除)
+# 两种形态, ladder 的 prev/legacy 两个槽位也覆盖不全。
+#
+# 故改为"投影": 按前缀把退役参数从世代身份里整体剔除 —— 库中带 polish* 的行按
+# 剔除后的形态登记进 _retired_index, 当前世代(不含 polish*)命中后回写迁移到当前
+# 形态(与 v23/v24-A 的 ladder 同约定), 实现零重译迁移。
+#
+# 同批退役的还有 v23s(术语表"按段指纹"后缀): 它的生产者是润色术语表
+# (_cache_key_suffix 在 POLISH/术语表未启用时恒返回 ""), 润色退场后该维度不再产生,
+# 而库里的行几乎都带它 —— 不剔除则投影形态仍差一维, 一行也命中不了。
+# 两者都只由润色子系统生产, 故一并按"退役维度"处理: 退役世代重新只按
+# "渲染所必需的维度"(引擎参数 + 文档画像 fp 等)区分缓存。
+_RETIRED_PARAM_PREFIXES = ("polish",)
+_RETIRED_PARAM_KEYS = ("v23s",)
+
 
 class _TranslationCache(Model):
     id = AutoField()
@@ -57,6 +83,7 @@ class TranslationCache:
         self.legacy_params_json = None
         self.prev_params_json = None
         self._legacy_canon_index = None
+        self._retired_canon_index = None      # [v27] 退役参数投影索引(惰性)
         self.replace_params(translate_engine_params)
 
     # The program typically starts multi-threaded translation
@@ -131,6 +158,74 @@ class TranslationCache:
         params["v23s"] = key_suffix
         return json.dumps(self._sort_dict_recursively(params))
 
+    def _with_suffix(self, base_json: str, key_suffix: str) -> str:
+        """[v24-A] 给历史(prev/legacy)基形态补上每段 v23s 后缀。
+
+        库里的行是以"基形态 + v23s"入库的(如 '#g23:-'), 而 snapshot 登记的
+        只是基形态 —— 不补后缀则 exact 匹配与内存索引双双落空。"""
+        if not key_suffix or not base_json:
+            return base_json
+        try:
+            params = json.loads(base_json)
+        except Exception:
+            return base_json
+        if not isinstance(params, dict):
+            return base_json
+        params["v23s"] = key_suffix
+        return json.dumps(self._sort_dict_recursively(params))
+
+    @staticmethod
+    def _strip_retired(base_json: str):
+        """[v27] 剔除退役键参数(_RETIRED_PARAM_PREFIXES)后的形态。
+
+        返回 (形态, 剔除个数)。无退役参数时**原样返回**并报 0 —— 保证当前世代
+        的键形态逐字节不变(不引入无谓重排序)。形态用同一套递归排序序列化,
+        以便与被剔除后的 self.translate_engine_params 逐字节比较。
+        """
+        if not base_json:
+            return base_json, 0
+        try:
+            params = json.loads(base_json)
+        except Exception:
+            return base_json, 0
+        if not isinstance(params, dict):
+            return base_json, 0
+        kept = {
+            k: v for k, v in params.items()
+            if not (k in _RETIRED_PARAM_KEYS
+                    or any(k.startswith(p) for p in _RETIRED_PARAM_PREFIXES))
+        }
+        n = len(params) - len(kept)
+        if not n:
+            return base_json, 0
+        return json.dumps(TranslationCache._sort_dict_recursively(kept)), n
+
+    def _retired_index(self):
+        """[v27] "剔除退役参数后"的条目索引 (惰性, 每引擎一次)。
+
+        只登记确实带退役参数的行(带 polish* 的润色世代), 故与当前世代的行
+        互不覆盖。内存索引而非 SQL: 旧行以 raw 文本入库, sqlite 精确匹配找不到
+        "规范化相等、原文不等"的行(与 _legacy_index 同理)。按 id 升序后写覆盖
+        —— 同一段落在润色世代里被翻过多次时, 留最新一条。
+        """
+        if self._retired_canon_index is not None:
+            return self._retired_canon_index
+        idx = {}
+        try:
+            for row in (_TranslationCache.select()
+                        .where(_TranslationCache.translate_engine
+                               == self.translate_engine)
+                        .order_by(_TranslationCache.id)):
+                stripped, n = self._strip_retired(row.translate_engine_params)
+                if not n:
+                    continue
+                canon_text, _ = self._canon_seq(row.original_text)
+                idx[(stripped, canon_text)] = (row.original_text, row.translation)
+        except Exception as e:
+            logger.debug(f"Retired-param canon index build failed: {e}")
+        self._retired_canon_index = idx
+        return idx
+
     @staticmethod
     def _canon_seq(text: str):
         """[v23] {vN} 全局编号 → 段内出现序规范编号。
@@ -180,8 +275,14 @@ class TranslationCache:
         forms = [pj]
         for extra in (getattr(self, "prev_params_json", None),
                       getattr(self, "legacy_params_json", None)):
-            if extra and extra not in forms:
-                forms.append(extra)
+            if not extra:
+                continue
+            # [v24-A] 历史形态同样要带每段 v23s 后缀: 库中的行以"基形态 +
+            # v23s"入库, 快照登记的只是基形态 —— 两种都试, 否则一次键演化
+            # (如 doc_summary_fp 加入) 就整篇失配。
+            for form in (self._with_suffix(extra, key_suffix), extra):
+                if form and form not in forms:
+                    forms.append(form)
 
         def _direct(form, key_text):
             return _TranslationCache.get_or_none(
@@ -190,16 +291,16 @@ class TranslationCache:
                 original_text=key_text,
             )
 
-        def _migrate_store(row):
+        def _migrate_store(stored_original, stored_translation):
             """[v23.3] 历史形态命中即回写当前形态; 译文规范化必须用
             "存入时原文"的 seq (行内 token 是存入时全局编号)。"""
             try:
-                canon_stored, stored_seq_s = self._canon_seq(row.original_text)
+                canon_stored, stored_seq_s = self._canon_seq(stored_original)
 
                 def _wb_repl(m):
                     return stored_seq_s.get(m.group(0), m.group(0))
 
-                canon_trans = _TOKEN_RE.sub(_wb_repl, row.translation)
+                canon_trans = _TOKEN_RE.sub(_wb_repl, stored_translation)
                 _TranslationCache.create(
                     translate_engine=self.translate_engine,
                     translate_engine_params=pj,
@@ -223,13 +324,30 @@ class TranslationCache:
                 hit = idx.get((form, canon_text))
                 if hit is not None:
                     stored_original, stored_translation = hit
+                    # [v24-A] 索引命中同样要回写迁移, 否则下次仍停在旧形态。
+                    _migrate_store(stored_original, stored_translation)
                     return self._remap(stored_original, stored_translation, cur_seq)
                 row = _direct(form, canon_text)
                 if row is None and canon_text != original_text:
                     row = _direct(form, original_text)
                 if row is not None:
-                    _migrate_store(row)
+                    _migrate_store(row.original_text, row.translation)
                     return self._remap(row.original_text, row.translation, cur_seq)
+        # ③ [v27] 退役参数投影回查: 润色钩子退场后, 库中"键里带 polish*"的行按
+        # 剔除 polish*(及后续退役前缀)后的形态命中, 命中即回写迁移到当前形态
+        # (同 ② 约定)。覆盖 ① ② 够不到的全部润色世代 —— 含 polish_guideline_fp
+        # 随文档而变、无法用 ladder 重建的那些形态。
+        # 门控: 仅当**当前世代本身不含退役参数**时启用。润色若日后重新开启
+        # (键里又出现 polish*), 这里直接跳过, 保持世代严格隔离 —— 不会把未润色
+        # 的旧译文喂给开启润色的任务。
+        if self._strip_retired(pj)[1] == 0:
+            idx = self._retired_index()
+            for form in forms:
+                hit = idx.get((self._strip_retired(form)[0], canon_text))
+                if hit is not None:
+                    stored_original, stored_translation = hit
+                    _migrate_store(stored_original, stored_translation)
+                    return self._remap(stored_original, stored_translation, cur_seq)
         return None
 
     def set(self, original_text: str, translation: str, key_suffix: str = ""):

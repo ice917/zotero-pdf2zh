@@ -527,7 +527,11 @@ class OpenAITranslator(BaseTranslator):
                 f"指南={os.path.basename(self._polish_guideline_path) if self._polish_guideline_path else '无'}",
                 flush=True,
             )
-        if self._polish_reflect:
+        # [v27] 润色退场(POLISH=0)后, 这行原本在门闩之外无条件登记 —— 键里会残留
+        # 一项 polish_reflect, 既是无意义的世代维度, 也让"润色重开"多出一代。
+        # 归入门闩内: 退役世代的键彻底不含 polish*(与 cache._RETIRED_PARAM_PREFIXES
+        # 的投影口径一致)。
+        if self._polish_enabled and self._polish_reflect:
             self.add_cache_impact_parameters("polish_reflect", "on")
 
         # [自研补丁 2026-09-03] 润色配置指纹进缓存键: 旧实现只登记了
