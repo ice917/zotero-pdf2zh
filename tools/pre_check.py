@@ -3,18 +3,25 @@
 tools/pre_check.py —— PDF 翻译前体检器（零 API 成本，零侵入）
 
 模块职责：
-  在提交翻译之前，用 pypdf 对 PDF 做一次快速"体检"，提前暴露
-  会触发 pdf2zh 版面解析失败的高危因素，并给出可操作的处置建议：
+  在提交翻译之前，对 PDF 做一次快速"体检"，提前暴露会触发 pdf2zh
+  版面解析失败的高危因素，并给出可操作的处置建议：
     - 参考文献页检测   → 自动推荐 skipLastPages 值（跳过末尾 N 页）
     - 扫描件检测       → 无文本层的页提示先走 OCR（pdf2zh_next + OCR）
     - 公式密集页预警   → 数学符号密度高的页列入"重点核对"名单
+    - 字体/结构风险    → Type3 字体、复合字体缺 ToUnicode、生产者指纹(dvips/iText)
     - 加密/损坏预检    → 提前发现无法解析的文件
   检查结论写入 server/translated/review/翻译前体检报告_*.md，
   与审校报告/存疑清单共用同一目录，形成"翻前体检 → 翻后质检"闭环。
 
+与其他工具的分工（**别搞反**）：
+  本工具 = 便宜筛子。字体那一段用 PyMuPDF 读"风险特征"，而 MuPDF 是另一个
+  解析器：它能读出结构 **不代表 pdfminer 读得下来**。结论只当线索。
+  tools/parse_smoke.py = 真判据：走产线同一条代码路径（pdf2zh.pdfinterp +
+  pdfminer 字体构造）逐页试解析，过了才是真的过。被本工具标红 → 必须跑沙盘。
+
 设计原则：
 1. **只读**：不修改 PDF 与任何翻译产物，仅输出报告文件。
-2. **零依赖增量**：只用 venv 里已有的 pypdf，不引入新依赖，零 API 成本。
+2. **零依赖增量**：只用 venv 里已有的 pypdf + PyMuPDF，不引入新依赖，零 API 成本。
 3. **保守推荐**：skipLastPages 只在"参考文献页构成文档后缀"时推荐；
    参考文献混在正文中间时仅提示，不自动给跳页建议。
 4. **优雅降级**：单页解析失败只跳过该页，不中断整体体检。
@@ -58,6 +65,25 @@ CJK_MOSTLY = 0.5        # 汉字字符占字母数字比例超过该值 → 疑�
 MATH_CHARS = re.compile(
     r"[∑∫∮∂√×÷±≈≠≤≥∞∈∀∃∇∆∏∪∩⊂⊃°µ≡→←↔⇒⟨⟩⟪⟫∂]"
     r"|[\u0391-\u03c9]")  # 数学符号 + 希腊字母（不含普通字母数字）
+
+# --- 闸门 1：字体/结构风险（便宜筛子，PyMuPDF 侧）---
+# 生产者/生成器指纹。只收"有确证来源"的两条，其余一律只记录不判定，
+# 避免把"格式谱系"当"风险"制造噪声：
+#   dvips → Type3 位图字体鼻祖。1986 年为 170K 内存的 Apple LaserWriter 所写，
+#           只做 Level 1 Type3 最低要求，生成了语法合法但语义无意义的 /Encoding
+#           向量（/A0–/H3 base36），TUGboat tb125rokicki 原文称其"至今仍在，
+#           颠覆一切搜索复制"。与本项目 v26.19 的 Type3 崩溃同一科。
+#   iText → 官方技术说明：Type3 字形到字符的映射本就不可靠（常用来画符号或
+#           防文本提取），即使解析成功也未必有可用文本。
+PRODUCER_RISK = (
+    ("dvips", "高",
+     "生产者是 dvips：Type3 位图字体高发源（/Encoding 语义无意义，1986 年至今未改）。"
+     "这类文件的 Type3 既可能让 pdfminer 字体构造抛错、整篇退出，"
+     "解析成功也只能得到不可搜索的文本"),
+    ("itext", "中",
+     "生产者是 iText：Type3 常被用来画符号或防文本提取，"
+     "即使解析成功也未必有可用的字符映射"),
+)
 
 
 def project_root():
@@ -121,10 +147,86 @@ def analyze_page(reader, idx):
     return feat
 
 
+# ---------------------------------------------------------------- 字体/结构画像
+def _composite_type(ftype):
+    """复合字体（字符→字形要查 CMap）：这类字体缺 ToUnicode 最易产生乱码/伪汉字"""
+    return ("Type0" in ftype) or ("CIDFont" in ftype) or ("TrueType" in ftype)
+
+
+def _missing_tounicode(doc, xref, ftype):
+    """
+    字体字典无 /ToUnicode → True。
+    只对复合字体问这个问题：Type1/base14 无 ToUnicode 是常态（走 /Encoding），
+    对它们报"缺映射"纯属噪声。
+    """
+    if not _composite_type(ftype):
+        return False
+    try:
+        kind, _val = doc.xref_get_key(xref, "ToUnicode")
+        return kind == "null"
+    except Exception:
+        return False
+
+
+def scan_fonts(pdf_path):
+    """
+    用 PyMuPDF 逐页读字体画像（**便宜筛子**：MuPDF 能读 != pdfminer 能读）。
+
+    返回 {'error','producer','creator','pages':[{'page','fonts','type3','noto',
+          'unembedded','count'}]}
+      type3      : Type3 字体名（v26.19 实测崩因，pdfminer 侧会在字体构造处抛错）
+      noto       : 复合字体中缺 /ToUnicode 的（文本极易成乱码/伪汉字）
+      unembedded : 无内嵌字体文件（只看不判，渲染问题不属解析层崩溃）
+    任何异常都不中断体检：出问题就返回 error / 该页记 error。
+    """
+    out = {"error": None, "producer": "", "creator": "", "pages": []}
+    try:
+        import fitz
+    except Exception as exc:
+        out["error"] = "PyMuPDF 不可用: %s" % exc
+        return out
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as exc:
+        out["error"] = "PyMuPDF 打不开: %s" % str(exc)[:120]
+        return out
+
+    try:
+        meta = doc.metadata or {}
+        out["producer"] = (meta.get("producer") or "").strip()
+        out["creator"] = (meta.get("creator") or "").strip()
+        for i in range(doc.page_count):
+            rec = {"page": i + 1, "fonts": [], "type3": [], "noto": [],
+                   "unembedded": [], "count": 0, "error": None}
+            try:
+                seen = set()
+                for f in doc[i].get_fonts(full=True):
+                    xref, ext, ftype, basefont = f[0], f[1], str(f[2]), str(f[3])
+                    if xref in seen:      # 同一字体在一页里可能被多处引用
+                        continue
+                    seen.add(xref)
+                    label = "%s:%s" % (ftype, basefont)
+                    rec["fonts"].append(label)
+                    if "Type3" in ftype:
+                        rec["type3"].append(label)
+                    if _missing_tounicode(doc, xref, ftype):
+                        rec["noto"].append(label)
+                    if not ext:
+                        rec["unembedded"].append(label)
+                rec["count"] = len(rec["fonts"])
+            except Exception as exc:      # 单页读不动不影响其它页
+                rec["error"] = str(exc)[:120]
+            out["pages"].append(rec)
+    finally:
+        doc.close()
+    return out
+
+
 # ---------------------------------------------------------------- 判定
-def decide(pages, total):
+def decide(pages, total, docrisk=None):
     """
     汇总所有页特征 → 体检结论。
+    docrisk: scan_fonts() 的返回（可为 None = 不做字体侧判定）
     返回 (recommend_skip, findings)
       recommend_skip: 推荐的 skipLastPages 值（0 = 不推荐跳页）
       findings:       [(级别, 页码或全局, 描述), ...]  级别: 高/中/提示
@@ -194,11 +296,61 @@ def decide(pages, total):
             "页面解析抛错（加密/字体表损坏），pdf2zh 大概率同样失败，"
             "建议先修复 PDF 或跳过这些页"))
 
+    # --- 字体/结构风险（闸门 1 → 是否必须跑闸门 2）---
+    findings += _font_findings(docrisk)
+
     return recommend_skip, findings
 
 
+def _font_findings(docrisk):
+    """
+    字体侧风险结论（便宜筛子）。只产"线索"，真正的判据是 tools/parse_smoke.py。
+    """
+    out = []
+    if not docrisk:
+        return out
+    if docrisk["error"]:
+        out.append(("提示", "全局",
+                    "字体画像不可用（%s）：本次只做文本/结构侧体检，"
+                    "没有字体侧线索" % docrisk["error"]))
+        return out
+
+    # --- Type3：本项目已实锤的"单个字体炸整篇"元凶 ---
+    t3 = [p for p in docrisk["pages"] if p["type3"]]
+    if t3:
+        pages_str = ",".join(str(p["page"]) for p in t3)
+        names = ", ".join(sorted({n for p in t3 for n in p["type3"]}))[:160]
+        out.append((
+            "高", f"第{pages_str}页",
+            f"检出 Type3 字体（{names}）。Type3 是用户自定义字体，字形由内嵌绘图"
+            "指令描述，pdfminer 侧处理路径与常规字体不同：实测（v26.19）单个 Type3 "
+            "就能让字体构造抛 AttributeError、pdf2zh 整篇退出码 1 且产物一个都不写。"
+            "**提交前必须跑：python tools/parse_smoke.py <该PDF>** —— 体检只报线索，"
+            "沙盘走产线同一条代码路径，过了才敢提交"))
+
+    # --- 复合字体缺 ToUnicode ---
+    noto = [p for p in docrisk["pages"] if p["noto"]]
+    if noto:
+        pages_str = ",".join(str(p["page"]) for p in noto)
+        out.append((
+            "中", f"第{pages_str}页",
+            "复合字体（Type0/CIDFont/TrueType）缺 /ToUnicode 字符映射表。"
+            "解析通常不会崩，但**字符到汉字的映射不可靠**：表现为乱码、伪汉字、"
+            "或「整页已是中文」的假象（老文献高发）。翻译前请人工看一眼这几页的提取"
+            "文本是否可读；不可读说明该页译文不可信"))
+
+    # --- 生产者/生成器指纹 ---
+    hay = ("%s %s" % (docrisk["producer"], docrisk["creator"])).lower()
+    for key, level, desc in PRODUCER_RISK:
+        if key in hay:
+            out.append((level, "全局", desc))
+
+    return out
+
+
 # ---------------------------------------------------------------- 报告
-def build_report(pdf_path, total, pages, recommend_skip, findings, encrypted):
+def build_report(pdf_path, total, pages, recommend_skip, findings, encrypted,
+                 docrisk=None):
     """组装 Markdown 体检报告"""
     now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     lines = [
@@ -220,6 +372,7 @@ def build_report(pdf_path, total, pages, recommend_skip, findings, encrypted):
         lines.append(
             "| {page} | {chars} | {ref_markers} | {ref_entries} | {math} | {cjk_r:.0%} | {note} |".format(
                 note=note, **p))
+    lines += font_section(docrisk)
     lines += ["", "## 结论与建议", ""]
     if not findings:
         lines.append("未发现高危因素，可正常提交翻译。")
@@ -227,7 +380,83 @@ def build_report(pdf_path, total, pages, recommend_skip, findings, encrypted):
         for level, loc, desc in findings:
             lines.append(f"- **[{level}]** {loc}：{desc}")
     lines += ["", "---", "",
-              "> 由 tools/pre_check.py 自动生成，阈值可在文件头部常量区调整。"]
+              "> 由 tools/pre_check.py 自动生成，阈值可在文件头部常量区调整。",
+              "> 本工具是**便宜筛子**（字体段用 PyMuPDF），只报线索；",
+              "> 被判红时请跑 tools/parse_smoke.py —— 那才是走产线同一条路径的真判据。"]
+    return "\n".join(lines)
+
+
+def font_section(docrisk):
+    """字体/结构画像小节（无数据则返回空列表）"""
+    if not docrisk:
+        return []
+    lines = ["", "## 字体/结构画像", ""]
+    if docrisk["error"]:
+        lines.append("- ⚠ 未取得字体画像：%s" % docrisk["error"])
+        return lines
+    lines += ["- 生产者: `%s`" % (docrisk["producer"] or "(空)"),
+              "- 生成器: `%s`" % (docrisk["creator"] or "(空)"),
+              "",
+              "> 便宜筛子口径：MuPDF 能读出结构 **不代表 pdfminer 读得下来**。",
+              "",
+              "| 页 | 字体数 | Type3 | 缺ToUnicode(复合) | 未嵌入 | 字体清单 |",
+              "|---|---|---|---|---|---|"]
+    for p in docrisk["pages"]:
+        if p["error"]:
+            lines.append("| %d | - | - | - | - | 读取失败: %s |"
+                         % (p["page"], p["error"].replace("|", "/")))
+            continue
+        lines.append("| {page} | {count} | {t3} | {noto} | {unemb} | {allf} |".format(
+            page=p["page"], count=p["count"],
+            t3=", ".join(p["type3"]).replace("|", "/") or "-",
+            noto=", ".join(p["noto"]).replace("|", "/") or "-",
+            unemb=len(p["unembedded"]) or "-",
+            allf=", ".join(p["fonts"]).replace("|", "/")[:200] or "-"))
+    return lines
+
+
+def build_batch_report(rows):
+    """
+    批量汇总报告：一张总表 + 每篇的完整体检结论（复用 build_report）。
+    用途：样本普查 —— 按"格式谱系 × 出版年代"抽一批 Zotero 里的 PDF 跑一遍，
+    先看风险分布，再挑红的去跑 tools/parse_smoke.py。
+    """
+    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    lines = ["# 翻译前体检 · 批量汇总", "",
+             "- 体检时间: %s" % now,
+             "- 篇数: %d" % len(rows),
+             "",
+             "| 文件 | 页数 | skip | 生产者 | Type3页 | 缺ToUnicode页 | 结论 |",
+             "|---|---|---|---|---|---|---|"]
+    counts = {"高": 0, "中": 0, "提示": 0, None: 0}
+    for res in rows:
+        base = os.path.basename(res["path"])[:44]
+        if res["error"]:
+            lines.append("| %s | - | - | - | - | - | 🔴 %s |"
+                         % (base, res["error"].replace("|", "/")))
+            counts["高"] += 1
+            continue
+        dr = res["docrisk"]
+        t3 = ",".join(str(p["page"]) for p in dr["pages"] if p["type3"]) or "-"
+        noto = ",".join(str(p["page"]) for p in dr["pages"] if p["noto"]) or "-"
+        lv = worst_level(res["findings"])
+        counts[lv] += 1
+        mark = {"高": "🔴", "中": "🟡", "提示": "🔵", None: "🟢"}[lv]
+        lines.append("| %s | %d | %d | %s | %s | %s | %s%s |" % (
+            base, res["total"], res["recommend_skip"],
+            (dr["producer"] or "-").replace("|", "/")[:28],
+            t3, noto, mark, lv or "无风险"))
+    lines += ["",
+              "**分布: 🔴高 %d 篇 · 🟡中 %d 篇 · 🔵提示 %d 篇 · 🟢无风险 %d 篇**"
+              % (counts["高"], counts["中"], counts["提示"], counts[None]),
+              "", "---", ""]
+    for res in rows:
+        if res["error"]:
+            continue
+        lines.append(build_report(res["path"], res["total"], res["pages"],
+                                  res["recommend_skip"], res["findings"],
+                                  res["encrypted"], res["docrisk"]))
+        lines += ["", "---", ""]
     return "\n".join(lines)
 
 
@@ -253,17 +482,11 @@ def find_latest_pdf():
     return max(cands, key=os.path.getmtime)
 
 
-def main():
-    ap = argparse.ArgumentParser(description="PDF 翻译前体检器（零 API 成本）")
-    ap.add_argument("pdf", nargs="?", default=None, help="PDF 路径，缺省取最新上传件")
-    ap.add_argument("--quiet", action="store_true", help="只写报告，不打印详情")
-    args = ap.parse_args()
-
-    pdf_path = args.pdf or find_latest_pdf()
-    if not pdf_path or not os.path.isfile(pdf_path):
-        print("❌ 未找到 PDF 文件", file=sys.stderr)
-        sys.exit(2)
-
+def check_one(pdf_path):
+    """
+    单篇体检（不写报告）。成功返回特征字典，失败返回 {'error': ...}。
+    加密预检见下方 [自研补丁] 注释。
+    """
     # [自研补丁 2026-09-03] 加密 PDF 定向提示: 旧代码先 len(pages) 再查
     # is_encrypted, 带用户口令的 PDF 在 len() 处直接抛 FileNotDecryptedError,
     # "加密预检"分支不可达且报错文案不明确
@@ -280,31 +503,87 @@ def main():
         total = len(reader.pages)
     except Exception as exc:
         if reader is not None and getattr(reader, "is_encrypted", False):
-            print("❌ PDF 已加密且需要打开口令, 请先去除密码"
-                  "(如 qpdf --decrypt in.pdf out.pdf)后再体检/翻译",
-                  file=sys.stderr)
-        else:
-            print(f"❌ PDF 无法解析: {exc}", file=sys.stderr)
-        sys.exit(2)
+            return {"path": pdf_path,
+                    "error": "PDF 已加密且需要打开口令, 请先去除密码"
+                             "(如 qpdf --decrypt in.pdf out.pdf)后再体检/翻译"}
+        return {"path": pdf_path, "error": "PDF 无法解析: %s" % exc}
 
     pages = [analyze_page(reader, i) for i in range(total)]
-    recommend_skip, findings = decide(pages, total)
+    docrisk = scan_fonts(pdf_path)
+    recommend_skip, findings = decide(pages, total, docrisk)
+    return {"path": pdf_path, "total": total, "encrypted": encrypted,
+            "pages": pages, "docrisk": docrisk,
+            "recommend_skip": recommend_skip, "findings": findings,
+            "error": None}
 
-    content = build_report(pdf_path, total, pages, recommend_skip,
-                           findings, encrypted)
+
+def worst_level(findings):
+    """结论里最高的级别（用于控制台记号与批量排序）"""
+    for lv in ("高", "中", "提示"):
+        if any(f[0] == lv for f in findings):
+            return lv
+    return None
+
+
+def print_summary(res):
+    """控制台摘要"""
+    name = os.path.basename(res["path"])
+    if res["error"]:
+        print("🔴 %s | %s" % (name, res["error"]))
+        return
+    mark = {"高": "🔴", "中": "🟡", "提示": "🔵"}.get(worst_level(res["findings"]), "🟢")
+    print("%s %s | %s 页%s | skipLastPages=%d" % (
+        mark, name, res["total"],
+        " | ⚠ 已加密" if res["encrypted"] else "", res["recommend_skip"]))
+    for level, loc, desc in res["findings"]:
+        m = {"高": "🔴", "中": "🟡", "提示": "🔵"}.get(level, "⚪")
+        print("     %s [%s] %s: %s" % (m, level, loc, desc))
+
+
+def main():
+    ap = argparse.ArgumentParser(description="PDF 翻译前体检器（零 API 成本）")
+    ap.add_argument("pdf", nargs="?", default=None, help="PDF 路径，缺省取最新上传件")
+    ap.add_argument("--dir", default=None, help="批量：目录（递归找 PDF），出一份汇总报告")
+    ap.add_argument("--limit", type=int, default=0, help="批量时最多几篇（0=不限）")
+    ap.add_argument("--quiet", action="store_true", help="只写报告，不打印详情")
+    args = ap.parse_args()
+
+    if args.dir:
+        from parse_smoke import list_pdfs          # 同目录，复用产物过滤规则
+        targets = list_pdfs(args.dir)
+        if args.limit:
+            targets = targets[:args.limit]
+        if not targets:
+            print("❌ 目录下没找到 PDF: %s" % args.dir, file=sys.stderr)
+            sys.exit(2)
+        rows = []
+        for p in targets:
+            res = check_one(p)
+            rows.append(res)
+            if not args.quiet:
+                print_summary(res)
+        content = build_batch_report(rows)
+        report_path = save_report(content, "batch%d" % len(rows))
+        print("📝 报告: %s" % report_path)
+        sys.exit(0)
+
+    pdf_path = args.pdf or find_latest_pdf()
+    if not pdf_path or not os.path.isfile(pdf_path):
+        print("❌ 未找到 PDF 文件", file=sys.stderr)
+        sys.exit(2)
+
+    res = check_one(pdf_path)
+    if res["error"]:
+        print("❌ %s" % res["error"], file=sys.stderr)
+        sys.exit(2)
+
+    content = build_report(res["path"], res["total"], res["pages"],
+                           res["recommend_skip"], res["findings"],
+                           res["encrypted"], res["docrisk"])
     report_path = save_report(content, pdf_path)
-
-    # 控制台摘要
-    print(f"📄 {os.path.basename(pdf_path)} | {total} 页"
-          + (" | ⚠ 已加密" if encrypted else ""))
-    print(f"🎯 推荐 skipLastPages: {recommend_skip}")
-    if findings:
-        for level, loc, desc in findings:
-            mark = {"高": "🔴", "中": "🟡", "提示": "🔵"}.get(level, "⚪")
-            print(f"{mark} [{level}] {loc}: {desc}")
-    else:
-        print("🟢 未发现高危因素，可直接提交翻译")
-    print(f"📝 报告: {report_path}")
+    if not args.quiet:
+        print_summary(res)
+    print("📝 报告: %s" % report_path)
     sys.exit(0)
 
 

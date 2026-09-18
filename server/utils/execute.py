@@ -13,6 +13,18 @@ from datetime import datetime
 TASK_TOTAL_TIMEOUT = float(os.environ.get("PDF2ZH_TASK_TOTAL_TIMEOUT", str(3 * 60 * 60)))
 TASK_IDLE_TIMEOUT = float(os.environ.get("PDF2ZH_TASK_IDLE_TIMEOUT", str(30 * 60)))
 
+# [自研补丁 2026-09-18] 无控制台部署下子进程进度输出的落点:
+# launch.ps1 用 -RedirectStandardError 把 stderr 写到这里, 而 tqdm 默认写 stderr。
+# 仓库根 = server/utils/execute.py 上溯三级。
+PROGRESS_LOG_ENV = "PDF2ZH_PROGRESS_LOG"
+PROGRESS_LOG_DEFAULT = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
+    "logs",
+    "server_err.log",
+)
+# 进度来源强制开关(回归测试用): console / log / 空=自动探测
+PROGRESS_SOURCE_ENV = "PDF2ZH_PROGRESS_SOURCE"
+
 
 class TaskTimeoutError(RuntimeError):
     """翻译子进程触发看门狗(总超时或空闲超时)。"""
@@ -422,11 +434,106 @@ def _execute_with_pty(final_cmd, final_env, task_id, cols, rows):
         raise
 
 
+def _match_progress_line(line):
+    """
+    从一行输出里取 (curr, total)，取不到返回 None。
+
+    [自研补丁 2026-09-18] 两个正则都要试。旧代码只试 MAIN_PROGRESS_RE
+    (要求出现 "translate" 字样)，而 pdf2zh 1.x 的页进度条是
+    `tqdm.tqdm(total=total_pages)` —— **不带 desc**，实测输出形如
+    ` 42%|███▏| 8/19 [00:02<00:03, 2.89it/s]`，压根没有 "translate"
+    这个词，所以旧代码在 pdf2zh 1.x 上永远匹配不上(进度恒为 0)。
+    PTY 那条路径(_parse_progress)本来就有 PDF2ZH_TQDM_RE 兜底，这里是补齐。
+    """
+    m = MAIN_PROGRESS_RE.search(line)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    m = PDF2ZH_TQDM_RE.search(line)
+    if m:
+        return int(m.group(1)), int(m.group(2))
+    return None
+
+
+def _open_progress_log():
+    """
+    [自研补丁 2026-09-18] 无控制台部署的进度来源。
+
+    launch.ps1 是 `-RedirectStandardOutput/Error + -WindowStyle Hidden` 启动服务的,
+    服务与子进程都**没有控制台**, 子进程 tqdm 继承的是**日志文件句柄**
+    (实测 logs/server_err.log 里躺着完整的 ` 42%|███| 8/19 [..]` 流)。
+    所以读屏幕缓冲永远读不到进度 —— 与闸门4 栽的是同一个坑。
+    从**当前文件末尾**开始跟读: 只认本次任务新写的行, 不会被上一次任务
+    留在日志里的旧 x/y 污染(否则会锁错 total)。
+    """
+    path = os.environ.get(PROGRESS_LOG_ENV) or PROGRESS_LOG_DEFAULT
+    try:
+        fp = open(path, "rb")
+        fp.seek(0, os.SEEK_END)
+    except OSError:
+        return None
+    return {"fp": fp, "buf": b"", "seq": 0}
+
+
+def _read_progress_log(state):
+    """
+    读出自上次以来新写入的完整行, 返回 (pairs, seq_end);
+    pairs 为 [(seq, line), ...], seq 全局单调递增。
+
+    tqdm 输出到**非 tty** 时仍用 '\\r' 原地刷新(实测), 所以 '\\r' 和 '\\n'
+    都当行分隔符 —— 不切 '\\r' 的话整个进度流是一条几十 KB 的巨行,
+    正则只能看到最后那次刷新。残段留到下次, 避免读到半行。
+    """
+    fp = state["fp"]
+    try:
+        chunk = fp.read()
+    except OSError:
+        return [], state["seq"]
+    if not chunk:
+        return [], state["seq"]
+
+    data = state["buf"] + chunk
+    idx = max(data.rfind(b"\n"), data.rfind(b"\r"))
+    if idx < 0:
+        # 一直没有分隔符: 只留尾部, 防止无换行输出把缓冲撑爆
+        state["buf"] = data[-65536:]
+        return [], state["seq"]
+    head, state["buf"] = data[:idx], data[idx + 1:]
+
+    pairs = []
+    seq = state["seq"]
+    for raw in head.split(b"\r"):
+        for piece in raw.split(b"\n"):
+            if not piece:
+                continue
+            seq += 1
+            pairs.append((seq, piece.decode("utf-8", "replace")))
+    state["seq"] = seq
+    return pairs, seq
+
+
+def _sole_translation(task_id):
+    """[自研补丁 2026-09-18] 本任务是否独占输出流(没有别的翻译在跑)。
+
+    logs/server_err.log 是全服务共享的: 服务自身与**所有**子进程都往同一个
+    文件写, 另一个并发翻译的 tqdm 会原样落在里面。页数相同时 locked_total
+    也挡不住, 所以只在独占时才敢把日志当进度源。
+    取不到任务表就返回 False(不独占) —— 宁可不出进度, 也不能把别人的
+    进度显示成自己的。
+    """
+    try:
+        return not task_manager.has_other_running(task_id)
+    except Exception:
+        return False
+
+
 def _monitor_windows_console_translate_progress(task_id, stop_event, activity=None):
     """
-    Windows-only monitor:
-    Read console buffer and parse only "translate ... x/y".
-    This keeps native progress bars untouched while enabling SSE updates.
+    Windows-only monitor: 解析 "translate ... x/y" 或 pdf2zh 1.x 的 tqdm 页进度条,
+    让 SSE 能更新任务卡片, 同时不动终端里原生的多进度条 UI。
+
+    两条来源, 按部署形态自动选:
+      ① 控制台屏幕缓冲 —— 前台(有窗口)启动时用;
+      ② 日志文件尾部   —— launch.ps1 无控制台部署时用(见 _open_progress_log)。
 
     [自研补丁] activity: 可选的 [最后活动时间戳, 是否曾解析到进度] 列表,
     供空闲看门狗判断子进程是否真的在推进。
@@ -491,98 +598,175 @@ def _monitor_windows_console_translate_progress(task_id, stop_event, activity=No
         return
 
     handle = get_std_handle(STD_OUTPUT_HANDLE)
-    if handle in (None, 0, INVALID_HANDLE_VALUE):
-        # _debug_progress_log("MONITOR_HANDLE_INVALID", task_id=task_id)
-        return
+    # [自研补丁 2026-09-18] 句柄"有效"不等于"是控制台": stdout 被重定向到文件时
+    # GetStdHandle 返回的是**文件句柄**, 旧代码会把它当控制台用, 然后
+    # GetConsoleScreenBufferInfo 失败 → break → 监视器静默退出(进度恒 0,
+    # 且 activity[1] 永远 False 连带废掉空闲看门狗)。这里实探一次。
+    console_usable = False
+    if handle not in (None, 0, INVALID_HANDLE_VALUE):
+        try:
+            probe = CONSOLE_SCREEN_BUFFER_INFO()
+            console_usable = bool(get_csbi(handle, ctypes.byref(probe)))
+        except Exception:
+            console_usable = False
 
-    # _debug_progress_log("MONITOR_STARTED", task_id=task_id)
+    forced_source = (os.environ.get(PROGRESS_SOURCE_ENV) or "").strip().lower()
+    if forced_source == "log":
+        console_usable = False
+    elif forced_source == "console" and handle not in (None, 0, INVALID_HANDLE_VALUE):
+        console_usable = True
+
+    log_state = None
+    if console_usable:
+        source_mode = "console"
+    else:
+        source_mode = "log"
+        # [自研补丁 2026-09-18] 日志是全服务共享的, 只在独占时才敢当进度源:
+        # 有并发翻译时退化为"无实时进度"(与无控制台环境的旧行为一致, 不影响翻译)。
+        if not _sole_translation(task_id):
+            # _debug_progress_log("MONITOR_LOG_NOT_SOLE", task_id=task_id)
+            return
+        log_state = _open_progress_log()
+        if log_state is None:
+            # 既没有控制台也读不到日志(非 launch.ps1 形态): 保持旧行为——静默返回,
+            # 只是没有实时进度, 不影响翻译本身。
+            # _debug_progress_log("MONITOR_NO_SOURCE", task_id=task_id)
+            return
+
+    # _debug_progress_log("MONITOR_STARTED", task_id=task_id, source=source_mode)
 
     locked_total = None
     last_curr = None
-    last_row = None
+    last_pos = None
     last_step = None
     idle_ticks = 0
     last_error = ""
 
     while not stop_event.is_set():
         try:
-            csbi = CONSOLE_SCREEN_BUFFER_INFO()
-            if not get_csbi(handle, ctypes.byref(csbi)):
-                # _debug_progress_log("MONITOR_CSBI_FAIL", task_id=task_id)
-                break
-
-            width = max(int(csbi.dwSize.X), 1)
-            buffer_rows = max(int(csbi.dwSize.Y), 1)
-            cursor_y = int(csbi.dwCursorPosition.Y)
-
-            start_row = max(0, cursor_y - WINDOWS_CONSOLE_SCAN_ROWS)
-            end_row = min(buffer_rows - 1, cursor_y + 2)
-            if end_row < start_row:
-                start_row, end_row = 0, min(buffer_rows - 1, WINDOWS_CONSOLE_SCAN_ROWS)
-
             pair_candidates = []
             latest_step = None
-            latest_step_row = -1
+            latest_step_pos = -1
+            # 候选位置: 控制台用行号, 日志用递增 seq, 一律"越大越新"
+            cursor_pos = 0
             translate_line_sample = None
 
-            for row in range(start_row, end_row + 1):
-                buf = ctypes.create_unicode_buffer(width)
-                chars_read = wintypes.DWORD(0)
-                ok = read_console(
-                    handle,
-                    buf,
-                    width,
-                    COORD(0, row),
-                    ctypes.byref(chars_read),
-                )
-                if not ok or chars_read.value <= 0:
+            if console_usable:
+                csbi = CONSOLE_SCREEN_BUFFER_INFO()
+                if not get_csbi(handle, ctypes.byref(csbi)):
+                    # _debug_progress_log("MONITOR_CSBI_FAIL", task_id=task_id)
+                    break
+
+                width = max(int(csbi.dwSize.X), 1)
+                buffer_rows = max(int(csbi.dwSize.Y), 1)
+                cursor_y = int(csbi.dwCursorPosition.Y)
+                cursor_pos = cursor_y
+
+                start_row = max(0, cursor_y - WINDOWS_CONSOLE_SCAN_ROWS)
+                end_row = min(buffer_rows - 1, cursor_y + 2)
+                if end_row < start_row:
+                    start_row, end_row = 0, min(buffer_rows - 1, WINDOWS_CONSOLE_SCAN_ROWS)
+
+                for row in range(start_row, end_row + 1):
+                    buf = ctypes.create_unicode_buffer(width)
+                    chars_read = wintypes.DWORD(0)
+                    ok = read_console(
+                        handle,
+                        buf,
+                        width,
+                        COORD(0, row),
+                        ctypes.byref(chars_read),
+                    )
+                    if not ok or chars_read.value <= 0:
+                        continue
+
+                    line = buf.value[: chars_read.value].strip()
+                    if not line:
+                        continue
+
+                    if translate_line_sample is None and "translate" in line.lower():
+                        translate_line_sample = line[:220]
+
+                    step_m = STEP_PROGRESS_RE.search(line)
+                    if step_m and row >= latest_step_pos:
+                        latest_step = step_m.group(1).strip()
+                        latest_step_pos = row
+
+                    matched = _match_progress_line(line)
+                    if not matched:
+                        continue
+
+                    curr, total = matched
+                    if total <= 0:
+                        continue
+                    if locked_total is not None and total != locked_total:
+                        continue
+
+                    pair_candidates.append((row, curr, total))
+            else:
+                # [自研补丁 2026-09-18] 无控制台部署: 从日志尾部跟读。
+                # 行按写入先后返回, 位置用递增 seq 表示(越大越新)。
+                pairs, _seq_end = _read_progress_log(log_state)
+                if not pairs:
+                    stop_event.wait(WINDOWS_MONITOR_INTERVAL)
+                    continue
+                cursor_pos = pairs[-1][0]
+
+                # 期间另起了翻译 -> 本批日志里可能混着它的 tqdm。只推进读取位置
+                # (_read_progress_log 已把新内容消费掉), 不回报; 等重新独占再继续。
+                if not _sole_translation(task_id):
+                    stop_event.wait(WINDOWS_MONITOR_INTERVAL)
                     continue
 
-                line = buf.value[: chars_read.value].strip()
-                if not line:
-                    continue
+                for seq, raw_line in pairs:
+                    line = ANSI_ESCAPE.sub("", raw_line).strip()
+                    if not line:
+                        continue
 
-                if translate_line_sample is None and "translate" in line.lower():
-                    translate_line_sample = line[:220]
+                    step_m = STEP_PROGRESS_RE.search(line)
+                    if step_m:
+                        latest_step = step_m.group(1).strip()
+                        latest_step_pos = seq
 
-                step_m = STEP_PROGRESS_RE.search(line)
-                if step_m and row >= latest_step_row:
-                    latest_step = step_m.group(1).strip()
-                    latest_step_row = row
+                    matched = _match_progress_line(line)
+                    if not matched:
+                        continue
 
-                m = MAIN_PROGRESS_RE.search(line)
-                if not m:
-                    continue
+                    curr, total = matched
+                    if total <= 0:
+                        continue
+                    if locked_total is not None and total != locked_total:
+                        continue
 
-                curr, total = int(m.group(1)), int(m.group(2))
-                if total <= 0:
-                    continue
-                if locked_total is not None and total != locked_total:
-                    continue
-
-                pair_candidates.append((row, curr, total))
+                    pair_candidates.append((seq, curr, total))
 
             if pair_candidates:
                 idle_ticks = 0
                 if locked_total is None:
                     max_total = max(c[2] for c in pair_candidates)
                     pair_candidates = [c for c in pair_candidates if c[2] == max_total]
-                    pair_candidates.sort(key=lambda c: (abs(c[0] - cursor_y), -c[0], -c[1]))
-                    row, curr, total = pair_candidates[0]
-                    locked_total = total
-                    # _debug_progress_log("LOCK_TOTAL", task_id=task_id, row=row, total=total)
-                else:
+                    locked_total = max_total
+                    if console_usable:
+                        # 首次锁 total: 挑离光标最近的候选
+                        pair_candidates.sort(key=lambda c: (abs(c[0] - cursor_pos), -c[0], -c[1]))
+                    else:
+                        pair_candidates.sort(key=lambda c: c[0])
+                elif console_usable:
                     def _rank(candidate):
-                        row = candidate[0]
-                        dist_prev = abs(row - last_row) if last_row is not None else abs(row - cursor_y)
-                        dist_cursor = abs(row - cursor_y)
-                        return (dist_prev, dist_cursor, -row)
+                        pos = candidate[0]
+                        dist_prev = abs(pos - last_pos) if last_pos is not None else abs(pos - cursor_pos)
+                        return (dist_prev, abs(pos - cursor_pos), -pos)
 
                     pair_candidates.sort(key=_rank)
-                    row, curr, total = pair_candidates[0]
+                else:
+                    # 日志模式: 同一批里最新的一行就是当前真实进度
+                    pair_candidates.sort(key=lambda c: c[0])
+
+                pick = pair_candidates[0] if console_usable else pair_candidates[-1]
+                pos, curr, total = pick
 
                 if last_curr is None or curr >= last_curr:
-                    last_row = row
+                    last_pos = pos
                     if last_curr is None or curr != last_curr:
                         last_curr = curr
                         # Keep 100% for final completion update only.
@@ -599,7 +783,7 @@ def _monitor_windows_console_translate_progress(task_id, stop_event, activity=No
                         # _debug_progress_log(
                         #     "PARSE_PROGRESS",
                         #     task_id=task_id,
-                        #     row=row,
+                        #     row=pos,
                         #     curr=curr,
                         #     total=total,
                         #     pct=pct,
@@ -611,9 +795,7 @@ def _monitor_windows_console_translate_progress(task_id, stop_event, activity=No
                     pass  # _debug_progress_log(
                     #     "PARSE_IDLE",
                     #     task_id=task_id,
-                    #     cursor=cursor_y,
-                    #     start=start_row,
-                    #     end=end_row,
+                    #     cursor=cursor_pos,
                     #     locked_total=locked_total,
                     #     sample=translate_line_sample,
                     # )

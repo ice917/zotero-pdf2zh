@@ -134,6 +134,23 @@ class TaskManager:
             history = list(self.progress_history)
         return copy.deepcopy(history)
 
+    def has_other_running(self, task_id):
+        """[自研补丁 2026-09-18] 除 task_id 外, 还有没有没结束的任务。
+
+        控制台屏幕缓冲与 logs/server_err.log 都是"只读一份、多方在写"的共享
+        输出流: 只有本任务独占时, 才敢把输出流当作它的进度/失败来源, 否则会把
+        另一个并发翻译的 tqdm 或 traceback 读成本任务的。
+        """
+        with self.lock:
+            items = list(self.active_tasks.items())
+        for tid, task in items:
+            if tid == task_id:
+                continue
+            if task.get("finished") or task.get("active") is False:
+                continue
+            return True
+        return False
+
     def _delayed_remove(self, task_id):
         time.sleep(30)
         with self.lock:

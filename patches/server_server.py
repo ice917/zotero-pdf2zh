@@ -39,6 +39,280 @@ from utils.execute import execute_with_progress
 
 _VALUE_ERROR_RE = re.compile(r'(?m)^ValueError:\s*(?P<msg>.+)$')
 
+# ================================================================================
+# [自研补丁 2026-09-18 闸门4] 任务失败根因提取
+#
+# 问题（v26.19 实测）：Windows 上 execute_with_progress 走 _execute_with_inherit,
+# 子进程 stdout/stderr **直接继承控制台**（为了保留 tqdm 原生多进度条 UI），
+# 于是 pdf2zh 的 traceback 只落在屏幕上、没有任何一处被捕获。server 侧最后
+# 只剩 CalledProcessError 的
+#   "Command '[...]' returned non-zero exit status 1."
+# —— 任务记录(/api/history)与 HTTP 响应里就是这么一句没有信息量的话，
+# 想找真正的 AttributeError 得人工往上翻终端。
+#
+# 处置：失败那一刻，把控制台屏幕缓冲区的尾部读回来，抽出**最后一个** Traceback
+# 的『异常类: 消息 @ 文件:行 (函数名)』，写进任务记录与响应。
+# 读不到控制台（服务无控制台/输出被重定向）就静默降级——绝不因为诊断失败
+# 而改变失败本身的语义。
+# ================================================================================
+
+_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[ -/]*[@-~]')
+# tqdm/rich 进度条碎片：对诊断无贡献，且会把 traceback 行切碎
+_PROGRESS_NOISE_RE = re.compile(r'(\d{1,3}%\|)|(\[\d+:\d+<)|(it/s\])|(s/it\])|(\?{3}%)')
+_TRACEBACK_HEAD_RE = re.compile(r'^\s*Traceback \(most recent call last\)')
+_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+), in (\S+)')
+
+
+def _clean_console_text(text):
+    """去掉 ANSI 转义 / 回车残留 / tqdm 进度碎片，留下可读行"""
+    if not text:
+        return ''
+    text = _ANSI_RE.sub('', text)
+    out = []
+    for raw in text.replace('\r', '\n').split('\n'):
+        ln = raw.rstrip()
+        if not ln.strip() or _PROGRESS_NOISE_RE.search(ln):
+            continue
+        out.append(ln)
+    return '\n'.join(out)
+
+
+def extract_root_cause(text):
+    """
+    从（可能混着进度条的）文本里抽**最后一个** Traceback 的根因。
+    返回 '异常类: 消息 @ 文件:行 (函数名)'；抽不到返回 None。
+    取最后一个：一次失败可能在屏幕上留下多段 traceback（重试等），最后那段
+    才是本次的。frame 取最深一层，与 tools/parse_smoke.py 的口径一致。
+    """
+    lines = _clean_console_text(text).split('\n')
+    head = None
+    for i, ln in enumerate(lines):
+        if _TRACEBACK_HEAD_RE.match(ln):
+            head = i
+    if head is None:
+        return None
+    frames, exc_line = [], None
+    for ln in lines[head + 1:]:
+        m = _FRAME_RE.search(ln)
+        if m:
+            frames.append((os.path.basename(m.group(1)), int(m.group(2)), m.group(3)))
+            continue
+        if ln[:1] not in (' ', '\t'):
+            exc_line = ln.strip()      # 顶格的最后一行 = "异常类: 消息"
+    if not exc_line:
+        return None
+    where = ''
+    if frames:
+        f, n, fn = frames[-1]
+        where = ' @ %s:%d (%s)' % (f, n, fn)
+    return exc_line + where
+
+
+def console_tail(max_lines=400):
+    """
+    Windows：一次性读回控制台屏幕缓冲区尾部文本；不可用返回 ''。
+    没有控制台（服务以无控制台方式跑）或句柄不是控制台（输出被重定向到文件）
+    时，ReadConsoleOutputCharacterW 会失败，这里静默返回 ''。
+    """
+    if sys.platform != 'win32':
+        return ''
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return ''
+
+    class COORD(ctypes.Structure):
+        _fields_ = [('X', wintypes.SHORT), ('Y', wintypes.SHORT)]
+
+    class SMALL_RECT(ctypes.Structure):
+        _fields_ = [('Left', wintypes.SHORT), ('Top', wintypes.SHORT),
+                    ('Right', wintypes.SHORT), ('Bottom', wintypes.SHORT)]
+
+    class CONSOLE_SCREEN_BUFFER_INFO(ctypes.Structure):
+        _fields_ = [('dwSize', COORD), ('dwCursorPosition', COORD),
+                    ('wAttributes', wintypes.WORD), ('srWindow', SMALL_RECT),
+                    ('dwMaximumWindowSize', COORD)]
+
+    STD_OUTPUT_HANDLE = -11
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+    try:
+        kernel32 = ctypes.windll.kernel32
+        get_std_handle = kernel32.GetStdHandle
+        get_std_handle.argtypes = [wintypes.DWORD]
+        get_std_handle.restype = wintypes.HANDLE   # 不设会把 64 位句柄截断
+        get_csbi = kernel32.GetConsoleScreenBufferInfo
+        get_csbi.restype = wintypes.BOOL
+        read_out = kernel32.ReadConsoleOutputCharacterW
+        read_out.argtypes = [wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD,
+                             COORD, ctypes.POINTER(wintypes.DWORD)]
+        read_out.restype = wintypes.BOOL
+
+        handle = get_std_handle(STD_OUTPUT_HANDLE)
+        if handle in (None, 0, INVALID_HANDLE_VALUE):
+            return ''
+        csbi = CONSOLE_SCREEN_BUFFER_INFO()
+        if not get_csbi(handle, ctypes.byref(csbi)):
+            return ''
+        width = max(int(csbi.dwSize.X), 1)
+        cursor_y = int(csbi.dwCursorPosition.Y)
+        start = max(0, cursor_y - int(max_lines) + 1)
+        rows = []
+        for row in range(start, cursor_y + 1):
+            buf = ctypes.create_unicode_buffer(width)
+            got = wintypes.DWORD(0)
+            if read_out(handle, buf, width, COORD(0, row), ctypes.byref(got)) and got.value > 0:
+                rows.append(buf.value[:got.value])
+        return '\n'.join(rows)
+    except Exception:
+        return ''
+
+
+# 失败输出流日志来源: launch.ps1 的 -RedirectStandardOutput/Error 落点。
+# 仓库根 = server.py 所在目录的上一级。
+_FAILURE_LOG_ENV = 'PDF2ZH_FAILURE_LOG'          # 覆盖/追加用的测试钩子
+_FAILURE_LOG_NAMES = ('server_err.log', 'server_out.log')
+_FAILURE_LOG_TAIL_BYTES = 256 * 1024             # 只读尾部，别把整个日志读进来
+_FAILURE_LOG_FRESH_SECONDS = 120                 # 超过这个岁数的日志不认（防张冠李戴）
+# [自研补丁 2026-09-18] 任务开始时刻各日志文件的字节数。失败时只认锚点之后新增的
+# 内容，否则会把"上一次失败"留在日志里的 traceback 张冠李戴成本次根因。
+_FAILURE_LOG_ANCHORS = {}
+_FAILURE_LOG_ANCHOR_LOCK = threading.Lock()
+_FAILURE_LOG_ANCHOR_KEEP = 32
+
+
+def _failure_log_paths():
+    base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    paths = []
+    override = (os.environ.get(_FAILURE_LOG_ENV) or '').strip()
+    if override:
+        paths.append(override)
+    paths.extend(os.path.join(base, 'logs', name) for name in _FAILURE_LOG_NAMES)
+    return paths
+
+
+def _log_offsets():
+    """各日志文件当前的字节数（还不存在的记 None）。"""
+    offsets = {}
+    for path in _failure_log_paths():
+        try:
+            offsets[path] = os.path.getsize(path)
+        except OSError:
+            offsets[path] = None
+    return offsets
+
+
+def anchor_failure_logs(task_id):
+    """
+    [自研补丁 2026-09-18 闸门4] 任务开始时刻锚定日志偏移，见 _FAILURE_LOG_ANCHORS。
+    只在任务登记处调用一次即可（所有路由都经过那里）。
+    """
+    if task_id is None:
+        return
+    try:
+        with _FAILURE_LOG_ANCHOR_LOCK:
+            _FAILURE_LOG_ANCHORS[task_id] = _log_offsets()
+            while len(_FAILURE_LOG_ANCHORS) > _FAILURE_LOG_ANCHOR_KEEP:
+                _FAILURE_LOG_ANCHORS.pop(next(iter(_FAILURE_LOG_ANCHORS)))
+    except Exception:
+        pass
+
+
+def _sole_task(task_id):
+    """
+    [自研补丁 2026-09-18] 本任务是否独占输出流（没有别的翻译在跑）。
+    logs/*.log 是全服务共享的：服务自身与**所有**子进程都往同一个文件写，
+    并发翻译时另一个任务的 traceback 会落在本任务的锚点窗口里。
+    取不到任务表就返回 False（不独占）——宁可不给根因，也不给错的根因。
+    """
+    try:
+        return not task_manager.has_other_running(task_id)
+    except Exception:
+        return False
+
+
+def _tail_file(path, max_bytes=_FAILURE_LOG_TAIL_BYTES, start=None):
+    """
+    start 给定时只读该字节偏移之后的新增内容（锚点语义）：没有新增就返回 ''，
+    避免把锚点之前的旧 traceback 当成本次根因。
+    """
+    try:
+        size = os.path.getsize(path)
+        begin = 0
+        if start is not None:
+            if size <= start:
+                return ''
+            begin = start
+        with open(path, 'rb') as fp:
+            if size - begin > max_bytes:
+                begin = size - max_bytes
+            fp.seek(begin)
+            return fp.read().decode('utf-8', errors='replace')
+    except Exception:
+        return ''
+
+
+def failure_output_tail(task_id=None):
+    """
+    [自研补丁 2026-09-18 闸门4] 失败时刻"子进程输出流的尾部"。
+    两条来源, 按部署形态自动选:
+      ① 控制台屏幕缓冲 —— 前台启动(有窗口)时用, 见 console_tail();
+      ② 日志文件尾部 —— launch.ps1 是 `-RedirectStandardOutput/Error + -WindowStyle Hidden`
+         启动的, 服务与子进程都**没有控制台**, 子进程 stdout/stderr 继承的正是这两个
+         日志句柄(实测: tqdm 进度条原样落在 logs/server_err.log 里)。
+         服务跑在无控制台的部署里, ①必然为空, 这时只有②能拿到 traceback。
+
+    宁可没有根因, 也不要错的根因, 所以②有三道闸:
+      1) 独占闸 —— 还有别的翻译在跑时直接弃用(共享日志里混着它的输出);
+      2) 锚点闸 —— 只认本任务开始之后新增的内容(挡住上一次失败的 traceback);
+      3) 新鲜度闸 —— 超过 FRESH_SECONDS 没写过的日志不认(没有锚点时兜底)。
+    """
+    screen = console_tail()
+    if screen.strip():
+        return screen
+
+    if not _sole_task(task_id):
+        return ''
+
+    anchor = None
+    if task_id is not None:
+        with _FAILURE_LOG_ANCHOR_LOCK:
+            anchor = _FAILURE_LOG_ANCHORS.get(task_id)
+
+    now = time.time()
+    chunks = []
+    for path in _failure_log_paths():
+        try:
+            if not os.path.isfile(path):
+                continue
+            if now - os.path.getmtime(path) > _FAILURE_LOG_FRESH_SECONDS:
+                continue
+            chunks.append(_tail_file(path, start=(anchor or {}).get(path)))
+        except Exception:
+            continue
+    return '\n'.join(c for c in chunks if c)
+
+
+def failure_brief(exc, task_id=None):
+    """
+    喂给任务记录(error=...)与 HTTP 响应的一句话根因。
+    优先级：异常自带的子进程 stderr → 子进程输出流尾部 → 异常自身字符串。
+    """
+    txt = str(exc).strip().replace('\n', ' ')
+    if isinstance(exc, subprocess.CalledProcessError):
+        blob = (getattr(exc, 'stderr', None) or '') or failure_output_tail(task_id)
+        root = extract_root_cause(blob)
+        if root:
+            return root
+    elif not txt or len(txt) < 12 or '请查看' in txt:
+        # 只有异常本身没什么信息量时才去翻输出流，避免把上一轮失败的
+        # traceback 张冠李戴到本次（如明确的 ValueError 提示已足够）
+        root = extract_root_cause(failure_output_tail(task_id))
+        if root:
+            return root
+    return txt[:300] or exc.__class__.__name__
+
+
 # [自研补丁 2026-09-03] 自动质检并发上限: 每个翻译任务收尾都会起后台 QC 线程,
 # 不加限制时批量提交会瞬时起多个 pypdf 进程抢内存
 _QC_SEMAPHORE = threading.Semaphore(2)
@@ -404,13 +678,17 @@ class PDFTranslator:
         # 新插件：POST 立刻 accepted，翻完后按 taskId 取结果，避免 Windows 长连接被掐。
         # 旧插件：阻塞到完成，再返回 {status: success, fileList, ...}。
         task_manager.add_task(task_id, task_info)
+        # [自研补丁 2026-09-18 闸门4] 锚定失败日志偏移：本次任务的 traceback 只会
+        # 出现在这个位置之后，失败时据此排除"上一次失败"留在日志里的旧 traceback。
+        anchor_failure_logs(task_id)
         if self._client_wants_async_job():
             def run():
                 try:
                     worker()
                 except Exception as exc:
-                    task_manager.complete_task(task_id, 'failed', str(exc), error=str(exc))
-                    self._exception_payload(exc, context=context)
+                    task_manager.complete_task(
+                        task_id, 'failed', str(exc), error=failure_brief(exc, task_id=task_id))
+                    self._exception_payload(exc, context=context, task_id=task_id)
 
             threading.Thread(target=run, daemon=True).start()
             return jsonify({'status': 'accepted', 'taskId': task_id}), 200
@@ -427,8 +705,9 @@ class PDFTranslator:
                 }), 500
             return jsonify(payload), 200
         except Exception as exc:
-            task_manager.complete_task(task_id, 'failed', str(exc), error=str(exc))
-            return self._handle_exception(exc, context=context)
+            task_manager.complete_task(
+                task_id, 'failed', str(exc), error=failure_brief(exc, task_id=task_id))
+            return self._handle_exception(exc, context=context, task_id=task_id)
 
     def _complete_job_files(self, task_id, paths, message):
         payload = self._success_files_payload(paths)
@@ -688,8 +967,8 @@ class PDFTranslator:
             )
         except Exception as e:
             self._release_inflight(inflight_name, task_id)
-            task_manager.complete_task(task_id, 'failed', str(e), error=str(e))
-            return self._handle_exception(e, context='/translate')
+            task_manager.complete_task(task_id, 'failed', str(e), error=failure_brief(e, task_id=task_id))
+            return self._handle_exception(e, context='/translate', task_id=task_id)
 
     def _execute_translate_job(self, task_id, input_path, config, engine):
         def addFileList(fileList, filePath):
@@ -901,16 +1180,20 @@ class PDFTranslator:
             except Exception as exc:
                 print(f"⚠️ [自动质检] {script} 执行异常: {exc}")
 
-    def _handle_exception(self, exc, status_code=500, context=None):
-        return jsonify(self._exception_payload(exc, context=context)), status_code
+    def _handle_exception(self, exc, status_code=500, context=None, task_id=None):
+        return jsonify(self._exception_payload(exc, context=context, task_id=task_id)), status_code
 
-    def _exception_payload(self, exc, context=None):
+    def _exception_payload(self, exc, context=None, task_id=None):
+        # [自研补丁 2026-09-18 闸门4] 先取根因，再打印。
+        # 顺序不能颠倒：traceback.print_exception 会把 server 自己的
+        # CalledProcessError 栈写进控制台，而闸门4 正是从控制台尾部取
+        # "最后一个 Traceback"——颠倒过来就只会抽到我们自己那句没营养的话。
+        info = self._derive_error_info(exc, task_id=task_id)
         if context:
             print(f"⚠️ [Zotero PDF2zh Server] {context} Error: {exc}")
         else:
             print(f"⚠️ [Zotero PDF2zh Server] Error: {exc}")
         traceback.print_exception(type(exc), exc, exc.__traceback__)
-        info = self._derive_error_info(exc)
         payload = {
             'status': 'error',
             'ok': False,
@@ -923,7 +1206,7 @@ class PDFTranslator:
             payload['exitCode'] = exc.returncode
         return payload
 
-    def _derive_error_info(self, exc):
+    def _derive_error_info(self, exc, task_id=None):
         parts = []
         if isinstance(exc, subprocess.CalledProcessError) and getattr(exc, 'stderr', None):
             parts.append(exc.stderr)
@@ -931,12 +1214,32 @@ class PDFTranslator:
         if formatted:
             parts.append(formatted)
         blob = '\n'.join(part for part in parts if part)
+        # [自研补丁 2026-09-18 闸门4] Windows 继承输出流模式拿不到子进程 stderr，
+        # 这里补上"输出流尾部"（有控制台读屏幕；launch.ps1 无控制台的部署读日志尾部），
+        # 否则 CalledProcessError 的 blob 里只有一句
+        # "returned non-zero exit status 1"，根因完全丢失
+        if isinstance(exc, subprocess.CalledProcessError) and not (exc.stderr or '').strip():
+            stream = failure_output_tail(task_id)
+            if stream:
+                blob = '\n'.join(p for p in (blob, stream) if p)
 
         ve_msg = self._extract_value_error(blob)
         if ve_msg:
             return {
                 'errorType': 'ValueError',
                 'message': ve_msg,
+            }
+
+        # [自研补丁 闸门4] 子进程自己的 traceback 比"最后一行可读文本"信息量大得多：
+        # 它带异常类 + 崩在哪个文件哪一行哪一函数
+        root = extract_root_cause(blob)
+        if root:
+            error_type = root.split(':', 1)[0].strip()   # 'AttributeError: ...' → 'AttributeError'
+            if not error_type or ' ' in error_type:
+                error_type = exc.__class__.__name__
+            return {
+                'errorType': error_type,
+                'message': root,
             }
 
         def _tail_readable(text):
@@ -1049,8 +1352,8 @@ class PDFTranslator:
                 '/crop-compare',
             )
         except Exception as e:
-            task_manager.complete_task(task_id, 'failed', str(e), error=str(e))
-            return self._handle_exception(e, context='/crop-compare')
+            task_manager.complete_task(task_id, 'failed', str(e), error=failure_brief(e, task_id=task_id))
+            return self._handle_exception(e, context='/crop-compare', task_id=task_id)
 
     def _execute_crop_compare_job(self, task_id, input_path, config, engine, infile_type):
         if infile_type == 'origin':
@@ -1126,8 +1429,8 @@ class PDFTranslator:
                 '/compare',
             )
         except Exception as e:
-            task_manager.complete_task(task_id, 'failed', str(e), error=str(e))
-            return self._handle_exception(e, context='/compare')
+            task_manager.complete_task(task_id, 'failed', str(e), error=failure_brief(e, task_id=task_id))
+            return self._handle_exception(e, context='/compare', task_id=task_id)
 
     def _execute_compare_job(self, task_id, input_path, config, engine, infile_type):
         if infile_type == 'origin':

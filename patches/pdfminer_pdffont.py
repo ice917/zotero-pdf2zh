@@ -971,6 +971,98 @@ class PDFFont:
         return bbox
 
 
+# [自研补丁 2026-09-18 闸门3] 字体构造失败的"降级替身" + 台账
+#
+# 背景：PDFResourceManager.get_font 原先没有任何兜底，任何字体在**构造期**抛
+# 异常都会一路冒到顶层 —— 单个坏字体就能让整篇 PDF 解析失败。v26.19 的 Type3
+# 崩溃就是这样：pdf2zh 退出码 1，译文/侧车/缓存一个都不写，整篇白翻。
+# 上游源码里那句 `font = PDFType1Font(self, spec)  # this is so wrong!` 说明
+# 它自己的哲学也是"宁可降级也不崩"，只是没覆盖到字体构造本身。
+#
+# 处置：构造失败就地降级为哑字体 —— 不吐任何字符（to_unichr 抛既有的
+# PDFUnicodeNotDefined，等于"这字体没有可用字符映射"，下游处理路径早已稳），
+# 宽度按 default_width 推进以保住版面坐标，页面其余部分照常翻译。
+#
+# **必须留痕**：降级是静默的质量损失，台账 + warning 是它唯一能被发现的方式。
+# 台账: server/translated/review/字体降级台账.jsonl
+#       （环境变量 PDF2ZH_FONT_LEDGER 可覆盖，供测试隔离）
+
+
+def _font_ledger_path():
+    import os
+    return (os.environ.get("PDF2ZH_FONT_LEDGER")
+            or r"D:\zotero-pdf2zh\server\translated\review\字体降级台账.jsonl")
+
+
+def _last_frame(exc):
+    """最深一层调用栈的『文件:行 (函数名)』——诊断要这个，不是最外层"""
+    import os
+    import traceback
+    tb = traceback.extract_tb(exc.__traceback__)
+    if not tb:
+        return ""
+    f = tb[-1]
+    return "%s:%d (%s)" % (os.path.basename(f.filename), f.lineno, f.name)
+
+
+def record_font_fallback(objid, spec, exc):
+    """
+    字体降级留痕：追加一行 JSONL，返回该条记录（调用方据此打 warning）。
+    写盘失败一律吞掉 —— 诊断信息的丢失绝不能反过来把翻译搞崩。
+    doc 取自 sys.argv 里的 .pdf（产线是把 PDF 路径当参数传给 pdf2zh 的），
+    这样不必给 get_font 增加"当前处理哪个文件"的上下文。
+    """
+    import datetime
+    import json
+    import os
+    import sys
+    try:
+        subtype = spec.get("Subtype")
+        subtype = str(getattr(subtype, "name", subtype))
+    except Exception:
+        subtype = "?"
+    doc = ""
+    for a in sys.argv:
+        if str(a).lower().endswith(".pdf"):
+            doc = os.path.basename(str(a))
+    rec = {"ts": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+           "doc": doc,
+           "objid": objid,
+           "subtype": subtype,
+           "basefont": str(spec.get("BaseFont", ""))[:80],
+           "err": "%s: %s" % (type(exc).__name__, str(exc)[:200]),
+           "where": _last_frame(exc)}
+    try:
+        path = _font_ledger_path()
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    return rec
+
+
+class PDFNullFont(PDFFont):
+    """
+    [自研补丁 2026-09-18 闸门3] 构造失败的字体替身。
+
+    to_unichr 抛 PDFUnicodeNotDefined 是**刻意**的：这正是"字体没有可用字符
+    映射"的既有标准路径（缺 ToUnicode 的字体天天走它），解释器与转换器对它的
+    处理已经是稳的，不需要下游改一行。宽度取 default_width=1000（即 1.0 文本
+    单位，约一个全角字），避免零宽度把版面坐标全叠到一点上。
+    """
+
+    def __init__(self, fallback_of="?", default_width=1000):
+        PDFFont.__init__(self, {"FontName": "NullFont(%s)" % fallback_of}, {},
+                         default_width=default_width)
+
+    def __repr__(self):
+        return "<PDFNullFont %s>" % self.fontname
+
+    def to_unichr(self, cid):
+        raise PDFUnicodeNotDefined(None, cid)
+
+
 # [自研补丁] 字体字符校正表: 修复老式期刊 PDF (如 Elsevier AdvTimes 系列) 自定义
 # 字体编码的解码错误 (± 被解成 I, 负号被解成 ), 分隔符被解成 Æ 等)。
 # 校正表: server/config/font_char_fixes.json
@@ -1024,7 +1116,12 @@ class PDFSimpleFont(PDFFont):
             self.unicode_map = FileUnicodeMap()
             CMapParser(self.unicode_map, BytesIO(strm.get_data())).run()
         PDFFont.__init__(self, descriptor, widths)
-        _apply_font_char_fixes(self.basefont, self.cid2unicode)
+        # [自研补丁 2026-09-18] PDFFont.__init__ 不设 self.basefont（只有
+        # PDFType1Font / PDFCIDFont 子类自设），PDFType3Font 走到这里会
+        # AttributeError → 整篇解析直接崩（实测 EgoPhys 论文第 8 页图形内的
+        # Type3 字体，进度 8/19 处 pdf2zh 进程退出码 1）。
+        # 取不到就给空串：规则按字体名子串匹配，无名即不匹配，等价于未打补丁。
+        _apply_font_char_fixes(getattr(self, "basefont", ""), self.cid2unicode)
 
     def to_unichr(self, cid: int) -> str:
         if self.unicode_map:
