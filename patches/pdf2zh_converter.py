@@ -170,6 +170,28 @@ class TranslateConverter(PDFConverterEx):
         if not self.translator:
             raise ValueError("Unsupported translation service")
 
+    def _maybe_summarize_document(self, ltpage, sstk: list) -> None:
+        """[v24-A] 首页文本 → 文档画像, 每文档仅一次(_doc_summary_done 门闩)。
+
+        门闩必须"先验后关": 流式解析下首页若含图形对象, receive_layout 会
+        先以 LTFigure 触发(sstk 为空); 若此时提前关门, 整页文字到达时摘要
+        将永不生成(无落盘/无打印/无异常, 键里缺失 doc_summary_fp)。文字
+        不足同理, 留给后续页再试。失败安全(异常一律吞掉, 不阻断翻译)。
+        """
+        try:
+            _tr = getattr(self, "translator", None)
+            if (_tr is None
+                    or not hasattr(_tr, "summarize_document")
+                    or getattr(_tr, "_doc_summary_done", False)
+                    or not isinstance(ltpage, LTPage)):
+                return
+            _txt = " ".join(s for s in sstk if len(s.strip()) > 40)[:4000]
+            if len(_txt) > 600:
+                _tr._doc_summary_done = True
+                _tr.summarize_document(_txt)
+        except Exception:
+            pass
+
     def receive_layout(self, ltpage: LTPage):
         # 段落
         sstk: list[str] = []            # 段落文字栈
@@ -399,17 +421,7 @@ class TranslateConverter(PDFConverterEx):
         # "通读全文"意识而不破坏切片/缓存/版面三约束。摘要落盘
         # (~/.cache/pdf2zh/docsummary/), 同文档永远复用同一份, 键不漂移;
         # fp 经 add_params 进键, 旧条目走 v23 旧形态回查, 零重译迁移。
-        # 每文档仅执行一次(_doc_summary_done 门闩), 失败安全。
-        try:
-            _tr = self.translator
-            if (hasattr(_tr, "summarize_document")
-                    and not getattr(_tr, "_doc_summary_done", False)):
-                _tr._doc_summary_done = True
-                _txt = " ".join(s for s in sstk if len(s.strip()) > 40)[:4000]
-                if len(_txt) > 600:
-                    _tr.summarize_document(_txt)
-        except Exception:
-            pass
+        self._maybe_summarize_document(ltpage, sstk)
 
         @retry(wait=wait_fixed(1))
         def worker(s: str, head: str = ""):  # 多线程翻译

@@ -49,11 +49,21 @@ def load_pages(sidecar):
 
 
 def renumber(text_pagelevel, raw_pagelevel):
-    """页级 {vN} -> 段内 0 基 {vk}; raw_pagelevel 提供 token 顺序。"""
+    """页级 {vN} -> 段内 0 基 {vk}; raw_pagelevel 提供 token 顺序。
+
+    [自研补丁 2026-09-19] 侧车 trans 是 LLM 产物, 实测会写出 raw 里不存在的
+    token 编号(EgoPhys p12#11 的 {v71}、p15#19 的 {v255})。旧写法 mapping[...]
+    直接取 → KeyError, 整个注入流程被打断(2 段污染整篇)。
+    映射不到就**原样保留**该 token, 交给调用方既有的"译文占位符多重集 ⊆ raw
+    多重集"断言去判 —— 那条断言本就是为 LLM 乱写编号设计的。
+    """
     mapping = {}
     for k, m in enumerate(V_TOKEN.finditer(raw_pagelevel)):
         mapping.setdefault(m.group(1), k)
-    return V_TOKEN.sub(lambda m: "{v%d}" % mapping[m.group(1)], text_pagelevel)
+    return V_TOKEN.sub(
+        lambda m: "{v%d}" % mapping[m.group(1)] if m.group(1) in mapping
+        else m.group(0),
+        text_pagelevel)
 
 
 def detect_fp(cur, pages, man):
