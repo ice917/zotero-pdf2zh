@@ -53,7 +53,7 @@ def main():
         print("FAIL 页数不一致")
         return 1
 
-    moved = kept = unresolved = skipped = 0
+    moved = unresolved = skipped = 0
     misses = []
     for pno in range(len(doc)):
         if pno + 1 in skip:

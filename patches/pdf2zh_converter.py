@@ -756,9 +756,8 @@ class TranslateConverter(PDFConverterEx):
             def _extract_body_chars(chars, body, norm):
                 """按原字符流顺序取出组成 body 的连续字符(含主体内部空格)。"""
                 # 去掉首尾标点/空格后, body 与 chars 的尾段子序列一一对应;
-                # 用双指针从两端向内收缩, 跳过首尾的标点与空格。
+                # 跳过首尾的标点与空格。
                 seq = [norm(c) for c in chars]
-                lo, hi = 0, len(chars) - 1
                 body_stripped = body.replace(" ", "")
                 # 从左找第一个属于 body 的字符: 逐个消费 head 部分
                 target = list(body_stripped)
