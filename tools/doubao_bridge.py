@@ -3,13 +3,17 @@
 
 注册方式 (豆包「技能·连接器·伙伴 → 新建自定义连接器」):
   传输类型: STDIO
-  命令:     D:/Users/<user>/anaconda3/envs/zotero-pdf2zh-venv/python.exe
-  参数:     D:/zotero-pdf2zh/tools/doubao_bridge.py
+  命令:     <项目所用 python.exe, 如 .../envs/zotero-pdf2zh-venv/python.exe>
+  参数:     <项目根>/tools/doubao_bridge.py
+  环境变量: P2Z_PROJ=<项目根>   (不设则退回 D:\\zotero-pdf2zh)
 
 暴露四个工具:
-  list_inbox()                 列出待译 payload (D:/zotero-pdf2zh/inbox)
+  list_inbox()                 列出待译 payload (<项目根>/inbox)
   get_payload(name)            读取 payload 全文 (编号段落包, #S1..#Sn, ⋮ 为跨页断点)
-  submit_result(name, text)    保存译文到 D:/zotero-pdf2zh/out, 返回段号统计
+  submit_result(name, text)    保存译文到 <项目根>/out, 返回段号统计。
+                               文件名统一落成 `<名>.doubao.txt` —— 与 tools/adopt.py
+                               的 deliver 自动发现规则 (out/<name>.doubao*.txt) 对齐;
+                               否则豆包交的件 deliver 认不到, 纯豆包环境就断在这
   search_term(term)            术语证据检索(等价于本地版搜索工具): 命中 Zotero 库 PDF 原文
                                上下文 + OpenAlex 学术文献, 返回证据供裁决; 只出证据,
                                不改译文、不写术语表
@@ -23,11 +27,16 @@ import sys
 import time
 import traceback
 
-INBOX = r"D:\zotero-pdf2zh\inbox"
-OUTDIR = r"D:\zotero-pdf2zh\out"
+# 路径**不焊死在本机** —— 与 tools/adopt.py / tools/seg_export.py 同一套环境变量
+# 约定 (P2Z_PROJ / P2Z_INBOX)。桥是这条链上最容易被"换台电脑就废"的一环:
+# 别的用户把项目装在别的盘符时, 焊死的 D:\zotero-pdf2zh 会让四个工具全部指向空目录。
+PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
+INBOX = os.environ.get("P2Z_INBOX", os.path.join(PROJ, "inbox"))
+OUTDIR = os.path.join(PROJ, "out")
 MAX_READ = 4 * 1024 * 1024
 
 S_LINE = re.compile(r"(?m)^\s*#S(\d+)\s*$")
+_DOUBAO_SUFFIX = re.compile(r"\.doubao\d*$")
 
 
 def _log(msg):
@@ -40,6 +49,25 @@ def _safe_name(name):
     if not re.fullmatch(r"[A-Za-z0-9_\-. ]{1,80}", n):
         raise ValueError("非法文件名: %r (仅限字母数字-_. 与空格)" % n)
     return n
+
+
+def _result_name(name):
+    """交件文件名规范化 → `<stem>.doubao.txt`。
+
+    为什么要规范化: tools/adopt.py 的 deliver 缺省只认 `out/<name>.doubao*.txt`
+    (多轮定稿靠 .doubao/.doubao2/.doubao3 区分)。而豆包最常见的提交名是
+    inbox 里那个原名 (`egophys2026.txt`) —— 直接落盘就落成 `out/egophys2026.txt`,
+    deliver 找不到 → 断在交件这一步。
+
+    实测 (2026-09-19 豆包日志): 之所以历史上没断, 是因为人在对话框里额外叮嘱了
+    "存成 egophys2026.doubao.txt"。**依赖人记得说, 不是契约** —— 这个函数把它变成契约。
+
+    已带 `.doubao` / `.doubao2` / `.doubao3` 的名字原样保留(不叠成 .doubao.doubao)。
+    """
+    stem, _ext = os.path.splitext(name)
+    if not _DOUBAO_SUFFIX.search(stem):
+        stem += ".doubao"
+    return stem + ".txt"
 
 
 def tool_list_inbox(args):
@@ -68,8 +96,7 @@ def tool_submit_result(args):
     if not text.strip():
         raise ValueError("text 为空, 拒绝保存")
     os.makedirs(OUTDIR, exist_ok=True)
-    if not re.search(r"\.(txt|md)$", fn):
-        fn += ".md"
+    fn = _result_name(fn)
     p = os.path.join(OUTDIR, fn)
     with open(p, "w", encoding="utf-8") as f:
         f.write(text)
@@ -135,7 +162,7 @@ def tool_search_term(args):
 TOOLS = [
     {
         "name": "list_inbox",
-        "description": "列出 pdf2zh 待译目录 D:/zotero-pdf2zh/inbox 下的 payload 文件",
+        "description": "列出 pdf2zh 待译目录 inbox 下的 payload 文件",
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
     {
@@ -150,11 +177,14 @@ TOOLS = [
     },
     {
         "name": "submit_result",
-        "description": "提交译文: 保存到 D:/zotero-pdf2zh/out 并返回统计。每段译文行首保留 #S编号, 跨页断点处保留 ⋮",
+        "description": "提交译文: 保存到 out/ 并返回统计。每段译文行首保留 #S编号, 跨页断点处保留 ⋮。"
+                       "name 直接填 get_payload 取件时那个**原名**即可 (如 egophys2026.txt) —— "
+                       "落盘时会自动规范成 `原名.doubao.txt`, 交给 adopt 的 deliver 认领; "
+                       "若要交多轮定稿, 用 `egophys2026.doubao2.txt` 这样带序号的名字",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "name": {"type": "string", "description": "结果文件名, 如 roundtrip_test.txt"},
+                "name": {"type": "string", "description": "结果文件名, 通常就是 payload 原名, 如 payload_test.txt"},
                 "text": {"type": "string", "description": "全部文本, 含 #S 编号行"},
             },
             "required": ["name", "text"],
