@@ -557,11 +557,27 @@ class TranslateConverter(PDFConverterEx):
                 # 在页与页之间插显式页边界标记, 并声明"页边界≠语段边界"。
                 _pageno = getattr(self, "_segflow_pageno", 0) + 1
                 self._segflow_pageno = _pageno
+                # [自研补丁 2026-09-19 v28.23] 文档画像指纹随行导出。
+                # 为什么必须带出来: adopt export 原先靠"库内命中行"反探指纹来决定
+                # 注入用的键形态; 而暂停档(PAUSE_TRANSLATE=1)第一趟**一列都不写**
+                # (死规矩: 写进英文 = 第二轮命中英文 = 全篇英文 PDF), 于是反探必然
+                # 0 命中 -> export 拒导 -> 整个两趟回路的第一半直接失效(实测: 服务端
+                # 静默回落成付费机器翻译)。指纹本来就在引擎手里(缓存参数), 顺手带
+                # 出来最省事, 也让下游不必再从库行反推(反推本就脆弱: 库行是翻过的
+                # 产物, 骨架档没有产物)。
+                _doc_fp = ""
+                try:
+                    _tr = getattr(self, "translator", None)
+                    _doc_fp = ((getattr(_tr, "cache", None) and _tr.cache.params) or {}).get(
+                        "doc_summary_fp") or ""
+                except Exception:
+                    _doc_fp = ""
                 rec = {
                     "page": _pageno,
                     "pageid": ltpage.pageid,
                     "segs": [{"raw": s, "trans": n} for s, n in zip(sstk, news)],
                     "vars": _legend,
+                    "doc_fp": _doc_fp,
                 }
                 _line = json.dumps(rec, ensure_ascii=False) + "\n"
                 for _p in (_sf_path, _sf_doc):   # latest.jsonl + 按文档归档件

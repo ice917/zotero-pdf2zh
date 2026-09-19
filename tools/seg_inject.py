@@ -114,16 +114,124 @@ def newest_row(cur, cache_raw):
         (cache_raw,)).fetchone()
 
 
+def rollback(fp, raws=(), dry=False):
+    """[v28.23] 撤销骨架行: 删掉"译文 == 原文"的库行。
+
+    为什么需要: 暂停档(PAUSE_TRANSLATE=1)为了让 seg_inject 有行可改, 会按最终
+    键形态落一批 raw→raw 骨架行。正常回路里它们随即被豆包稿改写; 但回路**半途
+    失败**(导出失败/交件拒收/注入 dry FAIL/等不到交稿)时若不撤掉, 第二趟就会
+    命中它们 -> 整篇出英文 PDF —— 正是本档最怕的那个后果。
+
+    两道判据, 优先用段原文(更精确, 且不依赖指纹能否探到):
+      a) raws 非空: 只删 original_text 落在**本篇载荷段原文**集合里的行;
+      b) 否则用 fp:  只删文档作用域内的行。
+    两种都叠加 `translation = original_text` —— 骨架行的定义就是这个, 它不可能
+    误删任何真译文(真译文与原文逐字相同, 等于没翻, 删掉也无害)。两者都没有则
+    拒绝执行(宁可漏撤, 不可误删全库)。
+    """
+    raws = sorted({r for r in raws if r})
+    if raws:
+        cond_head = "translation = original_text AND original_text IN "
+        print("作用域: 本篇载荷 %d 段原文" % len(raws))
+    elif fp:
+        cond_head = None
+        print("作用域: 文档指纹 %s" % fp)
+    else:
+        print("FAIL rollback: 既无段原文也无文档指纹 -> 拒绝删 (怕误删全库)")
+        return 1
+
+    con = sqlite3.connect(CACHE)
+    cur = con.cursor()
+    if cond_head:
+        # 分块: SQLite 变量上限, 长论文段数可能上千
+        found = []
+        for i in range(0, len(raws), 400):
+            chunk = raws[i:i + 400]
+            found += cur.execute(
+                "SELECT id, substr(original_text, 1, 50) FROM _translationcache WHERE "
+                + cond_head + "(" + ",".join("?" * len(chunk)) + ")", chunk).fetchall()
+    else:
+        found = cur.execute(
+            "SELECT id, substr(original_text, 1, 50) FROM _translationcache"
+            " WHERE translate_engine_params LIKE ? AND translation = original_text",
+            ("%" + fp + "%",)).fetchall()
+    print("骨架行: %d" % len(found))
+    for rid, head in found[:8]:
+        print("  id=%s %r" % (rid, head))
+    if dry or not found:
+        con.close()
+        print("结论: PASS%s" % (" (dry, 未删)" if dry else " (无可删)"))
+        return 0
+    bak = CACHE + ".bak-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    shutil.copy2(CACHE, bak)
+    print("备份:", bak)
+    n = 0
+    if cond_head:
+        ids = [r[0] for r in found]
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            cur.execute("DELETE FROM _translationcache WHERE id IN ("
+                        + ",".join("?" * len(chunk)) + ")", chunk)
+            n += cur.rowcount
+    else:
+        cur.execute("DELETE FROM _translationcache WHERE translate_engine_params LIKE ?"
+                    " AND translation = original_text", ("%" + fp + "%",))
+        n = cur.rowcount
+    con.commit()
+    con.close()
+    print("结论: PASS (已删 %d 行骨架)" % n)
+    return 0
+
+
+def raws_of_run(manifest_path, sidecar_path):
+    """本篇载荷涉及的"缓存侧原文" (与注入时用的口径逐字一致)。
+
+    manifest_path 为空时退化为"这份侧车里的全部段" —— 用在导出阶段就失败、台账
+    里没留下 manifest 的场合: 此时侧车是本次第一趟刚写的, 它已经覆盖整篇, 范围
+    只会比载荷大(多删不到任何东西: 判据还叠着 translation == original_text)。
+    """
+    pages = load_pages(sidecar_path)
+    out = []
+    if not manifest_path:
+        for rec in pages.values():
+            for s in rec.get("segs", []):
+                raw = s["raw"]
+                out.append(renumber(raw, raw))
+        return out
+    with open(manifest_path, encoding="utf-8") as f:
+        man = json.load(f)
+    for it in man["items"]:
+        for p in it["parts"]:
+            raw = pages[p["page"]]["segs"][p["seg"]]["raw"]
+            out.append(renumber(raw, raw))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--imported", required=True)
-    ap.add_argument("--manifest", required=True)
+    ap.add_argument("--imported", default="")
+    ap.add_argument("--manifest", default="")
     ap.add_argument("--shift", default="", help='如 "S4:1,S9:2"')
     ap.add_argument("--sidecar", default=SIDECAR, help="侧车路径; 新论文先归档 latest.jsonl 再指向它")
     ap.add_argument("--fp", default="",
                     help="文档指纹; 缺省自动探测(平票取最后写入的世代; 探测失败回落 Cactaceae 默认)")
     ap.add_argument("--dry", action="store_true", help="只演算不写库")
+    ap.add_argument("--rollback", action="store_true",
+                    help="[v28.23] 撤销模式: 删本篇(或本文档指纹作用域下)的 raw→raw 骨架行, 不做注入")
     args = ap.parse_args()
+
+    if args.rollback:
+        raws = []
+        if os.path.exists(args.sidecar):
+            try:
+                raws = raws_of_run(args.manifest if (args.manifest and os.path.exists(args.manifest)) else "",
+                                   args.sidecar)
+            except Exception as exc:
+                print("⚠️ 段原文口径不可用(%s), 改用文档指纹作用域" % exc)
+        return rollback(args.fp, raws, dry=args.dry)
+    if not args.imported or not args.manifest:
+        print("FAIL: 非 --rollback 模式必须给 --imported 与 --manifest")
+        return 1
 
     with open(args.imported, encoding="utf-8") as f:
         imported = json.load(f)

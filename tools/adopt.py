@@ -28,6 +28,12 @@
                 PDF 换成 imported.json —— 前移之后那一轮服务端渲染直接省掉。
   6 gate     verify_render(--expect) + post_check 双 PASS 才算交付
 
+另有一个**不在顺序里**的止损阶段 (v28.23):
+  7 rollback 撤销骨架行: 暂停档(PAUSE_TRANSLATE=1)第一趟为了让 seg_inject
+             (UPDATE-only)有行可改, 会按最终键形态落一批 raw→raw 骨架行;
+             回路半途失败时必须**先撤掉再回落**成正常翻译, 否则第二趟命中
+             它们 -> 整篇英文 PDF
+
 用法 (解释器同 tools/tests/run_all.py):
   PY = D:/Users/<user>/anaconda3/envs/zotero-pdf2zh-venv/python.exe
   & $PY tools/adopt.py export --name payload_p2_p4 --pages 2-4 --pdf "D:/.../xxx.pdf" --doc "标题 (期刊, 年份)"
@@ -295,6 +301,27 @@ def resolve_sidecar(args):
                   % (os.path.basename(args.pdf), want))
 
 
+def sidecar_doc_fp(sc):
+    """读侧车自带的文档画像指纹 (converter v28.23 起随行导出)。
+
+    没有这一项的老侧车返回 ""。取第一行里非空的那个即可 —— 同一篇的每一行都
+    是同一个值(引擎在同一次渲染里算出来然后逐页重复写入)。
+    """
+    try:
+        with open(sc, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                v = (json.loads(line) or {}).get("doc_fp") or ""
+                if v:
+                    return v
+                break   # 只看第一行: 有就是有, 没有说明是老侧车
+    except Exception:
+        pass
+    return ""
+
+
 def stage_export(args):
     led = load_ledger(args.name)
     if not guard(led, "export", args.force):
@@ -323,15 +350,26 @@ def stage_export(args):
         save_ledger(led)
         return die("manifest 未生成: %s" % man_p)
     pages = load_sidecar_pages(sc)
-    hit, fp = probe_db(man, pages)
-    if hit == 0:
-        mark(led, "export", "failed", reason="库内 0 命中")
-        save_ledger(led)
-        return die("库内查不到本次任何段落原文 —— 侧车与缓存库不是同一篇(或没翻过)。"
-                   "请先跑翻译再导出; 若已翻译, 用 --sidecar 指向该篇归档的 latest.jsonl")
-    if fp is None:
-        print("[adopt] 警告: 探测不到文档摘要指纹(库内行不带 docsummary fp)。")
-        print("        该篇无法用文档作用域注入 —— inject 阶段必须显式 --fp, 否则会误用默认值。")
+    hit, fp_db = probe_db(man, pages)
+    # [v28.23] 指纹优先取侧车自带的那一份。
+    # 为什么: "库内命中反探"在**暂停档**下必然 0 命中 —— 骨架档的第一趟按规矩
+    # 一列缓存都不写, 于是 export 拒导 -> 服务端回落成付费机器翻译(实测)。
+    # 侧车是本次刚渲染出来的那一份, 指纹来自引擎自己算的缓存参数, 比从库行反推
+    # 更权威(库行是"翻过的产物", 骨架档恰恰没有产物)。老侧车没有该项, 走原路。
+    fp = sidecar_doc_fp(sc)
+    if fp:
+        if hit == 0:
+            print("[adopt] 库内 0 命中 —— 骨架档/首翻的正常形态; 指纹取自侧车: %s" % fp)
+    else:
+        fp = fp_db
+        if hit == 0:
+            mark(led, "export", "failed", reason="库内 0 命中")
+            save_ledger(led)
+            return die("库内查不到本次任何段落原文 —— 侧车与缓存库不是同一篇(或没翻过)。"
+                       "请先跑翻译再导出; 若已翻译, 用 --sidecar 指向该篇归档的 latest.jsonl")
+        if fp is None:
+            print("[adopt] 警告: 探测不到文档摘要指纹(库内行不带 docsummary fp)。")
+            print("        该篇无法用文档作用域注入 —— inject 阶段必须显式 --fp, 否则会误用默认值。")
 
     mark(led, "export", "ok", pages=args.pages, sidecar=sidecar_id(sc),
          sidecar_source=sc_why, doc_fp=fp, db_hits=hit, n_items=len(man["items"]),
@@ -481,6 +519,51 @@ def stage_inject(args):
          backup=bak[-1] if bak else None, shift=args.shift or None)
     save_ledger(led)
     print("[adopt] inject OK: 更新 %d 行" % rows)
+    return 0
+
+
+# -------------------------------------------------------------- 阶段 7: rollback
+def stage_rollback(args):
+    """[v28.23] 撤销骨架行 —— 两趟回路半途失败时的**止损坏**步骤。
+
+    暂停档第一趟会按最终键形态落一批 raw→raw 骨架行(它们的存在是必需的: 回灌
+    工具 seg_inject 是 UPDATE-only, 没行可改就直接 FAIL)。一旦回路半途失败
+    (导出失败 / 交件被拒 / 注入 dry FAIL / 等不到交稿), 这些行必须在"回落成
+    正常翻译"**之前**删掉 —— 否则第二趟命中它们, 整篇出英文 PDF。
+    作用域两级(seg_inject 侧实现): 有 manifest 就按**本篇载荷段原文**逐段限,
+    否则退化为"这份侧车里的全部段"; 再叠一层 `translation == original_text`。
+    """
+    led = load_ledger(args.name)
+    exp = led["stages"].get("export") or {}
+    fp = args.fp or exp.get("doc_fp") or ""
+    sidecar = (exp.get("sidecar") or {}).get("path") or ""
+    manifest = exp.get("manifest") or ""
+    # [v28.23] 导出阶段就失败时, 台账里**没有** export 条目, 但那批骨架行已经落库
+    # (第一趟跑完才轮到导出)。没有作用域时 seg_inject 只能退回全局 latest.jsonl 的
+    # 全部段 —— 而那是"最近渲染过的那一篇": 并发的另一篇一开始渲染, 这份就被顶掉,
+    # 于是"撤不掉 -> 回落成机器翻译命中骨架行 -> 整篇英文 PDF", 正是本机制要防的
+    # 那一种损坏。故这里补一条**确定性**来源: --pdf 指向的按文档归档件(v28.9 起
+    # converter 每篇必落 pdf-<md5>.jsonl)。
+    if not sidecar and getattr(args, "pdf", ""):
+        sidecar = archived_sidecar(args.pdf) or ""
+        fp = fp or sidecar_doc_fp(sidecar)
+    # 首选"段原文"作用域: 它不依赖指纹能不能探到(没有文档摘要的短件探不到),
+    # 且范围就是本篇载荷那几段, 比 LIKE 指纹更紧。
+    argv = ["--rollback"]
+    if fp:
+        argv += ["--fp", fp]
+    if sidecar and os.path.exists(sidecar):
+        argv += ["--sidecar", sidecar]
+        if manifest and os.path.exists(manifest):
+            argv += ["--manifest", manifest]
+    rc, _ = run_tool("seg_inject.py", argv)
+    if rc != 0:
+        mark(led, "rollback", "failed", fp=fp, rc=rc)
+        save_ledger(led)
+        return rc
+    mark(led, "rollback", "ok", fp=fp)
+    save_ledger(led)
+    print("[adopt] rollback OK: 骨架行已撤 (%s)" % (fp or "按段原文"))
     return 0
 
 
@@ -668,6 +751,14 @@ def main():
     p.add_argument("--fp", default="", help="覆盖台账里的文档指纹(缺省用 export 探到的)")
     p.add_argument("--dry", action="store_true", help="只演算不写库")
     p.set_defaults(fn=stage_inject)
+
+    p = sub.add_parser("rollback", help="7 [v28.23] 撤销骨架行(回路半途失败时止损坏)")
+    common(p)
+    p.add_argument("--fp", default="", help="文档指纹; 缺省用台账里 export 记下的")
+    p.add_argument("--pdf", default="",
+                   help="原文 PDF; 台账里没有 export 条目(导出阶段就失败)时靠它定位"
+                        "按文档归档的侧车, 避免退回全局 latest.jsonl 误伤别的论文")
+    p.set_defaults(fn=stage_rollback)
 
     p = sub.add_parser("render", help="5 重渲染落产物")
     common(p)

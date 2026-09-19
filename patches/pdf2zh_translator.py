@@ -103,12 +103,51 @@ class BaseTranslator:
         曾致 23 段全 miss / 233s)。"""
         return ""
 
+    def _pause_translate(self) -> bool:
+        """[v28.23] 暂停档判定: 引擎只提取文字, 不调 LLM 翻译。
+
+        与"润色钩子"**同一插入点**(translate() 内、初译之后), 行为相反:
+        润色是初译完再叫一次 LLM 改稿; 暂停档是把"初译"这一步整体停掉,
+        译文留给外部(豆包)供给, 经 seg_inject 回灌缓存后, 第二轮渲染全命中。
+
+        读序 **env 优先**: 插件推送配置时按 example 无条件回填, 用 env
+        可保证运营侧开关不被覆写(POLISH 被插件置 null 的那次事故即此因)。
+
+        注意"暂停"是**翻译这一步整篇不执行**, 不是挂起进程: pdf2zh 逐页
+        "提取→翻译→排版", 真要挂起只能停在第 1 页, 后续页尚未解析, 外部
+        只能拿到一页。
+        """
+        v = (os.environ.get("PAUSE_TRANSLATE")
+             or (self.envs or {}).get("PAUSE_TRANSLATE") or "")
+        return str(v).strip().lower() in ("1", "true", "on", "yes")
+
     def translate(self, text: str, ignore_cache: bool = False) -> str:
         """
         Translate the text, and the other part should call this method.
         :param text: text to translate
         :return: translated text
         """
+        # [v28.23] 暂停档: 只提字, 不调 LLM。
+        #   ① **不调 do_translate** —— 不产生任何付费翻译调用;
+        #   ② **落一条 raw→raw 的骨架行**(用最终键形态) —— 这是死规矩的例外,
+        #      而且是必须的: 回灌工具 seg_inject 是 **UPDATE-only**(按原文 + 文档
+        #      作用域找行, 找不到就 FAIL —— 那是它防"注入进别的文档"的核心安全
+        #      设计), 骨架档一列不写, 豆包稿就无处可写。实测: dry 演算 FAIL ->
+        #      服务端回落成付费机器翻译, 两趟白设计。
+        #   ③ 位置在 get() **之前**: 命中旧世代缓存的段落同样要留下"本次键形态"
+        #      的骨架行, 否则该段最新行不在本篇作用域内, inject 的世代自检照样
+        #      FAIL(实测 rowid 4305 那类旧形状行会顶掉新行成为 newest)。
+        # 骨架行不会把人变成英文 PDF 的两道保底:
+        #   a) 第二趟之前必被 seg_inject 改写成豆包译文(段号守恒门禁保证不漏段);
+        #   b) 回路半途失败时, 服务端先跑 adopt.py rollback(只删 translation ==
+        #      original_text 的行)再回落成正常翻译。
+        # docsummary 的 LLM 调用在 converter(pdf2zh_converter.py L173), 不经过本
+        # 函数, 故世代键(doc_summary_fp)两轮逐字节一致 —— 这是本档不引发整篇失配
+        # 的前提。
+        if self._pause_translate():
+            self.cache.set(text, text, self._cache_key_suffix(text))
+            return text
+
         if not (self.ignore_cache or ignore_cache):
             cache = self.cache.get(text, self._cache_key_suffix(text))
             if cache is not None:

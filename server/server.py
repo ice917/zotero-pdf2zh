@@ -25,6 +25,7 @@ import argparse
 import sys  # 用于退出脚本
 import re   # 用于解析版本号和提取错误信息
 import io
+import glob    # [v28.23] 等豆包交件落盘(out/<name>.doubao*.txt)
 import socket  # 用于端口检查
 import time    # 用于 SSE 推送间隔
 import threading
@@ -38,6 +39,56 @@ from utils.task_manager import task_manager
 from utils.execute import execute_with_progress
 
 _VALUE_ERROR_RE = re.compile(r'(?m)^ValueError:\s*(?P<msg>.+)$')
+
+# ================================================================================
+# [自研补丁 2026-09-19 v28.23] 两趟采纳回路（提字 → 待译 → 回灌重渲染）
+#
+# 为什么要两趟: 引擎逐页「提取→翻译→排版」, 一次跑完整篇、中途不等外部; 而豆包
+# 要看到**全篇**才能定稿(跨页接缝/术语/文风)。所以把「翻译」这一站拆成两趟 ——
+# 第一趟只提字(侧车写全篇), 中间交给豆包, 第二趟全命中缓存重排版(零翻译调用)。
+#
+# 为什么能在一个任务里"停一下": 新插件是异步协议 —— POST 立刻返回 accepted,
+# worker 在后台线程里跑, 进度走 /tasks 与 /events, 所以 worker 可以在这里等豆包,
+# 界面不卡, 任务卡片显示「待译」。这就是需求里的"停下来, 豆包搞完再继续"。
+#
+# 开关走**环境变量**(env 优先): 插件推送配置时会按 example 无条件回填, 只有 env
+# 不会被覆写(POLISH 被插件置 null 的那次事故即此因)。默认关 → 别的用户路径不变。
+# ================================================================================
+def _two_pass_enabled():
+    return str(os.environ.get("PAUSE_TRANSLATE", "")).strip().lower() in ("1", "true", "on", "yes")
+
+
+def _two_pass_wait_minutes():
+    """等豆包交稿的上限(分钟), 可用 PAUSE_WAIT_MINUTES 覆盖; 超时回落成正常翻译。"""
+    try:
+        v = float(os.environ.get("PAUSE_WAIT_MINUTES", "") or 30)
+    except ValueError:
+        v = 30.0
+    return max(0.0, v)
+
+
+def _adopt_run_name(pdf_path):
+    """run 名 = 原文文件名(去扩展名)。adopt 侧只允许字母数字-_ . 与空格。"""
+    stem = os.path.splitext(os.path.basename(pdf_path))[0]
+    name = re.sub(r"[^0-9A-Za-z_\-\. ]+", "_", stem).strip()
+    return (name or "run")[:60]
+
+
+def _run_tool(script, argv, timeout=None):
+    """跑项目内工具(adopt.py 等), 返回 (rc, 输出尾部)。用本进程解释器, cwd=项目根。
+
+    工具失败**不能**让翻译任务崩: 一律返回 rc!=0 交给调用方回落处理。
+    """
+    proj = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
+    cmd = [sys.executable, os.path.join(proj, "tools", script)] + [str(a) for a in argv]
+    env = dict(os.environ)
+    env["P2Z_PROJ"] = proj
+    try:
+        p = subprocess.run(cmd, cwd=proj, env=env, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=timeout)
+        return p.returncode, ((p.stdout or "") + (p.stderr or ""))[-2000:]
+    except Exception as exc:
+        return 1, "工具调用失败: %s" % exc
 
 # ================================================================================
 # [自研补丁 2026-09-18 闸门4] 任务失败根因提取
@@ -970,6 +1021,143 @@ class PDFTranslator:
             task_manager.complete_task(task_id, 'failed', str(e), error=failure_brief(e, task_id=task_id))
             return self._handle_exception(e, context='/translate', task_id=task_id)
 
+    def _wait_for_doubao_delivery(self, task_id, name, minutes, since_ts):
+        """[v28.23] 等豆包交件落盘 out/<name>.doubao*.txt; 超时返回 ""。
+
+        为什么轮询文件而不是等 MCP 反向通知: 交件本身就是"文件落盘"(桥的
+        submit_result 与剪贴板粘贴落盘走同一个命名), 而 MCP 服务端→客户端
+        没有"唤醒 agent 干活"的标准语义 —— 现在是**我们等它**, 不是它等我们推。
+
+        只认 since_ts 之后落盘的文件: out/ 里常常堆着同一篇的历史交件
+        (wang2026.doubao1..5 实测), 认错一份整轮白干 —— adopt 的 deliver 门禁
+        也是为这个设的。认"本次任务开始后才出现的、最新的一份", 是自动回路里
+        唯一站得住的判据(无人可问, 不能拿旧的充新的)。
+        """
+        proj = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
+        pattern = os.path.join(proj, "out", name + ".doubao*.txt")
+        floor = since_ts - 1.0   # 让 1s 内的时间戳粒度(±1)不误杀
+        deadline = time.time() + minutes * 60.0
+        waited = 0
+        while True:
+            hits = [f for f in glob.glob(pattern)
+                    if os.path.isfile(f) and os.path.getsize(f) > 0
+                    and os.path.getmtime(f) >= floor]
+            if hits:
+                return max(hits, key=os.path.getmtime)
+            if time.time() >= deadline:
+                return ""
+            task_manager.update_task(task_id, {
+                'status': '待译',
+                'message': f'待译：等待豆包交稿（已等 {waited // 60} 分钟，上限 {minutes:g} 分钟）',
+            })
+            time.sleep(5)
+            waited += 5
+
+    def _two_pass_adopt(self, task_id, input_path, config):
+        """[v28.23] 两趟回路的**开关还原壳**。
+
+        坑(实测踩到, 症状极具欺骗性): 第一趟要把 PAUSE_TRANSLATE 置 1、第二趟
+        必须置空, 顺手在 finally 里 pop 就顺手把"运营开关"也 pop 了 —— 于是
+        第一个任务跑完, 后续任务读不到开关, 静默退回"直接机器翻译"(第二个任务
+        照样烧钱, 而日志看起来一切正常)。运营开关是环境变量, 不是一次性令牌:
+        一进一出原样还回去。
+        """
+        _op_switch = os.environ.get("PAUSE_TRANSLATE")
+        try:
+            return self._two_pass_run(task_id, input_path, config)
+        finally:
+            if _op_switch is None:
+                os.environ.pop("PAUSE_TRANSLATE", None)
+            else:
+                os.environ["PAUSE_TRANSLATE"] = _op_switch
+
+    def _two_pass_run(self, task_id, input_path, config):
+        """[v28.23] 一趟任务内的两趟采纳回路。
+
+        第一趟 PAUSE_TRANSLATE=1 → 引擎不调翻译 LLM、不写缓存、返回原文, 跑完即得
+        全篇侧车(豆包要的整篇载荷); export 裁成 inbox 载荷 → 任务停在「待译」;
+        豆包交件后 deliver/import/inject 把译文灌回缓存库; 第二趟关掉开关重跑,
+        全命中缓存 → 零翻译调用, 产物仍由引擎排版。
+
+        止损: 导出失败或交件阶段失败都回落成「正常翻译」重跑第二趟, 不让用户
+        拿不到东西; 无人交稿则等满 PAUSE_WAIT_MINUTES 后同样回落。
+        """
+        name = _adopt_run_name(input_path)
+        try:
+            total_pages = len(PdfReader(input_path).pages)
+        except Exception:
+            total_pages = 0
+        wait_min = _two_pass_wait_minutes()
+        t_start = time.time()   # 交件判据的下界: 只认此刻之后落盘的文件
+
+        def abort(why):
+            """回路半途失败 -> **先撤骨架行**, 再回落成正常翻译。
+
+            撤骨架行这步不能省: 第一趟为了让 seg_inject(UPDATE-only)有行可改,
+            按最终键形态落了 raw→raw 行; 不撤就重跑, 第二趟全命中它们 —— 整篇
+            出英文 PDF。撤干净了才敢回落成机器翻译。
+            """
+            print(f"⚠️ [两趟] {why}，撤骨架行后回落成正常翻译")
+            rc2, out2 = _run_tool("adopt.py", [
+                "rollback", "--name", name, "--pdf", os.path.abspath(input_path), "--force",
+            ])
+            if rc2 != 0:
+                print(f"⚠️ [两趟] rollback 也失败了(rc={rc2})，残留骨架行需人工核：\n{out2}")
+            task_manager.update_task(task_id, {
+                'status': '回灌重渲染',
+                'message': '回路中断：已撤骨架行，按正常翻译重跑',
+            })
+            return self.translate_pdf(input_path, config, task_id)
+
+        # ---- 第一趟: 提字（翻译这一步整篇不走 LLM）----
+        print(f"🔍 [两趟] 第一趟·提字 (PAUSE_TRANSLATE=1, run={name}, {total_pages} 页)")
+        task_manager.update_task(task_id, {
+            'status': '提字中',
+            'message': '第一趟：提取全篇原文（不翻译、不写缓存）',
+        })
+        os.environ["PAUSE_TRANSLATE"] = "1"
+        try:
+            self.translate_pdf(input_path, config, task_id)
+        finally:
+            os.environ.pop("PAUSE_TRANSLATE", None)
+
+        # ---- 侧车 -> inbox 载荷（豆包要的整篇）----
+        task_manager.update_task(task_id, {
+            'status': '待译',
+            'message': '待译：全篇原文已提取，等待豆包交稿',
+        })
+        rc, out = _run_tool("adopt.py", [
+            "export", "--name", name,
+            "--pages", f"1-{total_pages}" if total_pages else "1-1",
+            "--pdf", os.path.abspath(input_path), "--force",
+        ])
+        if rc != 0:
+            return abort(f"载荷导出失败(rc={rc})：{out[-400:]}")
+
+        # ---- 等豆包交稿 ----
+        delivered = self._wait_for_doubao_delivery(task_id, name, wait_min, t_start)
+        if delivered:
+            print(f"🔍 [两趟] 收到豆包交件: {delivered}")
+            # --text 显式点名: 认的就是刚等到的这一份, 不让 deliver 去 glob
+            # (同名历史交件一堆)。--force 是给"同一篇重跑"开的: 它只跳过**顺序**
+            # 门禁, 段号守恒 / ⋮ 断点对账 / dry 演算这些内容门禁一个不减。
+            for stage in (["deliver", "--name", name, "--text", delivered, "--force"],
+                          ["import", "--name", name, "--force"],
+                          ["inject", "--name", name, "--force"]):
+                rc, out = _run_tool("adopt.py", stage)
+                if rc != 0:
+                    return abort(f"{stage[0]} 失败(rc={rc})：{out[-400:]}")
+        else:
+            return abort(f"等待交稿超时（{wait_min:g} 分钟）")
+
+        # ---- 第二趟: 重渲染（有回灌则全命中缓存, 零翻译调用）----
+        task_manager.update_task(task_id, {
+            'status': '回灌重渲染',
+            'message': '译文已回灌，重渲染中',
+        })
+        print("🔍 [两趟] 第二趟·重渲染")
+        return self.translate_pdf(input_path, config, task_id)
+
     def _execute_translate_job(self, task_id, input_path, config, engine):
         def addFileList(fileList, filePath):
             if os.path.exists(filePath):
@@ -977,7 +1165,12 @@ class PDFTranslator:
 
         if engine == pdf2zh:
             print("🔍 [Zotero PDF2zh Server] PDF2zh 开始翻译文件...")
-            fileList = self.translate_pdf(input_path, config, task_id)
+            # [v28.23] 两趟采纳回路: 开着开关才走「提字 → 待译 → 重渲染」;
+            # 关着时行为与过去完全一致(默认关, 别的用户路径不变)。
+            if _two_pass_enabled():
+                fileList = self._two_pass_adopt(task_id, input_path, config)
+            else:
+                fileList = self.translate_pdf(input_path, config, task_id)
             mono_path, dual_path = fileList[0], fileList[1]
             if config.mono_cut:
                 mono_cut_path = self.get_filename_after_process(mono_path, 'mono-cut', engine)
