@@ -48,6 +48,35 @@ list_reports / get_report / list_results / get_result / submit_result / search_t
 旁路（不参与主流程）：`term_verify.py` 术语证据查证——卡在某个词的译法时取证据再裁决，
 详见 [术语查证](#术语查证先拿证据再裁决)。
 
+### 自动回路：一个任务内跑完两趟（v28.23，默认关）
+
+上面那套是手工多步（导出 → 豆包 → import → inject → 渲染）。想让**服务端在一次任务里**
+把这条回路走完（第一趟只提字 → 停下来等豆包 → 交稿后回灌 → 第二趟重渲染），把运营开关打开：
+
+```powershell
+$env:PAUSE_TRANSLATE   = "1"    # 不设 = 行为与过去完全一致（开关默认关）
+$env:PAUSE_WAIT_MINUTES = "30"  # 可选：等交稿上限（默认 30 分钟）
+python server.py
+```
+
+一个任务四个状态：`提字中 → 待译 → 回灌重渲染 → 完成`
+
+1. **提字中**：引擎收到 `PAUSE_TRANSLATE=1`，只提字、不调翻译 LLM（这一趟零翻译调用），
+   跑出的侧车由 `adopt export` 裁成 `inbox/<任务名>.txt`；
+2. **待译**：worker 停住，每 5 秒看一次 `out/<任务名>.doubao*.txt` —— 豆包用桥
+   `submit_result` 交件，或人工把译文另存成这个名字，判据相同。只认**本次任务开始之后**
+   落盘的最新一份（`out/` 里同一篇的历史交件不作数）；界面不卡，任务卡显示「待译」；
+3. **回灌重渲染**：`deliver → import → inject` 把豆包稿写进缓存（就地改写第一趟留下的骨架行），
+   服务端随后在同一任务里把开关还原成"关"重跑一遍 —— 全部命中缓存，零翻译调用；
+4. **完成**：产物就是「豆包稿 + 原版面」的中文 PDF。
+
+等不到交稿也不会卡死：到上限走 `abort()` —— 先 `adopt rollback` 撤掉骨架行，再回落成
+正常机器翻译，任务照样 `success`，产物是正常中文 PDF。
+
+> 骨架行 = 第一趟按"原文 = 译文"落下的缓存行，专门给 `inject` 一个就地改写的落点
+> （`seg_inject` 是 UPDATE-only：按"原文 + 文档作用域"找行，找不到就 FAIL，这条安全设计不能松）。
+> 全部设计取舍见 `改动记录.md` 的 v28.23 一节。
+
 ## 新手照着做：从零到一份成品 PDF（Windows）
 
 > 这一节假设你**没写过代码**。命令一律复制粘贴，在 **Anaconda Prompt** 里跑
@@ -113,14 +142,16 @@ cd D:\zotero-pdf2zh\server\warmup
 ```powershell
 cd D:\zotero-pdf2zh
 
-# 5.1 服务器侧（5 个文件）
+# 5.1 服务器侧（7 个文件）
 Copy-Item patches\server_server.py                      server\server.py -Force
 Copy-Item patches\server_utils_config.py                server\utils\config.py -Force
 Copy-Item patches\server_utils_environment_lifecycle.py server\utils\environment_lifecycle.py -Force
+Copy-Item patches\server_utils_execute.py               server\utils\execute.py -Force
+Copy-Item patches\server_utils_task_manager.py          server\utils\task_manager.py -Force
 Copy-Item patches\server_config_venv.json               server\config\venv.json -Force
 Copy-Item patches\server_requirements.txt               server\requirements.txt -Force
 
-# 5.2 翻译引擎侧（5 个文件，要落进 conda 环境里）
+# 5.2 翻译引擎侧（6 个文件，要落进 conda 环境里）
 # 注意：这条会先打印一行 "not in git repo"，那是 babeldoc 的正常提示，不是错误。
 # 因为输出里可能混入这类杂音，所以用 SITE= 标记把它从输出中挑出来。
 $site = [regex]::Match((conda run -n zotero-pdf2zh-venv python -c "import pdf2zh,os;print('SITE='+os.path.dirname(os.path.dirname(pdf2zh.__file__)))" | Out-String), 'SITE=([^\r\n]+)').Groups[1].Value.Trim()
@@ -130,13 +161,15 @@ Copy-Item patches\pdf2zh_translator.py   "$site\pdf2zh\translator.py"    -Force
 Copy-Item patches\pdf2zh_cache.py        "$site\pdf2zh\cache.py"         -Force
 Copy-Item patches\pdfminer_encodingdb.py "$site\pdfminer\encodingdb.py"  -Force
 Copy-Item patches\pdfminer_pdffont.py    "$site\pdfminer\pdffont.py"     -Force
+Copy-Item patches\pdfminer_pdfinterp.py  "$site\pdfminer\pdfinterp.py"   -Force
 ```
 
-验证补丁真的进去了（三条都应该回 `True`）：
+验证补丁真的进去了（四条都应该回 `True`）：
 
 ```powershell
 Test-Path "$site\pdf2zh\converter.py"                            # False 说明 $site 没取到
 Select-String -Path "$site\pdf2zh\translator.py" -Pattern "doc_summary_fp" -Quiet
+Select-String -Path "$site\pdfminer\pdfinterp.py" -Pattern "闸门3" -Quiet   # 字体构造兜底(缺了坏字体 PDF 会崩)
 Select-String -Path "server\server.py" -Pattern "自研补丁" -Quiet
 ```
 
@@ -240,15 +273,16 @@ python tools\appendix_species.py --pdf $out --redraw
 | 输出里出现 `not in git repo` | babeldoc 探测不到 git 版本时的正常提示，**不是错误** | 忽略 |
 | 中文全是方块字 | 字体路径没填或填错 | 回第 8 步填字体文件 |
 | `ModuleNotFoundError: No module named 'pymupdf'` | 没进 conda 环境 | 先 `conda activate zotero-pdf2zh-venv` |
-| `端口 8890 已被占用` | 上次的服务器还活着 | 任务管理器结束所有 `python` 进程；或换 `python server.py --port 8891`，插件里端口同步改 |
+| `端口 8890 已被占用` | 上次的服务器还活着 | 任务管理器结束所有 `python` 进程；或换 `python server.py --port 8891`，插件里端口同步改。**注意**：Windows 下新实例可能"报了占用却照常起来"，此时请求仍落到旧实例（旧代码 / 旧缓存）——务必先杀干净，再确认 `/api/history` 为空 |
 | 译出来跟原文一样是英文 | 请求漏了配置，静默回落到 bing | 用 `python tools\force_rerender.py --pdf <原文.pdf> --force` 重渲染 |
-| 补丁好像没生效 | 覆盖到别的环境去了 | 重跑第 5 步，用那三条 `Test-Path` / `Select-String` 验证 |
+| 补丁好像没生效 | 覆盖到别的环境去了 | 重跑第 5 步，用那四条 `Test-Path` / `Select-String` 验证 |
 
 ## 增量清单（相对上游 v4.1.7）
 
 | 文件 | 作用 |
 |---|---|
 | `patches/pdf2zh_translator.py` | 术语表按段指纹进缓存键（改词不全量失效）+ CJK 排版清理（裸花括号脱壳）等 |
+| `tools/adopt.py` | 采纳管线总调度：`export → deliver → import → inject → render → gate`，每阶段台账留有痕（`rollback` 为回路半途失败的止损坏） |
 | `tools/seg_export.py` | 侧车 → 编号段落包：字形还原、PDF 断词修复、跨页续接合并 |
 | `tools/seg_import.py` | 译文校验与回锚：编号/⋮/数字/拉丁名逐一对账 |
 | `tools/seg_inject.py` | 缓存注入：重编号 + 文档指纹作用域 + 前置断言 + 自动备份 |
@@ -256,6 +290,8 @@ python tools\appendix_species.py --pdf $out --redraw
 | `tools/force_rerender.py` | force 重渲染（防漏传 config 静默回落 bing 重译） |
 | `tools/verify_render.py` | 渲染验收：新串落页 / 旧串清零，13 项断言 |
 | `tools/post_check.py` | 翻译后质检门禁：汉化率 / 引用完整性 / 占位符残留 |
+| `tools/pre_check.py` | 翻译前体检：文献页 / 扫描页 / 字体结构风险，坏 PDF 提交前拦截 |
+| `tools/pre_render_check.py` | 渲染前预检：用译文页特征提前判文献区，FAIL 就不渲染 |
 | `tools/seams_report.py` 等 | 接缝台账 / 专项审查 / 对照实验 |
 | `tools/backfill_pages.py` | 成品回填：整页表格等"零可译段页"用原版页替换 |
 | `tools/relink_pages.py` | 链接热区重定位：译文重排后把链接框搬到锚文本新位置 |
@@ -288,6 +324,8 @@ python tools\appendix_species.py --pdf $out --redraw
 | `patches/server_server.py` | `server/server.py` |
 | `patches/server_utils_config.py` | `server/utils/config.py` |
 | `patches/server_utils_environment_lifecycle.py` | `server/utils/environment_lifecycle.py` |
+| `patches/server_utils_execute.py` | `server/utils/execute.py` |
+| `patches/server_utils_task_manager.py` | `server/utils/task_manager.py` |
 | `patches/server_config_venv.json` | `server/config/venv.json` |
 | `patches/server_requirements.txt` | `server/requirements.txt` |
 | `patches/pdf2zh_converter.py` | 虚拟环境 `site-packages/pdf2zh/converter.py` |
@@ -295,6 +333,7 @@ python tools\appendix_species.py --pdf $out --redraw
 | `patches/pdf2zh_cache.py` | 虚拟环境 `site-packages/pdf2zh/cache.py` |
 | `patches/pdfminer_encodingdb.py` | 虚拟环境 `site-packages/pdfminer/encodingdb.py` |
 | `patches/pdfminer_pdffont.py` | 虚拟环境 `site-packages/pdfminer/pdffont.py` |
+| `patches/pdfminer_pdfinterp.py` | 虚拟环境 `site-packages/pdfminer/pdfinterp.py` |
 | `patches/PROTOCOL.md` | **不是覆盖文件**：`{vN}` 占位符协议契约，改动前必读 |
 
 > 为什么要打补丁：上游 v4.1.7 的公式保护参数、中文字体路径与配置写入方式，默认状态下在 Windows 本地环境不能正常工作（逐项原理见 `改动记录.md` 第一节与第二节）。又因为上游升级会覆盖这些改动，本仓库同时关闭了上游的自动更新通道——因此**升级上游前请先读 `patches/PROTOCOL.md` 与 `改动记录.md` 第四节的更新决策流程**。
@@ -493,6 +532,10 @@ python tools\term_verify.py <清单.md> --source all               # 全源合�
 - OpenAlex 是**按 IP 限流**的：配额耗尽时（实测 `Retry-After` 给到 ≈15.8 小时）它会被自动剔除，
   报告头会写明服务器要求的等待时间；此时 `zotero` 源照常可用。配 `OPENALEX_EMAIL` 只影响
   礼貌池，**解决不了配额耗尽**
+- **自动回路中途被强杀**（`PAUSE_TRANSLATE=1` 正在等交稿时直接关掉服务器 / 结束进程）：
+  第一趟落下的骨架行会留在缓存里，下次正常渲染会命中它 → 产物是英文。撤掉即可：
+  `python tools\adopt.py rollback --name <任务名> --pdf <原文.pdf>`
+  （只删"原文 = 译文"的骨架行，不会误删真译文）
 
 ## 许可与致谢
 
