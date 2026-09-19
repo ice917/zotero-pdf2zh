@@ -367,6 +367,9 @@ def stage_deliver(args):
             return die("交件件不唯一, 请用 --text 显式指定要采纳的那一份(拿错整轮白干)")
         path = cand[0]
         print("[adopt] 交件件(唯一候选): %s" % path)
+        # 自动认领这条路也要把正文读进来: 下面所有门禁(段号守恒/断点对账)都吃 text
+        with open(path, encoding="utf-8-sig") as f:
+            text = f.read()
 
     # 段号守恒 —— 回锚对齐的前提, 也是"豆包是否漏译/多译"的第一道判据
     got = SI.parse_blocks(text)
