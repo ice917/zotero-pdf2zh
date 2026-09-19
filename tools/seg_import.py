@@ -8,6 +8,9 @@
   4. 回锚: 对每段按侧车 raw 的 {vN} 原序, 在译文中定位字形值 -> 还原为 {vN}
      高价值字形 (含字母/数字) 找不到 -> FAIL; 纯标点找不到 -> 丢弃并记提示
   5. 产出 out/<name>.imported.json: {(page,seg): 带{vN}的译文} + 校验报告
+  6. FAIL 时落一份**给豆包的返工单**到 inbox/<name>.rework.md(桥的 list_inbox /
+     get_payload 直接读得到): 每条写明 真实页码 + #S编号 + 缺的字符 + 原文上下文,
+     用户不必去理解控制台里的内部坐标; PASS 时把旧单子删掉, 免得读到过期结论。
 
 用法:
   python tools/seg_import.py --manifest inbox\\payload_p2_p4.manifest.json --clip
@@ -26,9 +29,13 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 SIDECAR = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow", "latest.jsonl")
 PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
 OUTDIR = os.path.join(PROJ, "out")
+INBOX = os.environ.get("P2Z_INBOX", os.path.join(PROJ, "inbox"))
 
 KEY_LINE = re.compile(r"^\s*#?\**\s*S(\d+)\s*\**\s*$")
 V_TOKEN = re.compile(r"\{v(\d+)\}")
+
+REWORK_SUFFIX = ".rework.md"
+GLYPH_CTX = 60          # 返工单里原文上下文的半宽(按**还原后**字符数)
 
 
 def load_sidecar_pages(sidecar):
@@ -41,6 +48,139 @@ def load_sidecar_pages(sidecar):
             o = json.loads(line)
             pages[o["page"]] = o
     return pages
+
+
+def part_true_page(part, o):
+    """这一段的**真实 PDF 页码**(1 基)。
+
+    导出时已把 true_page 算好写进清单(与 seg_export.true_page 同一口径); 老清单
+    没有这个字段就退回落 pageid(LTPage.pageid, 0 基); 老侧车连 pageid 都没有, 才
+    退回侧车的回调计数 —— 那是**内部坐标**, 拿它当页码会指向不存在的页(实测
+    Padmaprabhan 全文 6 页, 侧车坐标却是 9, 门禁报"p9#4"用户根本找不到)。
+    """
+    if part.get("true_page") is not None:
+        return int(part["true_page"])
+    if o is not None and o.get("pageid") is not None:
+        return int(o["pageid"]) + 1
+    return int(part["page"])
+
+
+def restore_with_spans(raw, vv):
+    """raw -> (还原后文本, {字形号: [(起, 止), ...]})。
+
+    还原口径与 seg_export 一致({vN} -> vars[str(N)]), 但额外记下每个字形在**还原后**
+    文本里的位置 —— 返工单要按还原后的文字切片引用原文, 直接切 raw 会把 {v29}
+    切成 {v2 这种半截货。
+    """
+    out, spans, cur, i = [], {}, 0, 0
+    for m in V_TOKEN.finditer(raw):
+        out.append(raw[i:m.start()])
+        cur += m.start() - i
+        val = str((vv or {}).get(m.group(1), m.group(0)))
+        spans.setdefault(m.group(1), []).append((cur, cur + len(val)))
+        out.append(val)
+        cur += len(val)
+        i = m.end()
+    out.append(raw[i:])
+    return "".join(out), spans
+
+
+def glyph_context(raw, vv, vn, width=GLYPH_CTX):
+    """原文里字形 vn 所在处的前后文(字形已还原), 供返工单引用。
+
+    同一字形号在段里可能出现多次, 取第一处 —— 返工单是给人和豆包的**线索**,
+    不是判据本身。
+    """
+    txt, spans = restore_with_spans(raw, vv)
+    hit = spans.get(str(vn))
+    if not hit:
+        return ""
+    s, e = hit[0]
+    lo, hi = max(0, s - width), min(len(txt), e + width)
+    return ("…" if lo > 0 else "") + txt[lo:hi] + ("…" if hi < len(txt) else "")
+
+
+# 返工单的固定段落。放在模块级是为了让 test 能直接断言措辞(它是**给豆包看的合同**)。
+REWORK_INTRO = """# 返工单 —— {name}
+
+这份单子是 `tools/seg_import.py` 自动生成的, 用来替代门禁控制台里的原始报错:
+控制台报的是工具内部坐标(如 `p9#4`), 这里报的是**真实页码 + 段落编号**。
+
+**只改下面点到的段**; 没点到的段请逐字符照抄你上一版, 不要顺手改动 ——
+整篇重译会重新掷一次公式块与编号的骰子(v28.6 实测: 266 段里 206 段被动过)。
+
+门禁判定: FAIL —— {count}
+"""
+
+REWORK_WHY = """## 一、必须改
+
+**共同原因**：版面里这些字符是独立的字形对象，译文里不出现它就**没有落点**，
+渲染这一处会出错，所以门禁直接判 FAIL。
+**共同修法**：把它**原样写回**（数字/字母照抄，不要改写成「三维」「二维」这类中文说法）；
+紧邻的字母/数字一起照抄；公式片段整块照抄、中文放在块外（见任务包规则 2、7）。
+"""
+
+
+def write_rework_note(man, src, report, detail):
+    """FAIL 时写"给豆包的返工单" -> inbox/<name>.rework.md, 返回路径(不写返回 "")。
+
+    `report` 是控制台那串校验行(FAIL/提示), `detail` 是回锚失败的结构化明细。
+    两类分开渲染: 回锚失败能给出"缺哪个字符 + 原文哪一处"(豆包看不见字形占位符
+    背后的东西, 这正是它需要的线索); 其余 FAIL 原样转述。
+    """
+    name = man.get("name") or os.path.basename(src).replace(".manifest.json", "")
+    if not name:
+        return ""
+    fails_anchor = {d["line"] for d in detail}
+    other_fails = [r for r in report if r.startswith("FAIL") and r not in fails_anchor]
+    hints = [r for r in report if r.startswith("提示")]
+    keys = [int(str(it["key"]).lstrip("S")) for it in man.get("items", [])]
+
+    # 计数行只在**真有回锚失败**时才报数; 缺段/断点类 FAIL 没有"处数"可数, 硬写
+    # "需返工 0 段"会让人以为单子发错了(实测反复出现)。
+    if detail:
+        count = "需返工 %d 段 / %d 处字符没有落点" % (
+            len(detail), sum(len(d["fails"]) for d in detail))
+    else:
+        count = "见下面「其他门禁失败」一节"
+
+    L = [REWORK_INTRO.format(name=name, count=count).rstrip()]
+    if detail:
+        L.append("")
+        L.append(REWORK_WHY.rstrip())
+        for d in detail:
+            L.append("")
+            L.append("### #S%d（第 %d 页）" % (d["key"], d["tp"]))
+            L.append("- 缺的字符: %s" % "、".join("`%s`" % v for _vn, v in d["fails"][:8]))
+            for vn, _val in d["fails"][:4]:
+                ctx = glyph_context(d["raw"], d["vv"], vn)
+                if ctx:
+                    L.append("- 原文里它在哪: %s" % ctx)
+    # 小节编号随实际出现的小节走: 只写"一、必须改"和"三、不必改"、中间空着"二"，
+    # 读的人会以为单子缺了一节。
+    sections = []
+    if other_fails:
+        sections.append(("其他门禁失败（编号 / 分页断点 / 空段）",
+                         ["- %s" % r for r in other_fails]))
+    if hints:
+        sections.append(("不必改（工具已自动处理，别动）",
+                         ["- %s" % r for r in hints]))
+    for n, (title, lines) in enumerate(sections, 1 if not detail else 2):
+        L.append("")
+        L.append("## %s、%s" % ("一二三四五"[n - 1], title))
+        L.extend(lines)
+    L.append("")
+    L.append("## 交件")
+    L.append("- 交件名: `%s.doubao*.txt`（递增，别覆盖上一版）" % name)
+    L.append("- 段号必须 #S1–#S%s 连续无缺。" % (max(keys) if keys else "?"))
+    L.append("- 没点到的段逐字符照抄上一版。")
+    L.append("")
+
+    os.makedirs(INBOX, exist_ok=True)
+    path = os.path.join(INBOX, name + REWORK_SUFFIX)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(L))
+    return path
 
 
 def get_clipboard():
@@ -244,7 +384,7 @@ def main():
 
     want = {it["key"]: it for it in man["items"]}
     got = {int(k): v for k, v in blocks.items()}
-    report, ok = [], True
+    report, ok, detail = [], True, []
 
     # ---- 编号对账 (统一为整数) ----
     want_ids = {int(str(k).lstrip("S")) for k in want}
@@ -280,10 +420,14 @@ def main():
             report.append("FAIL #S%d 译文为空" % key)
             continue
         # 回锚
-        for (pg, seg), seg_zh in zip([(p["page"], p["seg"]) for p in it["parts"]], parts_zh):
+        for p, seg_zh in zip(it["parts"], parts_zh):
+            pg, seg = p["page"], p["seg"]
             o = pages[pg]
             vv = o.get("vars") or {}
             raw = o["segs"][seg].get("raw") or ""
+            # 报错一律用**真实页码 + #S编号**: 控制台是给人看的, 而内部坐标(p9#4)
+            # 在一篇 6 页的论文上指向不存在的页, 用户读不懂也搜不到。
+            loc = "#S%d（第%d页）" % (key, part_true_page(p, o))
             if not V_TOKEN.search(raw):
                 imported["%d#%d" % (pg, seg)] = seg_zh
                 continue
@@ -291,14 +435,17 @@ def main():
             imported["%d#%d" % (pg, seg)] = fixed
             if fails:
                 ok = False
-                report.append("FAIL p%d#%d 高价值字形未回锚: %s" % (
-                    pg, seg, ["{v%s}=%r" % f for f in fails[:8]]))
+                line = "FAIL %s 高价值字形未回锚: %s" % (
+                    loc, ["{v%s}=%r" % f for f in fails[:8]])
+                report.append(line)
+                detail.append({"key": key, "tp": part_true_page(p, o), "line": line,
+                               "raw": raw, "vv": vv, "fails": fails})
             if drops:
-                report.append("提示 p%d#%d 纯标点字形丢弃 %d 个: %s" % (
-                    pg, seg, len(drops), [d[1] for d in drops[:6]]))
+                report.append("提示 %s 纯标点字形丢弃 %d 个: %s" % (
+                    loc, len(drops), [d[1] for d in drops[:6]]))
             if notes:
-                report.append("提示 p%d#%d 歧义锚定 %d 个(取最近, 需复查): %s" % (
-                    pg, seg, len(notes),
+                report.append("提示 %s 歧义锚定 %d 个(取最近, 需复查): %s" % (
+                    loc, len(notes),
                     ["{v%s}=%r x%d" % n for n in notes[:6]]))
 
     os.makedirs(OUTDIR, exist_ok=True)
@@ -306,11 +453,24 @@ def main():
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(imported, f, ensure_ascii=False, indent=1)
 
+    # 返工单: FAIL 时写一份给豆包(桥读得到), PASS 时把旧单子删掉 ——
+    # 留着过期单子比没有更糟: 豆包会照它改已经改好的段。
+    name = man.get("name") or os.path.basename(args.manifest).replace(".manifest.json", "")
+    note = os.path.join(INBOX, name + REWORK_SUFFIX)
+    if ok:
+        if os.path.exists(note):
+            os.remove(note)
+    else:
+        note = write_rework_note(man, args.manifest, report, detail) or note
+
     print("--- 校验报告 ---")
     for r in report:
         print(r)
     print("回锚段数: %d" % len(imported))
     print("产出: %s" % out_json)
+    if not ok:
+        print("返工单: %s" % note)
+        print("        (给豆包的: 让它 list_inbox / get_payload 读这个文件, 按上面点到的段改)")
     print("结论: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

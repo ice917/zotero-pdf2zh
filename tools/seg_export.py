@@ -8,7 +8,8 @@
   2. 过滤纯字形段 (页眉/页码/整页表格 = {vN} 组成, 无可译文字)
   3. 还原字形: {vN} -> vars[str(N)], 让豆包看到真实数字/拉丁名
   4. 检测跨页续接 (上段尾无句末标点 + 下段首小写) -> 合并为一条, 原断点插 ⋮
-  5. 输出 payload 文件 (#S 编号行) + manifest.json (编号 -> 页/段映射)
+  5. 输出 payload 文件 (#S 编号行) + manifest.json (编号 -> 页/段映射;
+     每条 part 同时记 page=侧车内部坐标 与 true_page=真实 PDF 页码)
 
 用法 (--pages 是**真实 PDF 页码**, 与质检/体检报告同一口径; v28.10 起):
   python tools/seg_export.py --pages 2-4 --name payload_p2_p4 \
@@ -238,7 +239,11 @@ def main():
         manifest["items"].append({
             "key": it["key"],
             "merged": it["merged"],
-            "parts": [{"page": pg, "seg": idx} for pg, idx, _t, _tp in it["parts"]],
+            # page 是**侧车内部坐标**(回调计数), imported.json / seg_inject 沿用它;
+            # true_page 是**真实 PDF 页码**(给人看、给报告用)。两者都留着, 是为了让
+            # 下游(seg_import 的报错与返工单)不必再自己重算一遍 pageid 口径。
+            "parts": [{"page": pg, "seg": idx, "true_page": tp}
+                      for pg, idx, _t, tp in it["parts"]],
         })
 
     os.makedirs(INBOX, exist_ok=True)
