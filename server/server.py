@@ -26,6 +26,7 @@ import sys  # 用于退出脚本
 import re   # 用于解析版本号和提取错误信息
 import io
 import glob    # [v28.23] 等豆包交件落盘(out/<name>.doubao*.txt)
+import hashlib  # [v28.26] 按 PDF 内容散列定位本轮的归档侧车(提字进度源)
 import socket  # 用于端口检查
 import time    # 用于 SSE 推送间隔
 import threading
@@ -65,6 +66,107 @@ def _two_pass_wait_minutes():
     except ValueError:
         v = 30.0
     return max(0.0, v)
+
+
+def _inbox_dir():
+    """inbox 落点: 与 adopt.py / seg_export.py / doubao_bridge.py 同一套约定
+    (P2Z_INBOX 优先)。没设时用**本文件所在项目**的相对位置, 不焊死盘符。"""
+    env = os.environ.get("P2Z_INBOX")
+    if env:
+        return env
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "inbox")
+
+
+def _segflow_doc_sidecar(pdf_path):
+    """[v28.26] 定位本轮的**按文档归档侧车** (~/.cache/pdf2zh/segflow/pdf-<md5>.jsonl)。
+
+    为什么不用 latest.jsonl: 那是全局单文件, 换论文就覆盖; 并发/重跑时读到的
+    可能是别人的进度。散列口径与 converter._segflow_paths() 逐字节一致(整份
+    PDF 的 md5 前 16 位), 所以两边指的一定是同一份文件。
+    """
+    try:
+        h = hashlib.md5()
+        with open(pdf_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    p = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow",
+                     "pdf-%s.jsonl" % h.hexdigest()[:16])
+    return p if os.path.exists(p) else ""
+
+
+def _segflow_progress(sidecar):
+    """[v28.26] 读侧车得 (已提取段数, 已到第几页) —— 引擎逐页追加, 文件即真相。
+
+    为什么拿文件当进度源, 不信现成的进度解析: 那套解析依赖①抓控制台屏幕缓冲区
+    或②launch.ps1 重定向出来的日志尾; 在 IDE 终端里两者都拿不到, 卡片会永远停在
+    "正在初始化 0%"(实测 2026-09-19 23:47: 引擎已 16/81, /api/tasks 仍是 0%)。
+    侧车由引擎自己每页写, 与"服务端跑在哪种终端里"完全无关。
+
+    侧车格式: **一行 = 一页**, 记录形如 {page, pageid, doc_fp, segs:[{raw,trans}…]}
+    —— 段数必须数 segs 的长度, 不能数行数(行数=页数, 实测 22 行对应 350 段)。
+    页数取 pageid(LTPage.pageid, 0 基): 侧车的 page 是回调计数, 图形对象也各占一号,
+    拿它当页码会漂。
+    """
+    segs = pages = 0
+    try:
+        with open(sidecar, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except ValueError:
+                    continue
+                segs += len(o.get("segs") or [])
+                pid = o.get("pageid")
+                if pid is not None:
+                    pages = max(pages, int(pid) + 1)
+    except OSError:
+        return 0, 0
+    return segs, pages
+
+
+def _notify_payload_ready(task_id, name, pages_str):
+    """[v28.26] 载荷就绪 → 响铃 + 醒目横幅 + ready 标记 + 卡片落到「待译」。
+
+    为什么要有声音: 提字这趟不走 LLM, 比机器翻译快一个量级, 人一转头的功夫就过去
+    了; 而"文件已生成、该叫豆包了"是这条链上唯一需要人**立刻**接手的时刻。
+    声音之外再落一个 ready 标记: "响过了但当时没人"时仍可追溯这份载荷是哪一轮的。
+    """
+    n_items = 0
+    try:
+        with open(os.path.join(_inbox_dir(), name + ".manifest.json"), encoding="utf-8") as f:
+            n_items = len(json.load(f).get("items") or [])
+    except Exception:
+        pass
+    try:
+        os.makedirs(_inbox_dir(), exist_ok=True)
+        with open(os.path.join(_inbox_dir(), name + ".ready.json"), "w", encoding="utf-8") as f:
+            json.dump({"name": name, "segments": n_items, "pages": pages_str,
+                       "ready_at": datetime.now().isoformat(timespec="seconds")},
+                      f, ensure_ascii=False, indent=1)
+    except OSError as e:
+        print(f"⚠️ [两趟] ready 标记没落成: {e}")
+
+    print("\n" + "=" * 68)
+    print("🔔 [两趟] 载荷已就绪：inbox/%s.txt  (%d 段 / 覆盖 %s 页)" % (name, n_items, pages_str))
+    print("        下一步：把这份载荷交给豆包定稿 (豆包可用桥的 get_payload 直接取)")
+    print("=" * 68 + "\n")
+    try:                        # Windows 本地响铃; 无声卡/被禁用时静默跳过
+        import winsound
+        for _ in range(3):
+            winsound.Beep(880, 160)
+            time.sleep(0.07)
+    except Exception:
+        pass
+    task_manager.update_task(task_id, {
+        'status': '待译',
+        'message': '待译：载荷已就绪（%d 段 / 覆盖 %s 页），等待豆包交稿' % (n_items, pages_str),
+    })
 
 
 def _adopt_run_name(pdf_path):
@@ -1116,16 +1218,40 @@ class PDFTranslator:
             'message': '第一趟：提取全篇原文（不翻译、不写缓存）',
         })
         os.environ["PAUSE_TRANSLATE"] = "1"
+        # [v28.26] 提字进度: 侧车逐页追加 → 每 3 秒把"第几页/几段"写到卡片上。
+        # 引擎那套进度解析要靠①抓控制台或②launch.ps1 的日志尾, IDE 终端里两样都
+        # 没有(实测卡在 0%); 侧车是引擎自己写的文件, 拿它当进度源与终端形态无关。
+        sidecar = _segflow_doc_sidecar(os.path.abspath(input_path))
+        stop_watch = threading.Event()
+
+        def _watch():
+            while not stop_watch.wait(3):
+                # 重跑同一篇时旧侧车还在, 首页处理时会把它**截断**重写; 等它新起来
+                # 再读, 否则开头几秒会把上一轮的"第 20 页 / 350 段"当成这一轮的进度。
+                try:
+                    if os.path.getmtime(sidecar) < t_start:
+                        continue
+                except OSError:
+                    continue
+                segs, pages = _segflow_progress(sidecar)
+                if not segs:
+                    continue
+                task_manager.update_task(task_id, {
+                    'status': '提字中',
+                    'message': ('提字中：第 %d/%d 页 · 已提取 %d 段（不翻译、不写缓存）'
+                                % (pages, total_pages, segs)) if total_pages else
+                               ('提字中：已提取 %d 段（不翻译、不写缓存）' % segs),
+                    'progress': min(99, int(pages * 100 / total_pages)) if total_pages else 0,
+                })
+
+        threading.Thread(target=_watch, daemon=True).start()
         try:
             self.translate_pdf(input_path, config, task_id)
         finally:
+            stop_watch.set()
             os.environ.pop("PAUSE_TRANSLATE", None)
 
         # ---- 侧车 -> inbox 载荷（豆包要的整篇）----
-        task_manager.update_task(task_id, {
-            'status': '待译',
-            'message': '待译：全篇原文已提取，等待豆包交稿',
-        })
         rc, out = _run_tool("adopt.py", [
             "export", "--name", name,
             "--pages", f"1-{total_pages}" if total_pages else "1-1",
@@ -1133,6 +1259,9 @@ class PDFTranslator:
         ])
         if rc != 0:
             return abort(f"载荷导出失败(rc={rc})：{out[-400:]}")
+        # [v28.26] 「待译」搬到 export **成功之后**再置: 以前是引擎一跑完就报待译,
+        # 而那份"待译"可能对应一次失败的导出 —— 卡片会撒谎(载荷还没落盘就叫人来交稿)。
+        _notify_payload_ready(task_id, name, f"1-{total_pages}" if total_pages else "1")
 
         # ---- 等豆包交稿 ----
         delivered = self._wait_for_doubao_delivery(task_id, name, wait_min, t_start)
