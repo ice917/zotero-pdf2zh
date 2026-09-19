@@ -3,7 +3,7 @@
 tools/post_check.py —— 翻译后质检门禁（零 API 成本，只读）
 
 模块职责：
-  翻译完成后，将 mono 译文与原始 PDF 逐页对比，执行四项自动断言，
+  翻译完成后，将 mono 译文与原始 PDF 逐页对比，执行五项自动断言，
   把"翻车但没人发现"变成"翻车自动报警"。断言项（参照 BabelDOC
   ACL 2026 论文的 Untranslated Blocks 质检指标设计）：
 
@@ -17,6 +17,11 @@ tools/post_check.py —— 翻译后质检门禁（零 API 成本，只读）
                      作者-年份制条目密集，判据见 REF_DENSITY）
                      在译文中被中文化（人名/期刊名/标题被翻成中文）
                      → 学术文献表不可用。文献条目必须整条原样保留。
+    5. 渲染残渣      译文中出现"原文整篇都没有的"标签残渣（如渲染层
+                     内部标记 </style…>、<span class=…> 被当页面文字
+                     画了出来）→ 读者会直接在版面上看到这些字符。
+                     判据见 RESIDUE_TAG / check_residue：**差分**判定，
+                     正文里合法出现的 <EOS> 这类裸 token 名不算残渣。
 
   特别处理：参考文献条目按规定整条保持英文，所以"文献页译文汉字为零"
   是预期结果而非翻译失败——断言4 反向把关（条目里出现汉字才算事故），
@@ -100,6 +105,26 @@ PLACEHOLDER = re.compile(r"\{v\d+\}")   # pdf2zh 公式占位符 {v1} {v2} ...
 REF_ENTRY = re.compile(r"(?m)^\s*\[\d{1,3}\]")
 CITE_ANY = re.compile(r"\[\d{1,3}\]")
 CJK = re.compile(r"[\u4e00-\u9fff]")
+# [自研补丁 2026-09-19] 第五断言(渲染残渣)口径。
+# 事故: 官方 BabelDOC 2.9.0 的产物第 2 页真印出了 `</style\x01id='25'>`
+# (16 个码点, 中间夹控制符 U+0001) —— IL(行间注)标签没被回填, 就被当成
+# 页面文字画了出来。我方 13 篇既有产物(含 34 页专著)扫描 0 处, 故判据可上线。
+#
+# 只认三类"标签形态", **刻意排除** <EOS>/<pad> 这类裸 token 名 —— 后者在
+# NLP 论文正文里合法出现(Vaswani 原文 30 处), 算成残渣就是误伤。
+# 又因为"原文自己就有"的标签形态同样可能是正文内容(讲标记语言的论文),
+# 故最终判据是**差分**: 只报"译文有、而原文整篇没有"的形态。
+# 归一化后比对(去空白与控制符, 见 RESIDUE_BLANK), 以防渲染把属性里的空白/
+# 控制符换掉后绕过同形判断。
+#
+# 反面教训(实测): "控制符出现在译文即 FAIL"这条更简单的判据**不可用** ——
+# 控制符是字体子集/编码的抽取产物, 原文自己就有(Proximity 原文 576 处;
+# Zhang 原文 73 处 = 译文 73 处; Wang 原文 0 → 译文 18), 会把我方合格产物
+# 大面积误判为 FAIL。
+RESIDUE_TAG = re.compile(r"</[A-Za-z][A-Za-z0-9]{0,24}[^<>]{0,60}>"
+                         r"|<[A-Za-z][A-Za-z0-9]{0,24}[^<>]{0,60}=[^<>]*>"
+                         r"|<[A-Za-z][A-Za-z0-9]{0,24}[^<>]{0,60}/>")
+RESIDUE_BLANK = re.compile(r"[\s\x00-\x1f\x7f]+")
 
 
 def project_root():
@@ -149,6 +174,17 @@ def count_zh_ay_blocks(text):
     return n
 
 
+def page_residues(text):
+    """该页出现的"标签残渣"形态（归一化后），供第 5 断言做差分比对。
+
+    [自研补丁 2026-09-19] 归一化只去空白与控制符：判据关心的是"哪种标签
+    形态出现在这里"，属性里的空白/控制符差异（渲染可能改写）不该让同一种
+    形态被当成两种。
+    """
+    return [RESIDUE_BLANK.sub("", m.group(0))
+            for m in RESIDUE_TAG.finditer(text)]
+
+
 def text_features(text, page_no):
     """由一段"页文本"算质检特征。
 
@@ -162,7 +198,7 @@ def text_features(text, page_no):
             "ref_entries": 0, "ref_density": 0.0,
             "ref_ay_entries": 0, "ref_ay_density": 0.0,
             "ref_zh_blocks": 0, "ref_zh_blocks_ay": 0,
-            "placeholders": 0, "error": None}
+            "placeholders": 0, "residues": [], "error": None}
     feat["chars"] = len(text.strip())
     feat["cjk"] = len(CJK.findall(text))
     feat["alnum"] = len(re.findall(r"[A-Za-z0-9]", text))
@@ -176,6 +212,7 @@ def text_features(text, page_no):
     feat["ref_zh_blocks"] = count_zh_ref_blocks(text)
     feat["ref_zh_blocks_ay"] = count_zh_ay_blocks(text)
     feat["placeholders"] = len(PLACEHOLDER.findall(text))
+    feat["residues"] = page_residues(text)
     return feat
 
 
@@ -238,9 +275,48 @@ def check_ref_zh(orig_feats, trans_feats):
     return []
 
 
+def check_residue(orig_feats, trans_feats):
+    """第 5 断言「渲染残渣」→ 返回 findings 列表。
+
+    [自研补丁 2026-09-19] 缘起：官方 BabelDOC 2.9.0 隔离评估时，产物第 2 页
+    真印出了 `</style\\x01id='25'>`，而当时那四项断言**全都抓不到** ——
+    汉化率只看"汉字够不够"，引用/占位符/文献区都不看这类标记。
+
+    判据是**差分**而非绝对计数：先收集原文整篇出现过的标签形态，再报"译文有
+    而原文没有"的那些。原因是标签形态本身可能就是正文内容 —— NLP 论文里的
+    `<EOS>`/`<pad>`（Vaswani 原文 30 处）、讲标记语言的论文里的 `<div class=…>`
+    都会合法出现，绝对计数会把它们判成事故。
+    实测分离度：Vaswani 原文 30 处 / 我方译文 2 处（差分负）→ 不触发；
+    官方该篇原文 0 处 / 官方译文 1 处（差分正）→ 触发。
+    """
+    known = set()
+    for f in orig_feats:
+        if not f["error"]:
+            known.update(f["residues"])
+    pages, samples, total = [], [], 0
+    for t in trans_feats:
+        if t["error"]:
+            continue
+        novel = [r for r in t["residues"] if r not in known]
+        if novel:
+            total += len(novel)
+            pages.append(t["page"])
+            samples.extend(novel)
+    if pages:
+        uniq = sorted(set(samples))
+        shown = "、".join(f"`{s}`" for s in uniq[:5])
+        more = f"等 {len(uniq)} 种" if len(uniq) > 5 else ""
+        return [(
+            "高", f"第{','.join(map(str, pages))}页",
+            f"渲染残渣断言失败：译文出现 {total} 处原文中不存在的标签/内部标记"
+            f"残渣（{shown}{more}）—— 渲染层把内部标记当成页面文字画了出来，"
+            "读者会直接在版面上看到这些字符")]
+    return [("通过", "全文", "渲染残渣检查通过：译文未出现原文之外的标签残渣")]
+
+
 def run_checks(orig_feats, trans_feats, skip_last=0):
     """
-    四项断言。返回 (findings, verdict)
+    五项断言。返回 (findings, verdict)
       findings: [(级别, 页码或全局, 描述), ...]  级别: 高/中/提示/通过
       verdict:  "PASS" / "FAIL"
       skip_last: 任务实际配置的 skipLastPages(由服务端传入); 仅末尾连续
@@ -346,6 +422,11 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
     # 代码 —— 前移这道闸门见 tools/pre_render_check.py。
     findings.extend(check_ref_zh(orig_feats, trans_feats))
 
+    # ---------- 5. 渲染残渣 ----------
+    # [自研补丁 2026-09-19] 判据与事故背景见 check_residue / RESIDUE_TAG。
+    # 差分口径（只报原文整篇没有的形态），故不会误伤正文里合法的 <EOS> 等。
+    findings.extend(check_residue(orig_feats, trans_feats))
+
     # ---------- 页数一致性 ----------
     if len(orig_feats) != len(trans_feats):
         findings.append((
@@ -387,6 +468,9 @@ def build_report(mono_path, orig_path, n_pages, findings, verdict, skip_last=0):
               f"制条目密度 ≥ {REF_DENSITY} 条/千字）的条目在译文中被翻成中文即失败"
               "（人名/标题/期刊名必须原样保留）；反之文献页译文无汉字属预期，"
               "不计入汉化率断言",
+              "5. **渲染残渣**：译文出现原文整篇都没有的标签残渣（渲染层"
+              "内部标记如 `</style…>` 被当成页面文字画了出来）即失败；"
+              "与原文同形的标签（如 NLP 论文正文里的 `<EOS>`）不算",
               "", "---", "",
               "> 由 tools/post_check.py 自动生成，阈值可在文件头部常量区调整。"]
     return "\n".join(lines)
