@@ -679,9 +679,15 @@ def main():
 
     p = sub.add_parser("gate", help="6 渲染验收 + 翻译质检 (双 PASS)")
     common(p)
-    p.add_argument("--expect", nargs="+", default=[], metavar="TEXT",
-                   help="期望落页的新串 (必须至少一条; 缺了无法证明'改了缓存且真落到页上')")
-    p.add_argument("--forbid", nargs="*", default=[], help="期望消失的旧串")
+    # action="extend" 不可省: 纯 nargs="+" 时 argparse 对**重复出现**的选项是
+    # "后者覆盖前者"(不是追加), 于是 `--expect A --expect B --expect C` 只剩 C,
+    # 验收静默变成只查一条 —— 实测 2026-09-19 CLAP 收口出现 "通过 1 / 共 1"。
+    # extend 让 `--expect A B` 与 `--expect A --expect B` 两种写法都累加。
+    p.add_argument("--expect", nargs="+", action="extend", default=[], metavar="TEXT",
+                   help="期望落页的新串 (必须至少一条; 缺了无法证明'改了缓存且真落到页上');"
+                        " 可写 --expect A B 或 --expect A --expect B, 两者等价且可混用")
+    p.add_argument("--forbid", nargs="*", action="extend", default=[],
+                   help="期望消失的旧串 (同样支持重复出现累加)")
     p.add_argument("--mono", default="", help="mono 译文; 缺省取 render 登记的产物")
     p.add_argument("--skip-last", type=int, default=None,
                    help="末尾保留页豁免数; 缺省沿用 render 阶段实际用的值(原本缺省 0, "

@@ -91,8 +91,13 @@ def _fmt(hl) -> str:
 def main() -> int:
     ap = argparse.ArgumentParser(description="渲染层验收: 新串落页 / 旧串清零")
     ap.add_argument("--pdf", default="", help="默认取 server/translated 最新 *-mono.pdf")
-    ap.add_argument("--expect", nargs="+", default=[], help="期望出现的串 (0 命中 -> FAIL)")
-    ap.add_argument("--forbid", nargs="+", default=[], help="期望消失的串 (>0 命中 -> FAIL)")
+    # action="extend": 纯 nargs="+" 时重复出现的选项是"后者覆盖前者", `--expect A
+    # --expect B` 会只剩 B(静默漏验)。extend 让 `--expect A B` / `--expect A
+    # --expect B` 两种写法都累加 —— 见 test_adopt ㉓。
+    ap.add_argument("--expect", nargs="+", action="extend", default=[],
+                    help="期望出现的串 (0 命中 -> FAIL); 可重复给或一次给多个")
+    ap.add_argument("--forbid", nargs="+", action="extend", default=[],
+                    help="期望消失的串 (>0 命中 -> FAIL); 同样支持重复累加")
     args = ap.parse_args()
 
     pdf = args.pdf or latest_mono()
