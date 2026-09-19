@@ -88,6 +88,10 @@ def main():
     ap = argparse.ArgumentParser(description="force 重渲染(缓存手术后落产物)")
     ap.add_argument("--pdf", required=True, help="原文 PDF 绝对路径")
     ap.add_argument("--service", default=PLUGIN_CONFIG["service"])
+    ap.add_argument("--skip-last", type=int, default=0,
+                    help="末尾保留页数(原样不译); 与 pre_check 推荐的 skipLastPages 同口径, "
+                         "也要跟 Zotero 插件里该任务设的「最后几页跳过翻译」一致 —— "
+                         "否则产出的 PDF 与用户实际拿到的那份不是同一份")
     ap.add_argument("--force", dest="force", action="store_true", default=True)
     ap.add_argument("--no-force", dest="force", action="store_false",
                     help="走正常去重(不加急)")
@@ -106,6 +110,7 @@ def main():
 
     cfg = dict(PLUGIN_CONFIG)
     cfg["service"] = args.service
+    cfg["skipLastPages"] = int(args.skip_last)
     cfg["force"] = bool(args.force)
     name = os.path.basename(pdf)
     cfg["fileName"] = name
@@ -113,8 +118,9 @@ def main():
         cfg["fileContent"] = base64.b64encode(f.read()).decode("ascii")
 
     t0 = time.time()
-    print("提交: %s (force=%s, service=%s, %d 字节)"
-          % (name, args.force, args.service, os.path.getsize(pdf)))
+    print("提交: %s (force=%s, service=%s, skipLastPages=%d, %d 字节)"
+          % (name, args.force, args.service, cfg["skipLastPages"],
+             os.path.getsize(pdf)))
     try:
         resp = post_json("/translate", cfg)
     except urllib.error.HTTPError as exc:

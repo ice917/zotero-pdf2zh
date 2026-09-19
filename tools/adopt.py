@@ -495,6 +495,8 @@ def stage_render(args):
                        % (imp or "台账未记录"))
         print("[adopt] --force: 跳过渲染前预检 (无 imported.json)")
     else:
+        # 预检只比对 imported.json 里**有译文的那几页**, 末 N 页保留原文的页本来
+        # 就不在里面, 所以无需把 skip_last 传下去 (pre_render_check 也没这个参数)。
         rc_c, _ = run_tool("pre_render_check.py",
                            ["--original", pdf, "--imported", imp], capture=True)
         if rc_c != 0:
@@ -506,7 +508,10 @@ def stage_render(args):
                        "再重走 import -> inject")
         print("[adopt] 渲染前预检 PASS")
 
-    rc, out = run_tool("force_rerender.py", ["--pdf", pdf], capture=True)
+    rc, out = run_tool("force_rerender.py",
+                       ["--pdf", pdf]
+                       + (["--skip-last", str(args.skip_last)] if args.skip_last else []),
+                       capture=True)
     if rc != 0:
         mark(led, "render", "failed", reason="force_rerender 退出码 %d" % rc, pdf=pdf)
         save_ledger(led)
@@ -523,7 +528,8 @@ def stage_render(args):
     if prod is None:
         print("[adopt] 警告: 未从输出解析到产物路径; gate 阶段将回落到'最新 mono'")
     mark(led, "render", "ok", pdf=pdf, mono=prod,
-         seconds=int(secs[0]) if secs else None, pre_render="PASS")
+         seconds=int(secs[0]) if secs else None, pre_render="PASS",
+         skip_last=int(args.skip_last))
     save_ledger(led)
     print("[adopt] render OK: %s" % prod)
     return 0
@@ -548,21 +554,30 @@ def stage_gate(args):
         return die("找不到 mono 译文 PDF; 用 --mono 指定")
     print("[adopt] 验收对象: %s" % mono)
 
+    # [自研补丁 2026-09-19] skip_last 缺省沿用 **render 阶段实际用的值**。原先 gate
+    # 只有 --skip-last 且缺省 0: 整篇翻(0)的 run 没事, 但末 N 页保留原文的 run 会
+    # 被判"文献区汉化 第16,17页(29+14条)" —— 那两页本来就该保持英文, 是 render
+    # 参数, 不是译文缺陷。实测 Zhang 2026 (17 页, pre_check 推荐 skipLastPages=3)。
+    skip_last = args.skip_last
+    if skip_last is None:
+        skip_last = int((led["stages"].get("render") or {}).get("skip_last") or 0)
+        print("[adopt] skip_last 缺省沿用 render 台账值: %d" % skip_last)
+
     va = ["--pdf", mono, "--expect"] + list(args.expect)
     if args.forbid:
         va += ["--forbid"] + list(args.forbid)
     rc_v, _ = run_tool("verify_render.py", va)
 
     pa = [mono]
-    if args.skip_last:
-        pa += ["--skip-last", str(args.skip_last)]
+    if skip_last:
+        pa += ["--skip-last", str(skip_last)]
     rc_p, _ = run_tool("post_check.py", pa)
 
     ok = (rc_v == 0 and rc_p == 0)
     mark(led, "gate", "ok" if ok else "failed", mono=mono,
          verify="PASS" if rc_v == 0 else "FAIL",
          post_check="PASS" if rc_p == 0 else "FAIL",
-         expect=list(args.expect), forbid=list(args.forbid))
+         expect=list(args.expect), forbid=list(args.forbid), skip_last=skip_last)
     save_ledger(led)
     if ok:
         print("[adopt] gate OK —— 本 run 交付完成 (%s)" % args.name)
@@ -646,6 +661,9 @@ def main():
     p = sub.add_parser("render", help="5 重渲染落产物")
     common(p)
     p.add_argument("--pdf", required=True, help="原文 PDF 绝对路径")
+    p.add_argument("--skip-last", type=int, default=0,
+                   help="末尾保留页数(原样不译); 与 pre_check 推荐的 skipLastPages 同口径。"
+                        "缺省 0=整篇翻。台账会记下它, gate 阶段缺省沿用")
     p.set_defaults(fn=stage_render)
 
     p = sub.add_parser("gate", help="6 渲染验收 + 翻译质检 (双 PASS)")
@@ -654,7 +672,9 @@ def main():
                    help="期望落页的新串 (必须至少一条; 缺了无法证明'改了缓存且真落到页上')")
     p.add_argument("--forbid", nargs="*", default=[], help="期望消失的旧串")
     p.add_argument("--mono", default="", help="mono 译文; 缺省取 render 登记的产物")
-    p.add_argument("--skip-last", type=int, default=0, help="末尾保留页豁免数")
+    p.add_argument("--skip-last", type=int, default=None,
+                   help="末尾保留页豁免数; 缺省沿用 render 阶段实际用的值(原本缺省 0, "
+                        "整篇翻的 run 传了 --skip-last 也会被当成没跳页)")
     p.set_defaults(fn=stage_gate)
 
     p = sub.add_parser("status", help="看台账 / 列出全部 run")
