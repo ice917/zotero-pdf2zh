@@ -1630,6 +1630,12 @@ class PDFTranslator:
         if config.babeldoc:
             print("🔍 [Zotero PDF2zh Server] 目前不推荐使用pdf2zh 1.x + babeldoc, 如有需要，请直接使用pdf2zh_next")
             cmd.append('--babeldoc')
+        # [自研补丁 2026-09-19 v28.9] 把本篇原文 PDF 的绝对路径交给 pdf2zh 子进程:
+        # 侧车要按"文档"归档 (converter 的 _segflow_paths 读 P2Z_DOC_PDF), 而转换器
+        # 自己拿不到输入路径 —— 上游 TranslateConverter 签名里没有它。子进程默认
+        # 继承 os.environ, 故在父进程设一次即可; 唯一假设是"同时只翻一篇", 与既有
+        # 的共享日志独占闸是同一假设。转换器读不到时只写 latest.jsonl, 不阻断翻译。
+        os.environ["P2Z_DOC_PDF"] = os.path.abspath(input_path)
         try:
             # 使用 execute_with_progress 替代原来的 execute_in_env / subprocess.run
             # 实时解析子进程输出中的进度信息并更新 task_manager

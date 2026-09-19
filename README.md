@@ -182,15 +182,22 @@ Zotero → 编辑 → 设置 → Zotero PDF2zh，需要填四项（界面上的�
 > ⚠️ 不要动插件设置里的「自动更新」。上游一更新就会覆盖本仓库的补丁。
 > 升级上游之前请先读 `patches/PROTOCOL.md` 与 `改动记录.md` 第四节。
 
-### 第 9 步：把「侧车」存下来（每篇都要做，很容易漏）
+### 第 9 步：侧车不用再手抄（v28.9 起自动按文档归档）
 
-每次翻译都会生成一个记录「原文 ↔ 译文 ↔ 版面位置」的文件，**下一篇会把它覆盖掉**，
-所以每翻完一篇立刻归档（把 `论文名` 换成你的）：
+每次翻译都会生成一个记录「原文 ↔ 译文 ↔ 版面位置」的文件。它由 `latest.jsonl`
+（**全局单文件**，下一篇会覆盖）和一份**按文档归档件**组成，归档件自动落在这里：
 
-```powershell
-cd D:\zotero-pdf2zh
-Copy-Item "$env:USERPROFILE\.cache\pdf2zh\segflow\latest.jsonl" "segflow\论文名.jsonl"
 ```
+%USERPROFILE%\.cache\pdf2zh\segflow\pdf-<原文 PDF 内容 md5 前16位>.jsonl
+```
+
+同一篇改名/重下仍是同一份（身份取内容不取文件名），换论文不会互相覆盖。
+采纳管线 `tools/adopt.py export --pdf <原文.pdf>` 会自己认领它，**找不到会拒绝执行**
+（不会拿"最近翻过的那一篇"顶上）。
+
+> 仅在两种情况下需要手工 `Copy-Item "$env:USERPROFILE\.cache\pdf2zh\segflow\latest.jsonl" "segflow\论文名.jsonl"`：
+> ① 该篇是 v28.9 之前翻的（没有归档件）；② 走下面第 10 步那套成品工具链、
+> 想固定一份只读副本。否则直接给 `--pdf` 即可。
 
 ### 第 10 步：出成品（按顺序，整段复制）
 

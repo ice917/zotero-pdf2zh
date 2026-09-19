@@ -7,6 +7,7 @@
     - 侧车 latest.jsonl 是**全局单文件**, 换论文会覆盖 -> 导出的 payload 与
       注入时的侧车不是同一篇 -> 回锚错位 (seg_export/seg_inject 的 --sidecar
       帮助都写着"新论文请先归档", 但那只是句提醒, 没人拦你);
+      [v28.9 已收口: converter 按文档散列另落一份 pdf-<md5>.jsonl, export --pdf 认领它]
     - 豆包交件可能有多个版本 (wang2026.doubao.txt/doubao2/doubao3), 拿错一份
       整轮白干;
     - `seg_inject` 的文档指纹探测失败会**静默回落 Cactaceae 默认值**, 对别的
@@ -29,13 +30,17 @@
 
 用法 (解释器同 tools/tests/run_all.py):
   PY = D:/Users/<user>/anaconda3/envs/zotero-pdf2zh-venv/python.exe
-  & $PY tools/adopt.py export --name payload_p2_p4 --pages 2-4 --doc "标题 (期刊, 年份)"
+  & $PY tools/adopt.py export --name payload_p2_p4 --pages 2-4 --pdf "D:/.../xxx.pdf" --doc "标题 (期刊, 年份)"
   & $PY tools/adopt.py deliver --name payload_p2_p4 --text "D:/.../p2_p4.doubao.txt"
   & $PY tools/adopt.py import  --name payload_p2_p4
   & $PY tools/adopt.py inject  --name payload_p2_p4
   & $PY tools/adopt.py render  --name payload_p2_p4 --pdf "D:/.../xxx.pdf"
   & $PY tools/adopt.py gate    --name payload_p2_p4 --expect "雄花具有长花柱"
   & $PY tools/adopt.py status
+
+  export 的侧车(v28.9): 给了 --pdf 就按**文档内容散列**认领
+  ~/.cache/pdf2zh/segflow/pdf-<md5[:16]>.jsonl (由 converter 每篇自动落一份),
+  不再需要人工把 latest.jsonl 归档; 找不到会拒绝执行而不是拿"最近翻过的另一篇"顶上。
 
 台账: D:\\zotero-pdf2zh\\logs\\adopt\\<name>.json
   --force 可跳过顺序门禁 (运维单步重跑用), 用了哪几步记在台账 forced_stages 里留痕。
@@ -239,17 +244,61 @@ def probe_db(man, pages):
     return hit, fp
 
 
+def pdf_md5_16(pdf):
+    """PDF 内容的 16 位散列 —— 文档身份, 与 converter 侧写归档件同一口径。"""
+    h = hashlib.md5()
+    with open(pdf, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()[:16]
+
+
+def archived_sidecar(pdf):
+    """该篇"按文档归档"的侧车路径 (存在才返回)。见 converter._segflow_paths。"""
+    p = os.path.join(os.path.dirname(SIDECAR), "pdf-%s.jsonl" % pdf_md5_16(pdf))
+    return p if os.path.exists(p) else None
+
+
+def resolve_sidecar(args):
+    """本次导出用哪份侧车 -> (路径, 来源说明) 或 (None, 拒绝理由)。
+
+    优先级: 显式 --sidecar > --pdf 指向的按文档归档件 > 全局 latest.jsonl。
+    给了 --pdf 却找不到归档件时**拒绝执行**, 不回落 latest.jsonl —— 那里躺的是
+    "最近翻过的那一篇", 拿错侧车会安静地导出一份别人的载荷(下游回锚还会 PASS)。
+    """
+    if os.path.abspath(args.sidecar) != os.path.abspath(SIDECAR):
+        return args.sidecar, "显式指定"
+    if not args.pdf:
+        return SIDECAR, "latest.jsonl (全局单文件, 换论文会被覆盖)"
+    if not os.path.exists(args.pdf):
+        return None, "原文 PDF 不存在: %s" % args.pdf
+    p = archived_sidecar(args.pdf)
+    if p:
+        return p, "按文档归档件"
+    want = os.path.join(os.path.dirname(SIDECAR), "pdf-%s.jsonl" % pdf_md5_16(args.pdf))
+    return None, ("按 %s 找不到按文档归档的侧车\n"
+                  "        期望: %s\n"
+                  "        该篇多半是 v28.9 之前的管线下翻的, 没留归档件。两条路:\n"
+                  "          a) 先对它跑一次渲染 (会自动补上归档件), 再导出\n"
+                  "          b) --sidecar 显式指一份 (自己确认那一份就是这一篇)"
+                  % (os.path.basename(args.pdf), want))
+
+
 def stage_export(args):
     led = load_ledger(args.name)
     if not guard(led, "export", args.force):
         return 1
-    if not os.path.exists(args.sidecar):
-        return die("侧车不存在: %s (先跑一次翻译, 或 --sidecar 指向归档件)" % args.sidecar)
+    sc, sc_why = resolve_sidecar(args)
+    if sc is None:
+        return die(sc_why)
+    if not os.path.exists(sc):
+        return die("侧车不存在: %s (先跑一次翻译, 或 --sidecar 指向归档件)" % sc)
+    print("[adopt] 侧车: %s (%s)" % (sc, sc_why))
     if (led["stages"].get("export") or {}).get("state") == "ok" and not args.force:
         return die("本 run 已导出过; 重做请加 --force (会覆盖 inbox 同名件)")
 
     rc, _ = run_tool("seg_export.py",
-                     ["--pages", args.pages, "--name", args.name, "--sidecar", args.sidecar]
+                     ["--pages", args.pages, "--name", args.name, "--sidecar", sc]
                      + (["--doc", args.doc] if args.doc else [])
                      + (["--terms", args.terms] if args.terms else []))
     if rc != 0:
@@ -262,7 +311,7 @@ def stage_export(args):
         mark(led, "export", "failed", reason="manifest 未生成")
         save_ledger(led)
         return die("manifest 未生成: %s" % man_p)
-    pages = load_sidecar_pages(args.sidecar)
+    pages = load_sidecar_pages(sc)
     hit, fp = probe_db(man, pages)
     if hit == 0:
         mark(led, "export", "failed", reason="库内 0 命中")
@@ -273,8 +322,8 @@ def stage_export(args):
         print("[adopt] 警告: 探测不到文档摘要指纹(库内行不带 docsummary fp)。")
         print("        该篇无法用文档作用域注入 —— inject 阶段必须显式 --fp, 否则会误用默认值。")
 
-    mark(led, "export", "ok", pages=args.pages, sidecar=sidecar_id(args.sidecar),
-         doc_fp=fp, db_hits=hit, n_items=len(man["items"]),
+    mark(led, "export", "ok", pages=args.pages, sidecar=sidecar_id(sc),
+         sidecar_source=sc_why, doc_fp=fp, db_hits=hit, n_items=len(man["items"]),
          txt=os.path.join(INBOX, args.name + ".txt"), manifest=man_p)
     save_ledger(led)
     print("[adopt] export OK: %d 段 / 库内命中 %d 行 / doc_fp=%s" % (len(man["items"]), hit, fp))
@@ -566,7 +615,10 @@ def main():
     p = sub.add_parser("export", help="1 侧车 -> inbox payload")
     common(p)
     p.add_argument("--pages", required=True, help="如 2-4 或 1,21-22")
-    p.add_argument("--sidecar", default=SIDECAR, help="缺省 latest.jsonl; 新论文先用归档件")
+    p.add_argument("--sidecar", default=SIDECAR,
+                   help="缺省 latest.jsonl; 给了 --pdf 就按文档自动认领归档件")
+    p.add_argument("--pdf", default="",
+                   help="原文 PDF 绝对路径; 按文档(md5)自动认领该篇侧车, 免得手工归档")
     p.add_argument("--doc", default="", help='文档抬头(写进 payload 首行), 如 "标题 (期刊, 年份)"')
     p.add_argument("--terms", default="", help="术语表 csv; 缺省用 seg_export 默认(server/glossary/terms.csv)")
     p.set_defaults(fn=stage_export)

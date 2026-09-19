@@ -1,4 +1,5 @@
 import concurrent.futures
+import hashlib
 import json
 import logging
 import os
@@ -191,6 +192,37 @@ class TranslateConverter(PDFConverterEx):
                 _tr.summarize_document(_txt)
         except Exception:
             pass
+
+    def _segflow_paths(self):
+        """[自研补丁 2026-09-19 v28.9] 侧车双写目标: (latest.jsonl, 按文档归档件/None)。
+
+        为什么: latest.jsonl 是**全局单文件**, 换论文就覆盖 —— 下游要"某一篇的载荷"
+        时只能人工归档, 忘了/记错就整轮白干 (实测 2026-09-19: 全项目只留了 3 份归档,
+        为拿 Vaswani 的侧车只能白烧一次渲染)。故每个文档再落一份:
+            <segflow>/pdf-<md5(PDF 字节)[:16]>.jsonl
+        身份取 PDF **内容**散列(不取文件名: 改名/重下同内容仍是同一篇)。
+        路径由 server.py 启动 pdf2zh 子进程前注入 P2Z_DOC_PDF 环境变量传入 ——
+        转换器自己拿不到输入路径 (上游 TranslateConverter 签名里没有它)。
+        取不到就只写 latest.jsonl (行为与 v28.8 前一致, 不阻断翻译)。
+        """
+        _d = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow")
+        os.makedirs(_d, exist_ok=True)
+        _latest = os.path.join(_d, "latest.jsonl")
+        _doc = getattr(self, "_segflow_doc_path", "-")
+        if _doc == "-":                      # 每进程只算一次 (MB 级散列, 可忽略)
+            _doc = None
+            _src = os.environ.get("P2Z_DOC_PDF") or ""
+            if _src and os.path.exists(_src):
+                try:
+                    _h = hashlib.md5()
+                    with open(_src, "rb") as _f:
+                        for _chunk in iter(lambda: _f.read(1 << 20), b""):
+                            _h.update(_chunk)
+                    _doc = os.path.join(_d, "pdf-%s.jsonl" % _h.hexdigest()[:16])
+                except OSError:
+                    _doc = None
+            self._segflow_doc_path = _doc
+        return _latest, _doc
 
     def receive_layout(self, ltpage: LTPage):
         # 段落
@@ -471,14 +503,16 @@ class TranslateConverter(PDFConverterEx):
         # 流水逐页追加到 sidecar (JSONL, 每行一页)。任务完成后军师脚本
         # (tools/strategist.py) 串读全文, 输出跨段指代/接缝/术语/文风修正,
         # 写回缓存后 force 重渲染生效。首页处理时截断旧文件(一子进程一文档)。
+        # [v28.9] 双写: 除全局 latest.jsonl 外, 再按**文档内容散列**落一份归档件
+        # (见 _segflow_paths), 供 seg_export/adopt export 按篇取用。
         try:
             if sstk:
-                _sf_dir = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow")
-                os.makedirs(_sf_dir, exist_ok=True)
-                _sf_path = os.path.join(_sf_dir, "latest.jsonl")
+                _sf_path, _sf_doc = self._segflow_paths()
                 if not getattr(self, "_segflow_fresh", False):
-                    with open(_sf_path, "w", encoding="utf-8") as f:
-                        pass
+                    for _p in (_sf_path, _sf_doc):
+                        if _p:
+                            with open(_p, "w", encoding="utf-8") as f:
+                                pass
                     self._segflow_fresh = True
                 # [v24b.2] 占位符图例: {vN} → 背后真实字形文本。军师只看译文字符串,
                 # 永远不知道 {v6}/{v7} 其实就是数字 3/2, 会把"丢失的 3:2"当成漏译
@@ -508,8 +542,11 @@ class TranslateConverter(PDFConverterEx):
                     "segs": [{"raw": s, "trans": n} for s, n in zip(sstk, news)],
                     "vars": _legend,
                 }
-                with open(_sf_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                _line = json.dumps(rec, ensure_ascii=False) + "\n"
+                for _p in (_sf_path, _sf_doc):   # latest.jsonl + 按文档归档件
+                    if _p:
+                        with open(_p, "a", encoding="utf-8") as f:
+                            f.write(_line)
         except Exception as _e:
             print(f"⚠️ [军师·段序导出] 失败: {_e}", flush=True)
 
