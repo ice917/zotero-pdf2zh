@@ -149,31 +149,45 @@ def count_zh_ay_blocks(text):
     return n
 
 
-def page_features(reader, idx):
-    """提取第 idx 页（0 基）的质检特征，失败返回 error"""
-    feat = {"page": idx + 1, "chars": 0, "cjk": 0, "alnum": 0, "cites": 0,
+def text_features(text, page_no):
+    """由一段"页文本"算质检特征。
+
+    [自研补丁 2026-09-19] 从 page_features 里抽出来, 为的是让
+    tools/pre_render_check.py 能对**回锚后的译文**(out/<name>.imported.json,
+    此时还没有 PDF) 用同一套口径算特征。文献区禁汉化这道闸门前移到 render
+    之前, 靠的就是"同一份计数代码 + 两种文本来源" —— 否则两边口径迟早漂移,
+    又变成翻前翻后各说各话。
+    """
+    feat = {"page": page_no, "chars": 0, "cjk": 0, "alnum": 0, "cites": 0,
             "ref_entries": 0, "ref_density": 0.0,
             "ref_ay_entries": 0, "ref_ay_density": 0.0,
             "ref_zh_blocks": 0, "ref_zh_blocks_ay": 0,
             "placeholders": 0, "error": None}
+    feat["chars"] = len(text.strip())
+    feat["cjk"] = len(CJK.findall(text))
+    feat["alnum"] = len(re.findall(r"[A-Za-z0-9]", text))
+    feat["cites"] = len(CITE_ANY.findall(text))
+    feat["ref_entries"] = len(REF_ENTRY.findall(text))
+    feat["ref_ay_entries"] = len(REF_AY.findall(text))
+    if feat["chars"]:
+        feat["ref_density"] = feat["ref_entries"] * 1000.0 / feat["chars"]
+        feat["ref_ay_density"] = (feat["ref_ay_entries"] * 1000.0
+                                  / feat["chars"])
+    feat["ref_zh_blocks"] = count_zh_ref_blocks(text)
+    feat["ref_zh_blocks_ay"] = count_zh_ay_blocks(text)
+    feat["placeholders"] = len(PLACEHOLDER.findall(text))
+    return feat
+
+
+def page_features(reader, idx):
+    """提取第 idx 页（0 基）的质检特征，失败返回 error"""
     try:
         text = reader.pages[idx].extract_text() or ""
-        feat["chars"] = len(text.strip())
-        feat["cjk"] = len(CJK.findall(text))
-        feat["alnum"] = len(re.findall(r"[A-Za-z0-9]", text))
-        feat["cites"] = len(CITE_ANY.findall(text))
-        feat["ref_entries"] = len(REF_ENTRY.findall(text))
-        feat["ref_ay_entries"] = len(REF_AY.findall(text))
-        if feat["chars"]:
-            feat["ref_density"] = feat["ref_entries"] * 1000.0 / feat["chars"]
-            feat["ref_ay_density"] = (feat["ref_ay_entries"] * 1000.0
-                                      / feat["chars"])
-        feat["ref_zh_blocks"] = count_zh_ref_blocks(text)
-        feat["ref_zh_blocks_ay"] = count_zh_ay_blocks(text)
-        feat["placeholders"] = len(PLACEHOLDER.findall(text))
     except Exception as exc:
+        feat = text_features("", idx + 1)
         feat["error"] = str(exc)[:120]
-    return feat
+        return feat
+    return text_features(text, idx + 1)
 
 
 def cjk_ratio(feat):
@@ -191,6 +205,39 @@ def is_ref_page(feat):
 
 
 # ---------------------------------------------------------------- 断言
+def check_ref_zh(orig_feats, trans_feats):
+    """第 4 断言「参考文献区不得汉化」→ 返回 findings 列表。
+
+    [自研补丁 2026-09-19] 从 run_checks 里抽出来, 让**渲染前预检**
+    (tools/pre_render_check.py) 与**渲染后门禁**跑的是同一段代码。前移这道闸门
+    的意义: 这 5 篇历史 FAIL 当初全是"PDF 出来了才发现文献区被汉化", 而重出
+    PDF 要占服务端一轮 —— 在 render 之前就判死, 那一轮直接省掉。
+
+    只在原文侧判文献页(见 is_ref_page), 译文侧只负责数"被汉化的条目"。
+    """
+    zh_ref_pages, zh_ref_why, n_ref_pages = [], [], 0
+    for o, t in zip(orig_feats, trans_feats):
+        if o["error"] or t["error"] or not is_ref_page(o):
+            continue
+        n_ref_pages += 1
+        zh_n = t["ref_zh_blocks"]
+        if o["ref_ay_density"] >= REF_DENSITY:
+            zh_n += t["ref_zh_blocks_ay"]
+        if zh_n >= REF_ZH_MIN:
+            zh_ref_pages.append(t["page"])
+            zh_ref_why.append(f"第{t['page']}页({zh_n}条)")
+    if zh_ref_pages:
+        return [(
+            "高", f"第{','.join(map(str, zh_ref_pages))}页",
+            "文献区汉化断言失败：原文的参考文献条目在译文中被翻译成中文"
+            f"（{('、'.join(zh_ref_why))}）。文献条目必须整条原样保留——"
+            "人名/标题/期刊名被汉化后文献表不可用，且无法据此回溯原文")]
+    if n_ref_pages:
+        return [("通过", "全文",
+                 f"文献区禁汉化检查通过：{n_ref_pages} 个文献页的条目均保持原样")]
+    return []
+
+
 def run_checks(orig_feats, trans_feats, skip_last=0):
     """
     四项断言。返回 (findings, verdict)
@@ -295,28 +342,9 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
     # count_zh_ay_blocks)。仅当该页确为作者-年份制文献页时才启用后者, 否则
     # 正文里的拉丁人名会让中文正文被误算成"被汉化的条目"(实测 CLAP 第15-17页
     # 编号制文献页 + 中文正文: 误报 27/53/17 条)。
-    zh_ref_pages, zh_ref_why, n_ref_pages = [], [], 0
-    for i in range(n):
-        o, t = orig_feats[i], trans_feats[i]
-        if o["error"] or t["error"] or not is_ref_page(o):
-            continue
-        n_ref_pages += 1
-        zh_n = t["ref_zh_blocks"]
-        if o["ref_ay_density"] >= REF_DENSITY:
-            zh_n += t["ref_zh_blocks_ay"]
-        if zh_n >= REF_ZH_MIN:
-            zh_ref_pages.append(t["page"])
-            zh_ref_why.append(f"第{t['page']}页({zh_n}条)")
-    if zh_ref_pages:
-        findings.append((
-            "高", f"第{','.join(map(str, zh_ref_pages))}页",
-            "文献区汉化断言失败：原文的参考文献条目在译文中被翻译成中文"
-            f"（{('、'.join(zh_ref_why))}）。文献条目必须整条原样保留——"
-            "人名/标题/期刊名被汉化后文献表不可用，且无法据此回溯原文"))
-    elif n_ref_pages:
-        findings.append((
-            "通过", "全文",
-            f"文献区禁汉化检查通过：{n_ref_pages} 个文献页的条目均保持原样"))
+    # [自研补丁 2026-09-19] 实现搬进 check_ref_zh(), 与渲染前预检共用同一段
+    # 代码 —— 前移这道闸门见 tools/pre_render_check.py。
+    findings.extend(check_ref_zh(orig_feats, trans_feats))
 
     # ---------- 页数一致性 ----------
     if len(orig_feats) != len(trans_feats):

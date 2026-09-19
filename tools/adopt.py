@@ -21,6 +21,10 @@
   3 import   seg_import 回锚 -> out/<name>.imported.json (必须 PASS)
   4 inject   seg_inject 写库 (先用 --dry 演算, PASS 才实写)
   5 render   force_rerender 落产物 PDF
+             —— 但**先跑渲染前预检** (pre_render_check: 文献区禁汉化)。
+                这道闸门原本只在阶段 6 的 post_check 里, 也就是"PDF 出来了才
+                发现文献区被汉化", 得删掉重出。判据同源, 只是文本来源从 mono
+                PDF 换成 imported.json —— 前移之后那一轮服务端渲染直接省掉。
   6 gate     verify_render(--expect) + post_check 双 PASS 才算交付
 
 用法 (解释器同 tools/tests/run_all.py):
@@ -416,6 +420,31 @@ def stage_render(args):
     pdf = os.path.abspath(args.pdf)
     if not os.path.exists(pdf):
         return die("找不到原文: %s" % pdf)
+
+    # [自研补丁 2026-09-19] 渲染前内容预检: 把「文献区禁汉化」这道闸门从阶段 6
+    # (出 PDF 之后) 前移到 render 之前。判据与 post_check 同源(共用
+    # post_check.check_ref_zh), 只是文本来源换成 imported.json。
+    # 为什么值得前移: 重出 PDF 要占服务端一轮。判 FAIL 就不渲染, 那一轮直接省掉;
+    # 否则就是用户说的"结果不好 -> 删掉 -> 重新生成"。实测 5 篇历史 FAIL 全属此类。
+    imp = (led["stages"].get("import") or {}).get("imported")
+    if not imp or not os.path.exists(imp):
+        if not args.force:
+            return die("找不到回锚译文 (%s), 无法做渲染前预检; 请先跑 "
+                       "`adopt.py import` (运维单步重跑可用 --force 跳过)"
+                       % (imp or "台账未记录"))
+        print("[adopt] --force: 跳过渲染前预检 (无 imported.json)")
+    else:
+        rc_c, _ = run_tool("pre_render_check.py",
+                           ["--original", pdf, "--imported", imp], capture=True)
+        if rc_c != 0:
+            mark(led, "render", "failed", pdf=pdf,
+                 pre_render="FAIL", reason="渲染前预检: 文献区汉化")
+            save_ledger(led)
+            return die("渲染前预检 FAIL —— 文献区被汉化, **未渲染**。"
+                       "修法: 让豆包照质检报告把文献条目还原成原文后重交, "
+                       "再重走 import -> inject")
+        print("[adopt] 渲染前预检 PASS")
+
     rc, out = run_tool("force_rerender.py", ["--pdf", pdf], capture=True)
     if rc != 0:
         mark(led, "render", "failed", reason="force_rerender 退出码 %d" % rc, pdf=pdf)
@@ -428,7 +457,7 @@ def stage_render(args):
     if prod is None:
         print("[adopt] 警告: 未从输出解析到产物路径; gate 阶段将回落到'最新 mono'")
     mark(led, "render", "ok", pdf=pdf, mono=prod,
-         seconds=int(secs[0]) if secs else None)
+         seconds=int(secs[0]) if secs else None, pre_render="PASS")
     save_ledger(led)
     print("[adopt] render OK: %s" % prod)
     return 0
