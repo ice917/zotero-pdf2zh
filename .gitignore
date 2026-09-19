@@ -43,4 +43,8 @@ server/md-translate/config.json
 # 本机路径与个人文件 (开源红线): 本地保留不入库
 server/config/local_paths.json
 tools/dedouble_sweep.py
+
+# 解压残留与运行时状态 (上游 zip 重下会再带回来, 只忽略不清理)
 .DS_Store
+__MACOSX/
+server/config/package_update_state.json
