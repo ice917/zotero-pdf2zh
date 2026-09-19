@@ -1,3 +1,9 @@
+# 术语表判据 (v28.15): 全局累积 不按篇隔离 —— 加词只作废"含该词"的段 (v23 按段指纹) 不会全文重译。
+# 每组前的 "# 来源" 记该批词因哪篇/哪次事故加入; 无据可查的早期条目如实写"未记"。
+# 注释行对三处读取端一律不可见: seg_export.load_terms 跳过 "#" 行; translator._load_polish_glossary
+# 按 csv 字段数 >=2 过滤; term_verify.load_glossary 跳过 "#" 行。注释里不写逗号以免被当字段。
+# 来源: 篇名未记 (早期累积; in-silico 系 2026-09-06 修标题"硅基准"误译时所加)
+
 contrastive latent action pretraining,对比潜动作预训练
 vision-language-action model,视觉-语言-动作模型
 rain gauge,雨量计
@@ -6,8 +12,10 @@ Loewner order,勒夫纳序
 super-spreader compartment,超级传播者仓室
 in-silico,计算机模拟
 
+# 来源: Reproductive Biology of Cactaceae (Desert Plants 2009) —— 本项目主译专著
 Cactaceae,仙人掌科
 herkogamy,雌雄异位
+dichogamy,雌雄异熟
 breeding system,繁殖系统
 successful gamete,可育配子
 selfing,自交

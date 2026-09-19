@@ -23,22 +23,43 @@ from pypdf import PdfReader, PdfWriter
 PURE_GLYPH = re.compile(r"^(?:\{v\d+\})+$")
 
 
+def true_page(o):
+    """侧车记录的**真实 PDF 页码**(1 基); 记录里没有 pageid 时回落 None。
+
+    侧车的 `page` 是 receive_layout 的**回调计数**, 不是页码: 图形对象若含文字
+    也会再写一行 (end_figure -> receive_layout(fig)), 同一页因此可能占多行,
+    图多的论文整体漂移 (与 seg_export.py 同一口径)。真实页码只有 `pageid` 说得准。
+    """
+    pid = o.get("pageid")
+    return None if pid is None else int(pid) + 1
+
+
 def zero_pages_from_sidecar(path):
-    zero = []
+    """零可译段页 (真实页码 1 基, 升序)。
+
+    判据按**页**聚合: 该页所有记录都不含可译段才算零可译段页 (整页表格典型)。
+    逐条记录判定会把同页的文字回调误判成零页 (一页多行), 且 `page` 是回调计数,
+    当页码用会点错页 —— 故先按页码归并。老侧车无 `pageid` 时回落用 `page` 当页码。
+    """
+    trans = {}   # 页码 -> 该页是否含可译段
     for line in open(path, encoding="utf-8"):
         line = line.strip()
         if not line:
             continue
         o = json.loads(line)
+        pg = true_page(o)
+        if pg is None:
+            pg = o["page"]
+        if trans.get(pg):
+            continue
         translatable = False
         for s in o["segs"]:
             raw = (s.get("raw") or "").strip()
             if raw and not PURE_GLYPH.match(raw) and re.search(r"[A-Za-z0-9]", raw):
                 translatable = True
                 break
-        if not translatable:
-            zero.append(o["page"])
-    return zero
+        trans[pg] = translatable
+    return sorted(pg for pg, ok in trans.items() if not ok)
 
 
 def main():

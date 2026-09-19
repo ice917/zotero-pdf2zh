@@ -1085,13 +1085,18 @@ def propose_glossary_updates(results, context=""):
 
 
 def load_glossary(path):
-    """读取现有术语表(csv, 无表头, 'english,chinese')。返回 dict 与原始行数。"""
+    """读取现有术语表(csv, 无表头, 'english,chinese')。返回 dict 与原始行数。
+
+    [v28.15] 以 "#" 开头的行是判据/来源注释(见 terms.csv 抬头), 既不算术语也不计入行数。
+    """
     entries = {}
     n = 0
     if not os.path.isfile(path):
         return entries, n
     for line in open(path, encoding="utf-8"):
         line = line.strip()
+        if line.startswith("#"):
+            continue
         n += 1
         if not line or "," not in line:
             continue

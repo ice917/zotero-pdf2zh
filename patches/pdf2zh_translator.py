@@ -575,33 +575,6 @@ class OpenAITranslator(BaseTranslator):
             self.cache.snapshot_legacy_key()
             self.cache.remove_param("polish_glossary_fp")
 
-    def _cache_key_suffix(self, text: str) -> str:
-        """[v23] 术语表按段指纹: 只哈希本段命中的术语条目。
-
-        与 prompt() 注入用同一套归一化匹配(_norm 剥离 {vN} 与非字母数字),
-        保证"注入了什么"与"键里编了什么"一致。未命中任何术语的段落用
-        显式空标记(与无后缀的旧形态键区分开)。"""
-        if not (self._polish_enabled and self._polish_glossary_path):
-            return ""
-        glossary = self._polish_glossary
-        if glossary is None and self._polish_glossary_path:
-            glossary = self._polish_glossary = self._load_polish_glossary()
-        if not glossary:
-            return ""
-
-        def _norm(s: str) -> str:
-            return re.sub(r"[^a-z0-9]", "", s.lower())
-
-        text_norm = _norm(re.sub(r"\{v\d+\}", "", text or ""))
-        matched = sorted(
-            (k, v) for k, v in glossary.items()
-            if _norm(k) and _norm(k) in text_norm
-        )
-        if not matched:
-            return "#g23:-"
-        blob = json.dumps(matched, ensure_ascii=False, sort_keys=True)
-        return "#g23:" + hashlib.md5(blob.encode("utf-8")).hexdigest()[:10]
-
     def _look_ahead(self) -> str:
         """[v23.4] 读取 converter 注入的本段前瞻上下文 (线程局部, 缺省空)。"""
         try:
