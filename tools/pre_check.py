@@ -27,8 +27,12 @@ tools/pre_check.py —— PDF 翻译前体检器（零 API 成本，零侵入）
 4. **优雅降级**：单页解析失败只跳过该页，不中断整体体检。
 
 判定规则（v1，经验阈值）：
-  - 参考文献页: 行首条目式 [n] >= REF_ENTRY_MIN(3) 或含 References 标题
-    （条目式=行首 [n]，正文行内引用不算——这是区分文献页与相关工作者节的关键）
+  - 参考文献页: 满足任一即候选 ——
+      a) 编号制: 行首条目式 [n] >= REF_ENTRY_MIN(3) 且行首占比 >= REF_ENTRY_RATIO(0.5)
+      b) 编号制: 条目密度 >= REF_DENSITY(2.5)（每千字）
+      c) 作者-年份制条目密度 >= REF_AY_DENSITY(2.5)（每千字）
+    体例 b/c 的常量与翻后质检 tools/post_check.py 原样共享 —— 不变量是
+    **门禁判 FAIL 的文献页，体检一定也认**（体检可以更敏感，不可更宽）。
   - 扫描页:   页面可提取文本 < SCAN_TEXT_MIN(50) 字符视为无文本层
   - 公式密集: 页面数学符号数 >= MATH_DENSE(40) 视为公式密集页
   - 已是中文: 页面汉字占比 > CJK_MOSTLY(0.5) 标记为"疑似已翻译"
@@ -57,7 +61,29 @@ warnings.filterwarnings("ignore")
 REVIEW_DIRNAME = "review"
 
 REF_ENTRY_MIN = 3       # 页内行首条目式 [n] 数达到该值 → 参考文献页候选
-REF_HEADING_WORDS = ("references", "bibliography", "参考文献", "文献")
+# [自研补丁 2026-09-19] 编号制文献页的两道闸门（缺一不可）。
+# 缺口一: 只数"行首 [n] 条数 >= 3" 会把正文页当成文献页 —— 实机取证
+#   Vaswani p10 = "Table 4 + 正文结尾"（行首 4 条），Zhang/CLAP p2 = teaser
+#   页（行首 3 条），两页整页没有一条真文献条目。
+# 缺口二: post_check 只按**密度**（>= REF_DENSITY）判，长条目文献页密度会掉到
+#   阈值以下 → 整页漏判。实测 Jiang p7（15 条/6891 字=2.18）、Kim p9（6 条/
+#   3392 字=1.77）、Melhani p42（5 条/3491 字=1.43）三页全部漏掉。
+# 判据用「行首 [n] 占全部 [n] 的比例」补上缺口一 —— 实测分离度极大:
+#   文献页 0.83~1.00（Vaswani p11=1.00, Melhani p42=0.83, Brody p14=0.89），
+#   正文页 0.00~0.25（Vaswani p10=0.24, Zhang p2=0.19, Jiang p6=0.20）。
+REF_ENTRY_RATIO = 0.5
+REF_DENSITY = 2.5       # 与 post_check.REF_DENSITY 同值：每千字的条目数。
+                        # 这一条必须原样共享，保证"翻后门禁判 FAIL 的文献页，
+                        # 翻前体检一定也认"（子集关系，见 is_ref_page）。
+# [自研补丁 2026-09-19] 作者-年份制文献页（整表无行首 [n]）的判据。
+# 缺口: 本文件此前只认行首 [n]，而 "R. Olfati-Saber and R. M. Murray (2004). ..."
+# 这类体例的行首 [n] 密度恒为 0 → 既不推荐 skipLastPages（文献区照常被翻译，
+# 翻译后质检的第四断言必然 FAIL），也正是 Wang 2026 那类论文踩的坑。
+# 口径与 post_check 同一套常量和正则 —— 翻前体检与翻后门禁对"文献页"必须
+# 是同一个定义，否则一个放行、一个判 FAIL。
+REF_AY_DENSITY = 2.5    # 原文每千字的作者-年份制条目数达到该值 → 文献页候选
+REF_AY = re.compile(r"(?m)^\s*(?:[A-Z]\.\s*){1,4}[A-Z][A-Za-z\-'\u4e00-\u9fff]+"
+                    r"[\s\S]{0,80}?\((?:19|20)\d{2}[a-z]?\)")
 SCAN_TEXT_MIN = 50      # 页面可提取文本低于该字符数 → 疑似扫描页
 MATH_DENSE = 40         # 页面数学符号数达到该值 → 公式密集页
 CJK_MOSTLY = 0.5        # 汉字字符占字母数字比例超过该值 → 疑似已是中文
@@ -111,6 +137,60 @@ def count_reference_entries(text):
     return len(re.findall(r"(?m)^\s*\[\d{1,3}\]", text))
 
 
+def count_reference_ay_entries(text):
+    """统计"作者-年份制"文献条目：行首姓名 + 其后 80 字符内出现 (年份)。
+
+    与 post_check.REF_AY 同口径。正文的行内引用 "(Olfati-Saber and Murray, 2004)"
+    不以行首姓名开头，故不在此列 —— 实测正文页密度 <=0.7，文献页 2.93/3.58。
+    """
+    return len(REF_AY.findall(text))
+
+
+def ref_ay_density(text):
+    """作者-年份制条目密度（每千字）。按**原文页**算，与 post_check 一致。"""
+    n = len(text.strip())
+    return (count_reference_ay_entries(text) * 1000.0 / n) if n else 0.0
+
+
+def ref_density(text):
+    """编号制条目密度（每千字）。与 post_check.REF_DENSITY 同口径、同阈值。"""
+    n = len(text.strip())
+    return (count_reference_entries(text) * 1000.0 / n) if n else 0.0
+
+
+# ---------------------------------------------------------------- 判定用谓词
+def ref_entry_ratio(feat):
+    """行首 [n] 占全部 [n] 的比例。
+
+    文献页的条目一律顶格起排（行首 [n]），正文页的 [n] 绝大多数夹在句中。
+    实测: 文献页 0.83~1.00，正文页 0.00~0.25（见常量区 REF_ENTRY_RATIO）。
+    """
+    n = feat["ref_markers"]
+    return (feat["ref_entries"] / n) if n else 0.0
+
+
+def is_ref_page(feat):
+    """页特征 → 是否参考文献页。
+
+    判据与 tools/post_check.py 的 is_ref_page 同源，**刻意同名同位以便对账**。
+    不变量: **翻后门禁判 FAIL 的文献页，翻前体检一定也认** —— 所以共享的
+    密度判据（REF_DENSITY / REF_AY_DENSITY）必须原样保留；本文件只能在此之上
+    更敏感（多认几页 → 多建议跳几页），绝不能反过来漏认。
+      作者-年份制: 条目密度 >= REF_AY_DENSITY
+      编号制      : 密度 >= REF_DENSITY（共享）
+                   或 行首条数 >= REF_ENTRY_MIN 且 行首占比 >= REF_ENTRY_RATIO
+                   （补 post_check 的漏：长条目文献页密度会掉到阈值以下）
+    """
+    if feat.get("error") is not None:
+        return False
+    if feat["ref_ay_density"] >= REF_AY_DENSITY:
+        return True
+    if feat["ref_density"] >= REF_DENSITY:
+        return True
+    return (feat["ref_entries"] >= REF_ENTRY_MIN
+            and ref_entry_ratio(feat) >= REF_ENTRY_RATIO)
+
+
 def count_math_symbols(text):
     """统计数学符号出现次数"""
     return len(MATH_CHARS.findall(text))
@@ -131,17 +211,19 @@ def analyze_page(reader, idx):
     单页解析失败时返回 {'error': ...}，不中断整体。
     """
     feat = {"page": idx + 1, "chars": 0, "ref_markers": 0, "ref_entries": 0,
-            "math": 0, "cjk_r": 0.0, "heading": False, "error": None}
+            "ref_density": 0.0, "ref_ay": 0, "ref_ay_density": 0.0,
+            "math": 0, "cjk_r": 0.0, "error": None}
     try:
         page = reader.pages[idx]
         text = page.extract_text() or ""
         feat["chars"] = len(text.strip())
         feat["ref_markers"] = count_citation_markers(text)
         feat["ref_entries"] = count_reference_entries(text)
+        feat["ref_density"] = ref_density(text)
+        feat["ref_ay"] = count_reference_ay_entries(text)
+        feat["ref_ay_density"] = ref_ay_density(text)
         feat["math"] = count_math_symbols(text)
         feat["cjk_r"] = cjk_ratio(text)
-        low = text.lower()
-        feat["heading"] = any(w in low for w in REF_HEADING_WORDS)
     except Exception as exc:  # 单页损坏/字体异常
         feat["error"] = str(exc)[:120]
     return feat
@@ -234,27 +316,36 @@ def decide(pages, total, docrisk=None):
     findings = []
     recommend_skip = 0
 
-    # --- 参考文献页检测：条目式 [n]（行首）密集 或 含 References 标题 ---
-    # 条目式标号是参考文献列表的专属特征，正文行内引用不会被误判
-    ref_pages = [p["page"] for p in pages
-                 if p["error"] is None
-                 and (p["ref_entries"] >= REF_ENTRY_MIN or p["heading"])]
+    # --- 参考文献页检测 ---
+    # 编号制: 行首 [n] 顶格起排（>3 条且占全部 [n] 的一半以上），或密度够高
+    # 作者-年份制: 行首姓名 + 年份，按**密度**判（正文页实测 <=0.7，文献页 >=2.9）
+    # 两种体例都要认 —— 只认第一种时，作者-年份制论文的文献区拿不到跳页建议，
+    # 会被照常翻译，翻后第四断言必 FAIL（见文件头常量区说明）。
+    # 判据收在模块级 is_ref_page()，与 post_check 同名同位，便于对账。
+    ref_pages = [p["page"] for p in pages if is_ref_page(p)]
+    ref_kinds = {p["page"]: ("编号制"
+                            if (p["ref_density"] >= REF_DENSITY
+                                or p["ref_entries"] >= REF_ENTRY_MIN)
+                            else "作者-年份制")
+                 for p in pages if is_ref_page(p)}
     if ref_pages:
         first = ref_pages[0]
         contiguous = ref_pages == list(range(first, total + 1))
+        kind_str = "/".join(sorted(set(ref_kinds.values())))
         if contiguous and first > 1:
             recommend_skip = total - first + 1
             findings.append((
                 "高", f"第{first}-{total}页",
-                f"检测到参考文献区（引用标号密集/含标题），这些页构成文档后缀。"
+                f"检测到参考文献区（体例: {kind_str}），这些页构成文档后缀。"
                 f"建议插件设置「最后几页跳过翻译」= {recommend_skip}，"
                 f"参考文献保持英文原版可避开双栏小字号版面解析失败的高发区"))
         else:
             pages_str = ",".join(str(p) for p in ref_pages)
             findings.append((
                 "中", f"第{pages_str}页",
-                "检测到参考文献特征页，但未构成文档后缀（可能混有正文）。"
-                "不建议自动跳页；如该区域乱码，考虑用 --pages 分页区间单独处理"))
+                f"检测到参考文献特征页（体例: {kind_str}），但未构成文档后缀"
+                "（可能混有正文）。不建议自动跳页；如该区域乱码，"
+                "考虑用 --pages 分页区间单独处理"))
 
     # --- 扫描页检测 ---
     scan_pages = [p["page"] for p in pages
@@ -367,8 +458,12 @@ def build_report(pdf_path, total, pages, recommend_skip, findings, encrypted,
         "|---|---|---|---|---|---|---|",
     ]
     for p in pages:
-        note = "解析失败: " + p["error"] if p["error"] else \
-               ("含References标题" if p["heading"] else "")
+        if p["error"]:
+            note = "解析失败: " + p["error"]
+        elif is_ref_page(p):
+            note = "文献页"
+        else:
+            note = ""
         lines.append(
             "| {page} | {chars} | {ref_markers} | {ref_entries} | {math} | {cjk_r:.0%} | {note} |".format(
                 note=note, **p))
