@@ -38,6 +38,17 @@ _TOKEN_RE = re.compile(r"\{v\d+\}")
 _RETIRED_PARAM_PREFIXES = ("polish",)
 _RETIRED_PARAM_KEYS = ("v23s",)
 
+# [v28.21] "文档画像"维度的键名: doc_summary_fp = f(首页文本 md5, 摘要内容 md5)。
+#
+# 为什么它需要一条专门的回查通道: 摘要的落盘键与这个 fp 都由"首页拼接文本"
+# 算出, 而 v28.21 之前那段文本里带着 {vN} 占位符 —— 占位符集合由 config
+# (formular_char_pattern / formular_font_pattern)决定, 于是**改一次配置 =
+# 摘要键漂移 = 全篇缓存换键重译**(实测 CLAP: 491 秒, 且重译结果盖掉了豆包
+# 回路已采纳的译文)。v28.21 已在源头把 {vN} 还原成真实字形(converter)并给
+# 摘要键加了防(translator._summary_text_key), 但库里已经躺着几代不同 fp 的
+# 行(CLAP 的 8bff… / 38bc…), 不救的话下次渲染仍要整篇重译。
+_DOC_SUMMARY_PARAM = "doc_summary_fp"
+
 
 class _TranslationCache(Model):
     id = AutoField()
@@ -84,6 +95,7 @@ class TranslationCache:
         self.prev_params_json = None
         self._legacy_canon_index = None
         self._retired_canon_index = None      # [v27] 退役参数投影索引(惰性)
+        self._reduced_canon_index = None      # [v28.21] 最小世代身份索引(惰性)
         self.replace_params(translate_engine_params)
 
     # The program typically starts multi-threaded translation
@@ -227,6 +239,89 @@ class TranslationCache:
         return idx
 
     @staticmethod
+    def _strip_docsummary(base_json: str):
+        """[v28.21] 剔除"文档画像"(_DOC_SUMMARY_PARAM)维度后的形态。
+
+        摘要键漂移的成因见 _DOC_SUMMARY_PARAM 处注释。这里把该维度从世代身份
+        里整体剔除, 任一世代的行都投影到同一形态 —— 与 v27 剔除 polish* 同一
+        思路, 只是这次退役的是"文档画像"这一维度。
+
+        放宽是可接受的: 文档画像只是每段 prompt 里 ≤120 字的软提示, 而其余
+        维度(引擎/语向/模型/prompt/template/术语表 fp/typo_clean…)仍要求逐
+        字节相同 —— 不是"随便什么旧译文都拿来用"。返回 (形态, 是否剔除)。
+        """
+        if not base_json:
+            return base_json, False
+        try:
+            params = json.loads(base_json)
+        except Exception:
+            return base_json, False
+        if not isinstance(params, dict) or _DOC_SUMMARY_PARAM not in params:
+            return base_json, False
+        kept = {k: v for k, v in params.items() if k != _DOC_SUMMARY_PARAM}
+        return json.dumps(TranslationCache._sort_dict_recursively(kept)), True
+
+    def _reduced_form(self, base_json: str) -> str:
+        """[v28.21] "不含文档画像的世代身份": 只剔除 doc_summary_fp 这一维。
+
+        **不**顺手剔除 v23s/polish*: 那些维度属于 ③ 的职权(且 ③ 有自己的门控)。
+        这里保持它们原样, 世代隔离就自动成立 —— 润色世代的行带 polish*, 当前
+        无润色的任务形态里没有它, 两者天然对不上, 不需要额外门控。
+        """
+        return self._strip_docsummary(base_json)[0]
+
+    @staticmethod
+    def _has_retired_generation(base_json: str) -> bool:
+        """[v28.21] 当前世代是否带**退役世代标记**(polish* 前缀)。
+
+        门控(③④)原先用 `_strip_retired(pj)[1] != 0` 判断, 但那把 v23s 也算进去
+        了 —— 而 v23s **不是世代标记**: 前瞻(v23.4)至今仍在生产 `#la:…` 后缀。
+        于是"带前瞻的段"被误判成润色世代 → 门控一关, 退役投影与文档画像投影
+        双双失效。实测: CLAP 每代 13~14 段前瞻段因此救不回来(182/195 → 应 195/195)。
+
+        门控真正要回答的是"当前任务是否重新开启了润色" —— 只有那一种情况才需要
+        世代严格隔离(不把未润色的旧译文喂给开启润色的任务)。v23s 不改变这个判断:
+        它在两个世代里都只是个"本段指纹"后缀, 且已由投影剔除。
+        """
+        if not base_json:
+            return False
+        try:
+            params = json.loads(base_json)
+        except Exception:
+            return False
+        if not isinstance(params, dict):
+            return False
+        return any(k.startswith(p)
+                   for k in params for p in _RETIRED_PARAM_PREFIXES)
+
+    def _reduced_index(self):
+        """[v28.21] "不含文档画像的世代身份"索引 (惰性, 每引擎一次)。
+
+        只登记**确实带 doc_summary_fp**的行 —— 不带该维度的行在 ladder ①②里
+        本就能对上, 无需在此重复。按 id 升序后写覆盖: 同一段落在不同世代里被
+        翻过多次时留最新一条, 与 _legacy_index/_retired_index 同约定。
+        用内存索引而非 SQL 的理由同 _legacy_index(旧行以 raw 文本入库, sqlite
+        精确匹配找不到"规范化相等、原文不等"的行)。
+        """
+        if self._reduced_canon_index is not None:
+            return self._reduced_canon_index
+        idx = {}
+        try:
+            for row in (_TranslationCache.select()
+                        .where(_TranslationCache.translate_engine
+                               == self.translate_engine)
+                        .order_by(_TranslationCache.id)):
+                stripped, had = self._strip_docsummary(row.translate_engine_params)
+                if not had:
+                    continue
+                canon_text, _ = self._canon_seq(row.original_text)
+                idx[(stripped, canon_text)] = (row.original_text, row.translation)
+        except Exception as e:
+            logger.debug(f"Reduced-form canon index build failed: {e}")
+        self._reduced_canon_index = idx
+        return idx
+
+    @staticmethod
     def _canon_seq(text: str):
         """[v23] {vN} 全局编号 → 段内出现序规范编号。
 
@@ -340,10 +435,29 @@ class TranslationCache:
         # 门控: 仅当**当前世代本身不含退役参数**时启用。润色若日后重新开启
         # (键里又出现 polish*), 这里直接跳过, 保持世代严格隔离 —— 不会把未润色
         # 的旧译文喂给开启润色的任务。
+        # (③ 会剔除 v23s, 所以它的门控必须把 v23s 也算作"退役参数在场"; 带前瞻
+        #  段因此走不到 ③, 由 ④ 兜住 —— ④ 不碰 v23s, 见 _reduced_form。)
         if self._strip_retired(pj)[1] == 0:
             idx = self._retired_index()
             for form in forms:
                 hit = idx.get((self._strip_retired(form)[0], canon_text))
+                if hit is not None:
+                    stored_original, stored_translation = hit
+                    _migrate_store(stored_original, stored_translation)
+                    return self._remap(stored_original, stored_translation, cur_seq)
+        # ④ [v28.21] "文档画像"投影回查: 同一段落库里可能躺着多代 doc_summary_fp
+        # (配置改动导致摘要键漂移, 见 _DOC_SUMMARY_PARAM), 全部投影到"最小世代
+        # 身份"后回查 —— 命中即回写迁移到当前形态(同 ② ③ 约定)。这是把已漂移
+        # 的译文救回来、不再整篇重译的那一档。
+        # 门控: 只看 polish*(退役世代标记), 不看 v23s。
+        # 为什么这里不能沿用 ③ 的门控: v23s 并非世代标记 —— 前瞻(v23.4)至今仍在
+        # 生产 `#la:…` 后缀, 用"含 v23s 即关门"会把带前瞻的段全部挡在门外(实测
+        # CLAP 每代 13~14 段救不回来)。④ 不剔除 v23s(_reduced_form), 世代隔离由
+        # "polish* 仍在形态里"天然保证, 故门控只需挡住"当前任务重新开启润色"。
+        if not self._has_retired_generation(pj):
+            idx = self._reduced_index()
+            for form in forms:
+                hit = idx.get((self._reduced_form(form), canon_text))
                 if hit is not None:
                     stored_original, stored_translation = hit
                     _migrate_store(stored_original, stored_translation)

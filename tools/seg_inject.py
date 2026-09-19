@@ -68,8 +68,20 @@ def renumber(text_pagelevel, raw_pagelevel):
 
 def detect_fp(cur, pages, man):
     """自动探测文档指纹: 取最长的几个段原文(重编号成段内编号)精确查缓存,
-    统计各行 translate_engine_params 里的 docsummary 指纹, 取覆盖行数最多者。"""
-    votes = {}
+    统计各行 translate_engine_params 里的 docsummary 指纹, 取覆盖行数最多者;
+    **平票时取最后写入的那一个世代**(见下)。
+
+    [v28.21+] 为什么平票必须取最新: 同一段落在库里会躺着**多代** doc_summary_fp
+    (配置改动让摘要键漂移, 每代各存一行, 见 cache.py `_DOC_SUMMARY_PARAM`)。
+    旧/新世代覆盖同样的段 -> 票数相同 -> 旧写法 `max(votes, key=votes.get)` 由
+    字典插入序决定, 返回先查到的**旧世代**; 随后 UPDATE 只落在被遮蔽的旧行上,
+    本脚本照常打印"已更新 N 行"/PASS, 而渲染器读的是新一代那一行 -> PDF 毫无变化。
+
+    判据选"id 最大"(= 最后写入)而不是别的: cache.set() 恒为 INSERT(从不原地
+    UPDATE), 故 id 单调 = 写入时序, 渲染器回查时 ③④ 档索引也正是"按 id 升序写
+    覆盖" —— 探测的口径就是回查的口径。
+    """
+    votes = {}  # fp -> (票数, 该 fp 命中行的最大 id)
     segs = []
     for it in man["items"]:
         for p in it["parts"]:
@@ -77,14 +89,29 @@ def detect_fp(cur, pages, man):
             if len(raw) >= 80:
                 segs.append(renumber(raw, raw))
     for cache_raw in sorted(segs, key=len, reverse=True)[:5]:
-        for (params,) in cur.execute(
-                "SELECT translate_engine_params FROM _translationcache WHERE original_text=?",
+        for rowid, params in cur.execute(
+                "SELECT id, translate_engine_params FROM _translationcache WHERE original_text=?",
                 (cache_raw,)):
             for fp in FP_RE.findall(params or ""):
-                votes[fp] = votes.get(fp, 0) + 1
+                n, mx = votes.get(fp, (0, 0))
+                votes[fp] = (n + 1, max(mx, rowid))
     if not votes:
         return None
-    return max(votes, key=votes.get)
+    # 元组按字典序比较: 先比票数, 平票再比"最后写入的行号"。
+    return max(votes, key=lambda fp: votes[fp])
+
+
+def newest_row(cur, cache_raw):
+    """该段"最后写入"的那一行 (id 最大) —— 渲染器实际读到的就是它。
+
+    cache.set() 恒为 INSERT, 故 id 单调 = 写入时序; 返回 (id, translation,
+    translate_engine_params), 该段没有任何行时返回 None。注入前后都用它复查:
+    "写进去了"不等于"渲染器会读到"。
+    """
+    return cur.execute(
+        "SELECT id, translation, translate_engine_params FROM _translationcache"
+        " WHERE original_text=? ORDER BY id DESC LIMIT 1",
+        (cache_raw,)).fetchone()
 
 
 def main():
@@ -93,7 +120,8 @@ def main():
     ap.add_argument("--manifest", required=True)
     ap.add_argument("--shift", default="", help='如 "S4:1,S9:2"')
     ap.add_argument("--sidecar", default=SIDECAR, help="侧车路径; 新论文先归档 latest.jsonl 再指向它")
-    ap.add_argument("--fp", default="", help="文档指纹; 缺省自动探测(探测失败回落 Cactaceae 默认)")
+    ap.add_argument("--fp", default="",
+                    help="文档指纹; 缺省自动探测(平票取最后写入的世代; 探测失败回落 Cactaceae 默认)")
     ap.add_argument("--dry", action="store_true", help="只演算不写库")
     args = ap.parse_args()
 
@@ -178,11 +206,25 @@ def main():
             print("%s: %d 字 -> %d 行%s" % (key, len(new_trans), len(rows), tag))
             if not rows:
                 continue
-            if not args.dry:
+            if args.dry:
+                # [v28.21+] 自检(预演): 该段"最新行"是否落在本次作用域里。
+                # 不在 -> 实写只会落在被遮蔽的旧世代行上, 渲染器不会读到。
+                newest = newest_row(cur, cache_raw)
+                if newest and fp not in (newest[2] or ""):
+                    ok = False
+                    print("  [FAIL 自检] 该段最新行(id %d)不在作用域 %s 内"
+                          " —— 实写落在被遮蔽世代" % (newest[0], fp))
+            else:
                 cur.execute(
                     "UPDATE _translationcache SET translation=? WHERE original_text=? AND " + scope,
                     (new_trans, cache_raw, scope_arg))
                 print("  已更新 %d 行" % cur.rowcount)
+                # [v28.21+] 自检(实写): 复查最新行是否真的变成新译文。
+                newest = newest_row(cur, cache_raw)
+                if newest and newest[1] != new_trans:
+                    ok = False
+                    print("  [FAIL 自检] 最新行(id %d)译文未被更新 —— 注入落在被遮蔽世代"
+                          % newest[0])
 
     if not args.dry:
         con.commit()

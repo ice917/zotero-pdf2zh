@@ -593,7 +593,7 @@ class OpenAITranslator(BaseTranslator):
             text = (text or "").strip()
             if len(text) < 400:
                 return getattr(self, "_doc_summary", "") or ""
-            key = hashlib.md5(text.encode("utf-8")).hexdigest()[:16]
+            key = self._summary_text_key(text)
             folder = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "docsummary")
             os.makedirs(folder, exist_ok=True)
             path = os.path.join(folder, key + ".txt")
@@ -637,10 +637,20 @@ class OpenAITranslator(BaseTranslator):
         """[v24-A] 读取文档画像 (缺省空)。"""
         return (getattr(self, "_doc_summary", "") or "").strip()
 
+    @staticmethod
+    def _summary_text_key(text: str) -> str:
+        """[v28.21] 摘要文本键: 剔除残留 {vN} 后取 md5。
+
+        上游 converter 已把占位符还原成真实字形再传进来; 这里再剔一次是防御
+        —— 还原越界或编号形态异常时会留下字面 {vN}, 而它的编号随 config 变,
+        不能让摘要落盘键/缓存键跟着漂(漂一次 = 全篇换键重译)。
+        """
+        t = re.sub(r"\{v\d+\}", "", (text or "").strip())
+        return hashlib.md5(t.encode("utf-8")).hexdigest()[:16] if t else "-"
+
     def _doc_summary_fp(self, text: str) -> str:
         """[v24-A] 文档画像指纹 (摘要内容 + 文本键), 供缓存键/落盘复用。"""
-        t = (text or "").strip()
-        key = hashlib.md5(t.encode("utf-8")).hexdigest()[:16] if t else "-"
+        key = self._summary_text_key(text)
         s = (getattr(self, "_doc_summary", "") or "").strip()
         return f"docsummary:{key}:{hashlib.md5(s.encode('utf-8')).hexdigest()[:8] if s else 'none'}"
 
