@@ -9,10 +9,17 @@
   5. 输出 payload 文件 (#S 编号行) + manifest.json (编号 -> 页/段映射)
 
 用法:
-  python tools/seg_export.py --pages 2-4 --name payload_p2_p4
+  python tools/seg_export.py --pages 2-4 --name payload_p2_p4 \
+      --doc "Reproductive Biology of Cactaceae (Desert Plants, 2009)"
 产出:
   D:\\zotero-pdf2zh\\inbox\\payload_p2_p4.txt
   D:\\zotero-pdf2zh\\inbox\\payload_p2_p4.manifest.json
+
+文档抬头与术语表都可参数化 (v28.1):
+  --doc   抬头文本。缺省只写页码 —— 不再内置某篇论文的抬头, 否则导出别的论文
+          时会给豆包一个错误的文档先验 (旧版硬编码 Cactaceae, 导出任何一篇都带它)。
+  --terms 术语表 csv (english,chinese, 无表头)。缺省 server/glossary/terms.csv;
+          传空串则退化为"按学科惯例统一译名", 不注入任何具体术语。
 """
 import argparse
 import io
@@ -24,22 +31,51 @@ import sys
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 SIDECAR = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow", "latest.jsonl")
-INBOX = os.environ.get("P2Z_INBOX", r"D:\zotero-pdf2zh\inbox")
+PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
+INBOX = os.environ.get("P2Z_INBOX", os.path.join(PROJ, "inbox"))
+TERMS_CSV = os.path.join(PROJ, "server", "glossary", "terms.csv")
 
 V_TOKEN = re.compile(r"\{v(\d+)\}")
 PURE_GLYPH = re.compile(r"^(?:\{v\d+\})+$")
 TERMINAL = tuple(".!?:;)】」”']")  # 句末/收尾标点 (含引括号收口)
 
-RULES = """[文档] Reproductive Biology of Cactaceae (Desert Plants, 2009) 第{pages}页
+RULES = """[文档] {doc}第{pages}页
 [任务] 把下列每个 #S 段落译成简体中文（学术书排版用），只输出译文，不要任何解释。
 [规则]
 1. 每段独立翻译；译文前先写一行原样的 #S编号；不许合并、拆分、增删段落。
 2. 数字、拉丁学名、人名、单位、[n] 引用标号、化学式：原样保留，不译不改不移动位置。
 3. ⋮ 是原文分页断点：译文在语义对应的断点处保留一个 ⋮；除此之外不得出现该符号。
-4. 术语统一：Cactaceae=仙人掌科；herkogamy=雌雄异位；breeding system=繁殖系统；
-   successful gamete(s)=可育配子；selfing/selfer=自交/自交个体；outcrossing=异交。
-5. 中文通顺为学术散文，不要翻译腔；段内语序可按中文习惯调整，但事实与数字不得增减。
+{terms}5. 中文通顺为学术散文，不要翻译腔；段内语序可按中文习惯调整，但事实与数字不得增减。
 """
+
+TERMS_FALLBACK = "4. 术语统一：按学科惯例统一译名，同一术语全文译法一致。\n"
+
+
+def load_terms(path):
+    """读术语表 csv (无表头, 'english,chinese') -> [(en, zh), ...]; 缺文件即空表"""
+    if not path or not os.path.exists(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8-sig") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(",", 1)
+            if len(parts) != 2:
+                continue
+            en, zh = parts[0].strip(), parts[1].strip()
+            if en and zh:
+                out.append((en, zh))
+    return out
+
+
+def terms_line(path):
+    """术语表 -> RULES 第 4 条的整行; 空表/缺文件退化为通用要求(不撒谎不误导向)"""
+    terms = load_terms(path)
+    if not terms:
+        return TERMS_FALLBACK
+    return "4. 术语统一：%s。\n" % "；".join("%s=%s" % (en, zh) for en, zh in terms)
 
 
 def load_pages(pages_want, sidecar):
@@ -72,6 +108,9 @@ def main():
     ap.add_argument("--pages", required=True, help="如 2-4 或 2,3,4")
     ap.add_argument("--name", required=True, help="payload 文件名(不含扩展名)")
     ap.add_argument("--sidecar", default=SIDECAR, help="侧车路径; 新论文请先归档 latest.jsonl 再用")
+    ap.add_argument("--doc", default="", help='文档抬头, 如 "标题 (期刊, 年份)"; 缺省只写页码')
+    ap.add_argument("--terms", default=TERMS_CSV,
+                    help="术语表 csv (english,chinese 无表头); 缺省 %s; 传空串则不注入具体术语" % TERMS_CSV)
     ap.add_argument("--force", action="store_true", help="续接检测失败也照常导出(逐段独立)")
     args = ap.parse_args()
 
@@ -134,7 +173,10 @@ def main():
         it["key"] = "S%d" % n
 
     # ---- 输出 payload ----
-    lines = [RULES.replace("{pages}", args.pages)]
+    doc = args.doc.strip()
+    lines = [RULES.format(doc=(doc + " ") if doc else "",
+                          pages=args.pages,
+                          terms=terms_line(args.terms))]
     for it in items:
         lines.append("#%s" % it["key"])
         body = ""

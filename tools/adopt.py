@@ -25,7 +25,7 @@
 
 用法 (解释器同 tools/tests/run_all.py):
   PY = D:/Users/<user>/anaconda3/envs/zotero-pdf2zh-venv/python.exe
-  & $PY tools/adopt.py export --name payload_p2_p4 --pages 2-4
+  & $PY tools/adopt.py export --name payload_p2_p4 --pages 2-4 --doc "标题 (期刊, 年份)"
   & $PY tools/adopt.py deliver --name payload_p2_p4 --text "D:/.../p2_p4.doubao.txt"
   & $PY tools/adopt.py import  --name payload_p2_p4
   & $PY tools/adopt.py inject  --name payload_p2_p4
@@ -236,7 +236,9 @@ def stage_export(args):
         return die("本 run 已导出过; 重做请加 --force (会覆盖 inbox 同名件)")
 
     rc, _ = run_tool("seg_export.py",
-                     ["--pages", args.pages, "--name", args.name, "--sidecar", args.sidecar])
+                     ["--pages", args.pages, "--name", args.name, "--sidecar", args.sidecar]
+                     + (["--doc", args.doc] if args.doc else [])
+                     + (["--terms", args.terms] if args.terms else []))
     if rc != 0:
         mark(led, "export", "failed", reason="seg_export 退出码 %d" % rc)
         save_ledger(led)
@@ -522,6 +524,8 @@ def main():
     common(p)
     p.add_argument("--pages", required=True, help="如 2-4 或 1,21-22")
     p.add_argument("--sidecar", default=SIDECAR, help="缺省 latest.jsonl; 新论文先用归档件")
+    p.add_argument("--doc", default="", help='文档抬头(写进 payload 首行), 如 "标题 (期刊, 年份)"')
+    p.add_argument("--terms", default="", help="术语表 csv; 缺省用 seg_export 默认(server/glossary/terms.csv)")
     p.set_defaults(fn=stage_export)
 
     p = sub.add_parser("deliver", help="2 登记豆包交件 (段号守恒门禁)")
