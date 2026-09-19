@@ -988,10 +988,22 @@ class PDFFont:
 #       （环境变量 PDF2ZH_FONT_LEDGER 可覆盖，供测试隔离）
 
 
+def _proj_root():
+    """项目根 —— 与 tools/ 下 adopt.py / seg_export.py / doubao_bridge.py 同一套约定:
+    P2Z_PROJ 优先, 未设才退回本机默认安装路径。
+
+    补这一层的原因: 下面两处路径原本焊死成 D:\\zotero-pdf2zh, 用户把项目装在别的盘符
+    时读不到文件 —— 而读取处是 `except: pass`, **静默失效**(字形校正无声消失, 零报错)。
+    """
+    import os
+    return os.environ.get("P2Z_PROJ") or r"D:\zotero-pdf2zh"
+
+
 def _font_ledger_path():
     import os
     return (os.environ.get("PDF2ZH_FONT_LEDGER")
-            or r"D:\zotero-pdf2zh\server\translated\review\字体降级台账.jsonl")
+            or os.path.join(_proj_root(), "server", "translated", "review",
+                            "字体降级台账.jsonl"))
 
 
 def _last_frame(exc):
@@ -1070,13 +1082,25 @@ class PDFNullFont(PDFFont):
 # 应用条件: 该码位当前解码 == 记录的错误解码时才替换, 避免误伤正常字符
 import json as _json
 
+
+def _font_fix_path():
+    """校正表路径 —— PDF2ZH_FONT_FIXES 优先, 否则 <项目根>/server/config/font_char_fixes.json"""
+    import os
+    return (os.environ.get("PDF2ZH_FONT_FIXES")
+            or os.path.join(_proj_root(), "server", "config", "font_char_fixes.json"))
+
+
+_FONT_FIX_PATH = _font_fix_path()
 _FONT_FIX_TABLE: dict = {}
 try:
-    _FONT_FIX_PATH = r"D:\zotero-pdf2zh\server\config\font_char_fixes.json"
     with open(_FONT_FIX_PATH, "r", encoding="utf-8") as _fh:
         _FONT_FIX_TABLE = _json.load(_fh)
-except Exception:
-    pass
+except FileNotFoundError:
+    pass  # 允许不部署校正表(缺文件时行为与历史一致)
+except Exception as _e:
+    # 表在但读不动(JSON 坏/权限): 必须出声 —— 否则字形校正静默消失, 零报错
+    import sys as _sys
+    _sys.stderr.write("[pdffont] 字体字符校正表加载失败 %s: %s\n" % (_FONT_FIX_PATH, _e))
 
 
 def _apply_font_char_fixes(basefont, cid2unicode):

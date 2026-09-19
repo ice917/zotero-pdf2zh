@@ -115,14 +115,27 @@ git clone <本仓库地址> D:\zotero-pdf2zh
 ```
 
 没有 git 也不要紧：在仓库主页点 `Code → Download ZIP`，解压后把文件夹改名成 `zotero-pdf2zh`
-放到 D 盘根目录。**路径必须是 `D:\zotero-pdf2zh`**——配置文件里写死了这个路径。
+放到 D 盘根目录。
 
-如果你确实想放到别处，先改配置里的写死路径（把 `D:/你的路径` 换成真实路径，注意是正斜杠）：
+**默认按 `D:\zotero-pdf2zh` 走**；装在别处也能用，但要把"项目根"在两处一起改掉：
+
+**① 配置里的绝对路径**（`config.json` / `config.toml` 里指向项目内的术语表、字体、报告目录）。
+先改模板（第 6 步会由它生成 `config.json`），把 `D:/你的路径` 换成真实路径，注意用正斜杠：
 
 ```powershell
 cd D:\你的路径
 (Get-Content server\config\config.json.example -Raw -Encoding UTF8) -replace 'D:/zotero-pdf2zh', 'D:/你的路径' | Set-Content server\config\config.json.example -Encoding UTF8
 ```
+
+**② 环境变量 `P2Z_PROJ`** —— 工具链（`tools\*.py`）、服务端、以及引擎补丁里读项目内文件的两处
+（字形校正表 `server\config\font_char_fixes.json`、字体降级台账）都认这一个变量。
+**在第 7 步启动服务端的那个窗口里设一次**即可，服务端会把它传给自己拉起的子进程：
+
+```powershell
+$env:P2Z_PROJ = 'D:\你的路径'
+```
+
+不设就退回默认的 `D:\zotero-pdf2zh`（项目就装在那儿的话，这步什么都不用做）。
 
 ### 第 4 步：建翻译环境（等 5~10 分钟）
 
