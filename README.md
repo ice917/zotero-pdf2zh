@@ -321,7 +321,7 @@ New-Item -ItemType Directory -Force inbox, out, segflow
 #    侧车默认在 %USERPROFILE%\.cache\pdf2zh\segflow\latest.jsonl，每翻一篇会被覆盖，所以先归档
 Copy-Item "$env:USERPROFILE\.cache\pdf2zh\segflow\latest.jsonl" segflow\<书名>.jsonl
 
-# 1) 导出段落包并放入剪贴板
+# 1) 导出段落包并放入剪贴板  (--pages 写**真实 PDF 页码**, 与体检/门禁报告同一口径)
 python tools/seg_export.py --pages 2-4 --name payload_p2_p4 --sidecar segflow/<书名>.jsonl
 Set-Clipboard ([IO.File]::ReadAllText('inbox/payload_p2_p4.txt',[Text.Encoding]::UTF8))
 

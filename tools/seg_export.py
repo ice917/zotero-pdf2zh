@@ -2,13 +2,15 @@
 """seg_export.py — 从侧车导出"编号段落包"给豆包翻译 (M1 工具)
 
 做什么:
-  1. 读 C:\\Users\\<user>\\.cache\\pdf2zh\\segflow\\latest.jsonl (每行一页: segs+vars)
+  1. 读 C:\\Users\\<user>\\.cache\\pdf2zh\\segflow\\latest.jsonl
+     (每行 = 一次 receive_layout 回调: page/pageid/segs/vars。**不是**"每行一页":
+      图形对象也各占一行, 那行的 pageid 就是它所在的真实页)
   2. 过滤纯字形段 (页眉/页码/整页表格 = {vN} 组成, 无可译文字)
   3. 还原字形: {vN} -> vars[str(N)], 让豆包看到真实数字/拉丁名
   4. 检测跨页续接 (上段尾无句末标点 + 下段首小写) -> 合并为一条, 原断点插 ⋮
   5. 输出 payload 文件 (#S 编号行) + manifest.json (编号 -> 页/段映射)
 
-用法:
+用法 (--pages 是**真实 PDF 页码**, 与质检/体检报告同一口径; v28.10 起):
   python tools/seg_export.py --pages 2-4 --name payload_p2_p4 \
       --doc "Reproductive Biology of Cactaceae (Desert Plants, 2009)"
 产出:
@@ -84,17 +86,47 @@ def terms_line(path):
     return "4. 术语统一：%s。\n" % "；".join("%s=%s" % (en, zh) for en, zh in terms)
 
 
+def true_page(o):
+    """侧车记录的**真实 PDF 页码**(1 基); 记录里没有 pageid 时回落 None。
+
+    侧车的 `page` 是 receive_layout 的**回调计数**, 不是页码: 图形对象也会各占
+    一号 (end_figure -> receive_layout(fig)), 所以图多的论文整体漂移。真实页码
+    只有 `pageid` 说得准 (LTPage.pageid, 0 基; 图形继承所在页的 pageid)。
+    """
+    pid = o.get("pageid")
+    return None if pid is None else int(pid) + 1
+
+
 def load_pages(pages_want, sidecar):
-    got = {}
+    """按**真实 PDF 页码**选页 -> (记录表, 缺页列表)。
+
+    为什么按真实页码: 质检/体检报告说的都是真实页码, 用户在报告里读到
+    "第43,44页"再照抄到 `--pages` 上是最自然的用法。而 v28.10 之前这里按回调
+    计数匹配, 对图多的论文会整体漂移 —— 实测 Melhani 真实第43,44页对应侧车
+    第55,56条(漂 12), `--pages 43-44` 取回的是第31,32页正文, 且库内照样命中
+    12 行、段号照样连续, 一路"看起来正常"(静默错)。
+
+    返回的记录表仍以侧车原 `page` 为键 —— 那是**载荷内部坐标**
+    (manifest / imported.json / seg_inject 沿用它), 不随本函数改变;
+    `pageid` 缺失的老侧车退化为按 `page` 匹配(与旧行为一致, 不误伤归档件)。
+    """
+    got, seen = {}, set()
     with open(sidecar, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             o = json.loads(line)
-            if o["page"] in pages_want:
+            tp = true_page(o)
+            if tp is None:                      # 老侧车没有 pageid
+                if o["page"] in pages_want:
+                    got[o["page"]] = o
+                    seen.add(o["page"])
+                continue
+            if tp in pages_want:
                 got[o["page"]] = o
-    return got
+                seen.add(tp)
+    return got, [p for p in sorted(pages_want) if p not in seen]
 
 
 def restore(raw, vars_):
@@ -111,7 +143,8 @@ def restore(raw, vars_):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pages", required=True, help="如 2-4 或 2,3,4")
+    ap.add_argument("--pages", required=True,
+                    help="真实 PDF 页码(与质检/体检报告同一口径), 如 2-4 或 2,3,4")
     ap.add_argument("--name", required=True, help="payload 文件名(不含扩展名)")
     ap.add_argument("--sidecar", default=SIDECAR, help="侧车路径; 新论文请先归档 latest.jsonl 再用")
     ap.add_argument("--doc", default="", help='文档抬头, 如 "标题 (期刊, 年份)"; 缺省只写页码')
@@ -128,17 +161,17 @@ def main():
             pages_want.update(range(a, b + 1))
         else:
             pages_want.add(int(tok))
-    pages = load_pages(pages_want, args.sidecar)
-    missing = [p for p in sorted(pages_want) if p not in pages]
+    pages, missing = load_pages(pages_want, args.sidecar)
     if missing:
         print("侧车缺页: %s" % missing)
         return 1
 
     # ---- 收集可译段 (顺序: 页升序, 段升序) ----
-    items = []   # {"parts": [(page, idx, text)], "merged": bool}
+    items = []   # {"parts": [(侧车坐标页, 段序, 文本, 真实页码)], "merged": bool}
     warnings = []
     for pg in sorted(pages):
         o = pages[pg]
+        tp = true_page(o)
         vv = o.get("vars") or {}
         for i, s in enumerate(o["segs"]):
             raw = (s.get("raw") or "").strip()
@@ -149,7 +182,8 @@ def main():
                 warnings.append("p%d#%d 仍有未还原占位符: %s" % (pg, i, V_TOKEN.findall(text)[:5]))
             if not re.search(r"[A-Za-z0-9]", text):
                 continue
-            items.append({"parts": [(pg, i, text)], "merged": False})
+            items.append({"parts": [(pg, i, text, tp if tp is not None else pg)],
+                          "merged": False})
 
     # ---- 跨页续接检测与合并 ----
     def tail(t):
@@ -164,7 +198,9 @@ def main():
         a, b = items[i], items[i + 1]
         ta = a["parts"][-1][2]
         tb = b["parts"][0][2]
-        pa, pb = a["parts"][-1][0], b["parts"][0][0]
+        # 相邻性按**真实页码**判: 侧车坐标页是回调计数, 用它判会把"同页的图形记录"
+        # 当成隔页, 也会把"隔着一页"当成相邻。
+        pa, pb = a["parts"][-1][3], b["parts"][0][3]
         # 页码必须物理相邻才可能跨页续接; 离散页集(如 1,21-22)不得跨空隙合并
         if pb == pa + 1 and tail(ta) not in TERMINAL and (tb[0].islower() or tb[0].isdigit()):
             a["parts"].append(b["parts"][0])
@@ -189,7 +225,7 @@ def main():
     for it in items:
         lines.append("#%s" % it["key"])
         body = ""
-        for j, (pg, idx, text) in enumerate(it["parts"]):
+        for j, (_pg, _idx, text, _tp) in enumerate(it["parts"]):
             if j:
                 body += "⋮"
             body += text
@@ -199,7 +235,7 @@ def main():
         manifest["items"].append({
             "key": it["key"],
             "merged": it["merged"],
-            "parts": [{"page": pg, "seg": idx} for pg, idx, _ in it["parts"]],
+            "parts": [{"page": pg, "seg": idx} for pg, idx, _t, _tp in it["parts"]],
         })
 
     os.makedirs(INBOX, exist_ok=True)
@@ -218,7 +254,7 @@ def main():
     for w in warnings:
         print("  [警告] " + w)
     for it in items:
-        loc = "+".join("p%d#%d" % (pg, idx) for pg, idx, _ in it["parts"])
+        loc = "+".join("p%d#%d" % (tp, idx) for _pg, idx, _t, tp in it["parts"])
         t = it["parts"][-1][2] if not it["merged"] else it["parts"][-1][2][:25] + "…"
         print("  %-5s %-12s %5dch  %s" % (
             "#" + it["key"], loc,
