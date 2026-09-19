@@ -73,6 +73,14 @@ python server.py
 等不到交稿也不会卡死：到上限走 `abort()` —— 先 `adopt rollback` 撤掉骨架行，再回落成
 正常机器翻译，任务照样 `success`，产物是正常中文 PDF。
 
+**载荷就绪会响两声**（第一趟比机器翻译快一个量级，人一转头的功夫就过去了，而"该叫豆包了"
+是这条链上唯一需要人立刻接手的时刻）：默认放随服务端自带的 `server/notify-complete.wav`，
+想换音就设 `PDF2ZH_NOTIFY_SOUND` 指向任意 WAV（必须 16-bit PCM —— `winsound` 只吃这种）；
+两个都没有时退回三声蜂鸣，全程静默失败、不影响任务。
+
+> 自带的那声铃来自 [`CaesiumY/dding-dong`](https://github.com/CaesiumY/dding-dong)（MIT）的
+> musical 音色包，取其中的 `complete.wav`。该仓库未单独标注音频素材的出处，介意可自行替换。
+
 > 骨架行 = 第一趟按"原文 = 译文"落下的缓存行，专门给 `inject` 一个就地改写的落点
 > （`seg_inject` 是 UPDATE-only：按"原文 + 文档作用域"找行，找不到就 FAIL，这条安全设计不能松）。
 > 全部设计取舍见 `改动记录.md` 的 v28.23 一节。

@@ -130,6 +130,47 @@ def _segflow_progress(sidecar):
     return segs, pages
 
 
+# [v28.27] 载荷就绪提示音: 默认用随服务端自带的 WAV, 可用环境变量换成任意 wav。
+# 为什么不用前端那个提示音(server/bo.mp3): 前端只在任务**结束**时响, 而两趟流程
+# 在「待译」这一刻任务仍算 active, 那一下是静的 —— 要有人来接手的时刻恰好在中间。
+NOTIFY_SOUND_ENV = "PDF2ZH_NOTIFY_SOUND"
+NOTIFY_SOUND_FILE = "notify-complete.wav"   # 16bit PCM 44.1kHz 单声道, 约 0.4 秒
+NOTIFY_SOUND_REPEAT = 2                     # 一声太短容易错过, 响两下
+
+
+def _notify_sound_path():
+    """提示音文件: 环境变量优先, 其次随服务端自带的那个; 都没有返回空串。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for p in (os.environ.get(NOTIFY_SOUND_ENV), os.path.join(here, NOTIFY_SOUND_FILE)):
+        if p and os.path.exists(p):
+            return p
+    return ""
+
+
+def _play_notify_sound():
+    """响就绪铃。winsound 只吃 WAV; 文件缺失(换机/被删)时退回蜂鸣, 全程静默失败。"""
+    try:
+        import winsound
+    except ImportError:         # 非 Windows 平台: 没有就绪铃, 不影响任务
+        return
+    path = _notify_sound_path()
+    if path:
+        try:
+            for i in range(max(1, NOTIFY_SOUND_REPEAT)):
+                if i:
+                    time.sleep(0.25)
+                winsound.PlaySound(path, winsound.SND_FILENAME)
+            return
+        except Exception as e:
+            print(f"⚠️ [两趟] 提示音没响成({path}): {e}")
+    try:
+        for _ in range(3):
+            winsound.Beep(880, 160)
+            time.sleep(0.07)
+    except Exception:
+        pass
+
+
 def _notify_payload_ready(task_id, name, pages_str):
     """[v28.26] 载荷就绪 → 响铃 + 醒目横幅 + ready 标记 + 卡片落到「待译」。
 
@@ -156,13 +197,7 @@ def _notify_payload_ready(task_id, name, pages_str):
     print("🔔 [两趟] 载荷已就绪：inbox/%s.txt  (%d 段 / 覆盖 %s 页)" % (name, n_items, pages_str))
     print("        下一步：把这份载荷交给豆包定稿 (豆包可用桥的 get_payload 直接取)")
     print("=" * 68 + "\n")
-    try:                        # Windows 本地响铃; 无声卡/被禁用时静默跳过
-        import winsound
-        for _ in range(3):
-            winsound.Beep(880, 160)
-            time.sleep(0.07)
-    except Exception:
-        pass
+    _play_notify_sound()
     task_manager.update_task(task_id, {
         'status': '待译',
         'message': '待译：载荷已就绪（%d 段 / 覆盖 %s 页），等待豆包交稿' % (n_items, pages_str),
