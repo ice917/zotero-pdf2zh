@@ -71,6 +71,9 @@ NEED = {  # 阶段 -> 前置阶段
     "gate": ["render"],
 }
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_\-. ]{1,80}$")
+# 只在 mark(..., "failed") 时写的字段: 阶段转 ok 后必须剔除, 否则台账里会留下
+# "ok 却带着失败原因"的自相矛盾(见 mark() 注释)。
+_FAIL_ONLY = ("reason", "missing", "extra", "detail")
 
 # 复用一线工具的口径, 避免"门禁的解析规则"与"真正执行的解析规则"漂移:
 #   seg_import.KEY_LINE / parse_blocks —— 段号行怎么认 (容忍 markdown 加粗)
@@ -138,6 +141,12 @@ def save_ledger(led):
 def mark(led, stage, state, **kw):
     rec = led["stages"].setdefault(stage, {})
     rec.update(kw)
+    # [自研补丁 2026-09-19] 失败专属字段只描述失败, 转 ok 就作废。mark() 是 update,
+    # 不剔除的话台账会自相矛盾 —— 实测 wang2026 的 import 重跑成功后仍是
+    # {"state":"ok", "reason":"seg_import 退出码 1"}。
+    if state == "ok":
+        for k in _FAIL_ONLY:
+            rec.pop(k, None)
     rec["state"] = state
     rec["at"] = now()
     return rec
@@ -450,10 +459,15 @@ def stage_render(args):
         mark(led, "render", "failed", reason="force_rerender 退出码 %d" % rc, pdf=pdf)
         save_ledger(led)
         return rc
-    prods = re.findall(r"产物: (\S+\.pdf)", out)
+    # [自研补丁 2026-09-19] 产物路径按**整行剩余**解析: 原文文件名可能带空格
+    # (实测 "Wang 等 - 2026 - Differentially Private Consensus for Time-Delay
+    # Multi-agent Systems.pdf"), 原来的 \S+ 只能吃到空格后的最后一段, 台账把
+    # mono 记成 "Systems-mono.pdf" -> gate 阶段拿着个不存在的路径直接拒绝执行。
+    # 另外优先取 -mono.pdf: gate 的 verify_render/post_check 要的就是 mono 译文。
+    prods = [p.strip() for p in re.findall(r"(?m)^\s*产物:\s*(.+\.pdf)\s*$", out)]
     secs = re.findall(r"耗时 (\d+) 秒", out)
-    mono = re.findall(r"(\S+-mono\.pdf)", out)
-    prod = prods[0] if prods else (mono[-1] if mono else None)
+    mono = [p for p in prods if p.lower().endswith("-mono.pdf")]
+    prod = mono[-1] if mono else (prods[0] if prods else None)
     if prod is None:
         print("[adopt] 警告: 未从输出解析到产物路径; gate 阶段将回落到'最新 mono'")
     mark(led, "render", "ok", pdf=pdf, mono=prod,

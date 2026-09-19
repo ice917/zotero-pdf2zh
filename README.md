@@ -37,10 +37,12 @@
 ```
 
 可选自动化通道：`doubao_bridge.py` 是零依赖手写的 STDIO MCP 桥（list_inbox / get_payload /
-list_reports / get_report / submit_result / search_term），注册进豆包「技能·连接器」后可省掉
-剪贴板（消耗 Agent 模式额度）；其中 `search_term` 让豆包**定稿时自己查证据**，不必等人喂数据
-（见 [术语查证](#术语查证先拿证据再裁决)），`list_reports` / `get_report` 让豆包
-**自己读质检报告**、知道上一轮哪一页被门禁判死——改稿前先看清单，才叫矫正而不是重抄一遍。
+list_reports / get_report / list_results / get_result / submit_result / search_term），注册进
+豆包「技能·连接器」后可省掉剪贴板（消耗 Agent 模式额度）；其中 `search_term` 让豆包**定稿时自己查证据**，
+不必等人喂数据（见 [术语查证](#术语查证先拿证据再裁决)），`list_reports` / `get_report` 让豆包
+**自己读质检报告**、知道上一轮哪一页被门禁判死，`list_results` / `get_result` 让它**读回自己上一版稿子**——
+前两个给"哪儿错了"，这两个给"上一版长什么样"，两个都看得见，改稿才是改动而不是重抄一遍；
+`submit_result` 的回执里附上与上一版的改动段数，改动面过大时直接提示"这一轮是在重译"。
 桥的路径走环境变量（`P2Z_PROJ` / `P2Z_INBOX` / `P2Z_REVIEW`），不设则退回 `D:\zotero-pdf2zh`。
 
 旁路（不参与主流程）：`term_verify.py` 术语证据查证——卡在某个词的译法时取证据再裁决，
@@ -243,7 +245,7 @@ python tools\appendix_species.py --pdf $out --redraw
 | `tools/seg_export.py` | 侧车 → 编号段落包：字形还原、PDF 断词修复、跨页续接合并 |
 | `tools/seg_import.py` | 译文校验与回锚：编号/⋮/数字/拉丁名逐一对账 |
 | `tools/seg_inject.py` | 缓存注入：重编号 + 文档指纹作用域 + 前置断言 + 自动备份 |
-| `tools/doubao_bridge.py` | 豆包本地 MCP 桥（STDIO JSON-RPC，零第三方依赖）：inbox/payload/result 三件套 + `search_term` 术语证据检索 + `list_reports`/`get_report` 读质检报告 |
+| `tools/doubao_bridge.py` | 豆包本地 MCP 桥（STDIO JSON-RPC，零第三方依赖）：inbox/payload/result 三件套 + `search_term` 术语证据检索 + `list_reports`/`get_report` 读质检报告 + `list_results`/`get_result` 读回上一版交件 |
 | `tools/force_rerender.py` | force 重渲染（防漏传 config 静默回落 bing 重译） |
 | `tools/verify_render.py` | 渲染验收：新串落页 / 旧串清零，13 项断言 |
 | `tools/post_check.py` | 翻译后质检门禁：汉化率 / 引用完整性 / 占位符残留 |

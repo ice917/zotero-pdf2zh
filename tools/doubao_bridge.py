@@ -7,7 +7,7 @@
   参数:     <项目根>/tools/doubao_bridge.py
   环境变量: P2Z_PROJ=<项目根>   (不设则退回 D:\\zotero-pdf2zh)
 
-暴露六个工具:
+暴露八个工具:
   list_inbox()                 列出待译 payload (<项目根>/inbox)
   get_payload(name)            读取 payload 全文 (编号段落包, #S1..#Sn, ⋮ 为跨页断点)
   list_reports(kind, limit)    列出质检/体检报告 (<项目根>/server/translated/review),
@@ -15,6 +15,13 @@
                                这是"矫正"的入口: 不先知道哪篇没过、为什么没过,
                                就无从改起
   get_report(name)             读取一份报告全文(问题清单: 哪页、什么断言、原文片段)
+  list_results(name, limit)    列出已经交过的译文 (<项目根>/out, 按时间倒序, 附段数)。
+                               与 list_reports 配对: 报告说"哪儿错了", 这里给"上一版
+                               长什么样" —— 两个都看得见, 改稿才是**改动**而不是重抄
+  get_result(name)             读回一份已交译文全文(通常是豆包自己上一轮的稿子)。
+                               改稿必须在它上面改: 看不到上一版就只能拿 inbox 原文
+                               整篇重译, 实测那样会洗掉大部分已定稿段落并重新引入
+                               公式字形块破坏
   submit_result(name, text)    保存译文到 <项目根>/out, 返回段号统计。
                                文件名统一落成 `<名>.doubao.txt` —— 与 tools/adopt.py
                                的 deliver 自动发现规则 (out/<name>.doubao*.txt) 对齐;
@@ -48,6 +55,10 @@ MAX_READ = 4 * 1024 * 1024
 
 S_LINE = re.compile(r"(?m)^\s*#S(\d+)\s*$")
 _DOUBAO_SUFFIX = re.compile(r"\.doubao\d*$")
+# out/ 下的交件: `<论文名>.doubao[序号].txt`。第 1 组是论文名, 第 2 组是轮次号。
+# 只认这个形态 —— out/ 里还堆着 seg_import/seg_inject 的中间产物
+# (.imported.json / .merged.txt / .raw.txt), 一律不能当"上一版交件"甩给豆包。
+_RESULT_FILE = re.compile(r"^(.+?)\.doubao(\d*)\.txt$")
 
 # review/ 下按前缀区分六种报告; 默认取第一种 —— 门禁报告才有 PASS/FAIL 判定
 REPORT_KINDS = ("翻译后质检", "翻译前体检", "审校报告", "存疑清单",
@@ -192,6 +203,142 @@ def tool_get_report(args):
         return f.read(MAX_READ)
 
 
+def _result_names(stem=None):
+    """out/ 下的交件文件名, 按修改时间倒序(最新在前)。
+
+    stem 是论文名(如 "wang2026")。比对上放宽成前缀匹配 —— 交件名由 submit_result
+    规范化而来, 但历史文件是人手起的, 别因为大小写/多一个空格就一条都列不出来。
+    """
+    if not os.path.isdir(OUTDIR):
+        return []
+    names = [n for n in os.listdir(OUTDIR) if _RESULT_FILE.match(n)]
+    if stem:
+        names = [n for n in names if n.lower().startswith(stem.lower() + ".doubao")]
+    names.sort(key=lambda n: os.path.getmtime(os.path.join(OUTDIR, n)), reverse=True)
+    return names
+
+
+def _seg_count(path):
+    """数一份交件里的 #S 段号个数; 读不动返回 -1。
+
+    列交件必须带段数: 同一篇在 out/ 下有多轮(.doubao/.doubao2/.doubao3/.doubao4),
+    光看字节数分不清哪份是全的、哪份是残件 —— 而"该在上一版基础上改"这件事,
+    前提就是先认出哪份是全量上一版。
+    """
+    try:
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return len(S_LINE.findall(f.read(MAX_READ)))
+    except OSError:
+        return -1
+
+
+def tool_list_results(args):
+    """列出 out/ 下已交的译文(豆包历轮交件), 附段数与时间。
+
+    为什么豆包需要这个: 采纳流程里的"矫正"应当是**改动**, 但旧桥只让它看得见
+    inbox/ 的原文, 看不见自己上一轮交出去的稿子 —— 于是每次"矫正"都退化成整篇
+    重译。实测事故 wang2026: doubao4 与上一版 doubao3 在 266 段里有 206 段不同,
+    并因此新引入 4 处公式字形块破坏, 被 import 门禁整篇退回。
+    先能读回上一版, 才谈得上"只改被点名的段落"。
+    """
+    stem = str(args.get("name") or "").strip()
+    try:
+        limit = int(args.get("limit") or LIST_LIMIT_DEFAULT)
+    except (TypeError, ValueError):
+        limit = LIST_LIMIT_DEFAULT
+    limit = max(1, min(limit, LIST_LIMIT_MAX))
+
+    names = _result_names(stem or None)
+    if not names:
+        return ("out/ 下没有%s交件。目录: %s"
+                % ("「%s」的" % stem if stem else "任何", OUTDIR))
+    shown = names[:limit]
+    lines = []
+    for n in shown:
+        p = os.path.join(OUTDIR, n)
+        nseg = _seg_count(p)
+        lines.append("%s  (%d 字节, %s 段)  改于 %s"
+                     % (n, os.path.getsize(p),
+                        nseg if nseg >= 0 else "段数读不出",
+                        time.strftime("%m-%d %H:%M",
+                                      time.localtime(os.path.getmtime(p)))))
+    tail = ("" if len(names) <= limit
+            else "\n… 另有 %d 份更早的未列出 (调大 limit 可取, 上限 %d)"
+                 % (len(names) - limit, LIST_LIMIT_MAX))
+    return ("out/ 交件共 %d 份, 最近 %d 份 (用 get_result 读全文):\n%s%s"
+            % (len(names), len(shown), "\n".join(lines), tail))
+
+
+def tool_get_result(args):
+    """读回一份已交译文(通常就是豆包自己上一轮的稿子)。
+
+    改稿务必在**它**上面改: 看不到上一版, 只能拿 inbox 的原文重译一遍, 那一遍会把
+    已定稿的段落整片洗掉, 并重新掷一次字形块/编号的骰子(实测事故见 list_results)。
+
+    取名规则与 get_report 一致: 只认 out/ 目录里真实存在的名字(允许唯一子串),
+    不套 _safe_name、不拼路径参数 —— 名字必须命中 os.listdir 的某一项,
+    `..\\x` 这类天然匹配不上, 不构成越权。
+    """
+    raw = str(args.get("name") or "").strip()
+    if not raw:
+        raise ValueError("name 为空 (先用 list_results 取文件名)")
+    names = _result_names()
+    hit = [n for n in names if n == raw] or [n for n in names if raw in n]
+    if not hit:
+        raise FileNotFoundError("out/ 下没有匹配 %r 的交件 (先用 list_results 查看)"
+                                % raw)
+    if len(hit) > 1:
+        raise ValueError("%r 匹配到 %d 份交件, 请写全名:\n%s"
+                         % (raw, len(hit), "\n".join("  " + n for n in hit[:10])))
+    with open(os.path.join(OUTDIR, hit[0]), "r", encoding="utf-8-sig") as f:
+        return f.read(MAX_READ)
+
+
+def _blocks(text):
+    """把交付文本拆成 {段号: 该段正文}。`#S编号` 行本身不算正文。"""
+    out, cur = {}, None
+    for line in text.splitlines():
+        m = S_LINE.match(line)
+        if m:
+            cur = int(m.group(1))
+            out[cur] = []
+        elif cur is not None:
+            out[cur].append(line)
+    return {k: "\n".join(v).strip() for k, v in out.items()}
+
+
+def _prev_round(stem, fn):
+    """同一篇的上一版交件路径(排除 fn 自己); 没有则 None。"""
+    for n in _result_names(stem):
+        if n != fn:
+            return os.path.join(OUTDIR, n)
+    return None
+
+
+def _diff_line(prev, text):
+    """本次交件与上一版相比改了几段 —— 交给豆包的自我核对; 失败返回空串。
+
+    为什么值得算: "矫正"和"重译"从交付文本上看不出区别, 直到门禁把整篇退回。
+    实测 wang2026 那一轮, 豆包以为在"按报告改", 实际 266 段里改了 206 段, 并因此
+    新踩 4 处公式字形块。有这一行, 它交完立刻能自己发现"改面过大 = 我在重译"。
+    只做提示: 任何异常都不影响交件本身。
+    """
+    try:
+        with open(prev, "r", encoding="utf-8-sig") as f:
+            a = _blocks(f.read(MAX_READ))
+        b = _blocks(text)
+    except OSError:
+        return ""
+    if not a or not b:
+        return ""
+    diff = [k for k in set(a) | set(b) if a.get(k, "") != b.get(k, "")]
+    line = "\n与上一版 %s 相比: %d/%d 段有改动" % (os.path.basename(prev), len(diff), len(b))
+    if len(diff) > len(b) * 0.3:
+        line += (" —— 改动面过大, 若本意是只修几处, 说明这一轮是在重译。"
+                 "请先用 get_result 读回上一版, 在它上面改")
+    return line
+
+
 def tool_submit_result(args):
     fn = _safe_name(args.get("name"))
     text = str(args.get("text") or "")
@@ -200,11 +347,15 @@ def tool_submit_result(args):
     os.makedirs(OUTDIR, exist_ok=True)
     fn = _result_name(fn)
     p = os.path.join(OUTDIR, fn)
+    # 先认上一版再由它算差异: 写盘之后最新的那份就成了自己, 认出来没有意义
+    prev = _prev_round(_RESULT_FILE.match(fn).group(1), fn)
     with open(p, "w", encoding="utf-8") as f:
         f.write(text)
     segs = S_LINE.findall(text)
     tail = ",".join(segs) if segs else "未检测到(若本批含段号则异常)"
     stats = "已保存: %s (%d 字符), 段号 #S: %s" % (p, len(text), tail)
+    if prev:
+        stats += _diff_line(prev, text)
     _log(stats)
     return stats
 
@@ -303,11 +454,41 @@ TOOLS = [
         },
     },
     {
+        "name": "list_results",
+        "description": "列出 out/ 下**已经交过的译文**(按时间倒序, 附带段数与时间)。"
+                       "**改稿/矫正前先看这里** —— 与 list_reports 配对: 报告说'哪儿错了', "
+                       "这里给'上一版长什么样'。两个都能看见, 改稿才是改动; 只看得见 inbox 原文, "
+                       "每一次'改'都会变成整篇重译, 而重译会把已定稿的段落洗掉、并重新踩公式字形块。"
+                       "name 传论文名可只看该篇的历轮; 不传则列全部",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "论文名, 如 wang2026(只看该篇); 留空列全部"},
+                "limit": {"type": "integer", "description": "最多列几份(按时间倒序), 默认 20, 上限 100"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_result",
+        "description": "读回一份已交译文全文(通常是你自己上一轮的稿子)。"
+                       "**改稿必须在它上面改, 不要从 inbox 的原文重译** —— 重译一遍等于把上一版"
+                       "整片作废, 已定稿的段落全丢, 还会重新引入公式字形块/编号错误。"
+                       "name 从 list_results 的结果里原样复制。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "交件文件名, 如 wang2026.doubao3.txt"}},
+            "required": ["name"],
+        },
+    },
+    {
         "name": "submit_result",
         "description": "提交译文: 保存到 out/ 并返回统计。每段译文行首保留 #S编号, 跨页断点处保留 ⋮。"
                        "name 直接填 get_payload 取件时那个**原名**即可 (如 egophys2026.txt) —— "
                        "落盘时会自动规范成 `原名.doubao.txt`, 交给 adopt 的 deliver 认领; "
-                       "若要交多轮定稿, 用 `egophys2026.doubao2.txt` 这样带序号的名字",
+                       "若要交多轮定稿, 用 `egophys2026.doubao2.txt` 这样带序号的名字。"
+                       "返回值会附上与上一版相比的改动段数: 若提示'改动面过大', 说明这一轮是在重译, "
+                       "应当先用 get_result 读回上一版再改",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -350,6 +531,8 @@ _DISPATCH = {
     "get_payload": tool_get_payload,
     "list_reports": tool_list_reports,
     "get_report": tool_get_report,
+    "list_results": tool_list_results,
+    "get_result": tool_get_result,
     "submit_result": tool_submit_result,
     "search_term": tool_search_term,
 }
