@@ -39,3 +39,8 @@ zotero-pdf-2-zh-*.xpi
 # 密钥红线: 含真实 key 的配置 (模板 *.example 不受影响)
 server/config/config.toml
 server/md-translate/config.json
+
+# 本机路径与个人文件 (开源红线): 本地保留不入库
+server/config/local_paths.json
+tools/dedouble_sweep.py
+.DS_Store

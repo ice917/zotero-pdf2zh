@@ -63,8 +63,19 @@ OUTDIR = os.path.join(PROJ, "out")
 LEDGER_DIR = os.path.join(PROJ, "logs", "adopt")
 SIDECAR = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow", "latest.jsonl")
 CACHE = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "cache.v1.db")
-DEFAULT_PY = r"D:\Users\97638\anaconda3\envs\zotero-pdf2zh-venv\python.exe"
-PY = os.environ.get("PDF2ZH_PYTHON") or (DEFAULT_PY if os.path.exists(DEFAULT_PY) else sys.executable)
+
+
+def _local_py():
+    """本机解释器路径, 读 git-ignored 的 server/config/local_paths.json
+    (开源仓库不携带任何个人绝对路径; 本机行为由该文件 + PDF2ZH_PYTHON 提供)"""
+    p = os.path.join(PROJ, "server", "config", "local_paths.json")
+    try:
+        with open(p, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("python") or ""
+    except Exception:
+        return ""
+DEFAULT_PY = os.environ.get("PDF2ZH_PYTHON") or _local_py() or sys.executable
+PY = DEFAULT_PY
 
 STAGES = ["export", "deliver", "import", "inject", "render", "gate"]
 NEED = {  # 阶段 -> 前置阶段
