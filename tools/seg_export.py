@@ -174,6 +174,9 @@ def main():
 
     # ---- 输出 payload ----
     doc = args.doc.strip()
+    if args.terms == TERMS_CSV and not os.path.exists(TERMS_CSV):
+        # 沙箱/换机时 P2Z_PROJ 一改, 默认术语表就跟着落空; 静默退化会让人以为术语生效了
+        warnings.append("默认术语表不存在: %s —— 本次只写通用术语要求, 用 --terms 指定" % TERMS_CSV)
     lines = [RULES.format(doc=(doc + " ") if doc else "",
                           pages=args.pages,
                           terms=terms_line(args.terms))]
