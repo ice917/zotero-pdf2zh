@@ -397,6 +397,22 @@ def sibling_hits(fails, parts_zh, idx):
     return out
 
 
+def has_alnum(text):
+    """字形 core 里含"字母/数字"吗 —— 高价值字形的判据(Unicode 口径)。
+
+    [v28.38] 原实现是 `re.search(r"[A-Za-z0-9]", core)`, **ASCII-only**: 侧车把
+    数学斜体存成**字面文本**(SILAGE p1#4 `vars[4]='𝑁=𝑛𝑚'`), 而 `𝑁`/`𝑛`/`𝑚` 是
+    U+1D400–U+1D7FF 的数学字母 —— 判据认不出, 它们就被当成"纯标点/纯符号"丢弃,
+    **从不回锚成 {vN}**。渲染时它们只能当普通文本排进**中文字体**(LXGW Neo
+    ZhiSong), 而中文字体的 cmap 里没有这些码位 → CID 0/.notdef: 视觉是豆腐块,
+    提取是 NUL(SILAGE 全篇 1518 处、第 1 页 32 处; 同引擎对照版 0 处 —— 那边走
+    pdf2zh 原生公式保护, 同一批字符由原文字体 CMMI10 画)。改成 Unicode 口径后
+    这类字形才像数字/字母一样参与回锚、由 var[i] **原字体**回填(与 `_eq_class`
+    的判据同源, 那里本来就用 `isalnum()`)。
+    """
+    return any(ch.isalnum() for ch in text)
+
+
 def reanchor(seg_zh, raw, vars_):
     """只回锚高价值字形(核心=字母/数字), 纯标点字形按设计丢弃。
     核心命中后向两侧吸收与字形值一致的标点(等价类同 _char_pattern, 见 _punct_eq),
@@ -427,7 +443,7 @@ def reanchor(seg_zh, raw, vars_):
         if val is None:
             continue
         pre, core, post = split_value(val)
-        if not core or not re.search(r"[A-Za-z0-9]", core):
+        if not core or not has_alnum(core):
             # 纯标点/纯符号字形(/ 等)按设计丢弃, 不参与搜索
             drops.append((vn, val))
             continue

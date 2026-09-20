@@ -172,6 +172,24 @@ def main():
     check("⑲ 无字形标点残留在占位符外", "]" not in res and "、" not in res, res)
     check("⑲ 顿号与右括号被吞净", "SCSG {v1} 和 SSRGD" in res, res)
 
+    # ⑳ 数学字母不是"纯符号" (v28.38, 2026-09-20 NUL 定性):
+    #    侧车把数学斜体存成**字面文本**(实测 SILAGE p1#4 `vars[4]='𝑁=𝑛𝑚'`), 而
+    #    "含字母/数字"的判据写成了 ASCII-only 的 `[A-Za-z0-9]` —— 𝑁/𝑛/𝑚 全被判成
+    #    纯符号丢弃, 于是从不回锚成 {vN}, 渲染时只能当普通文本排进**中文字体**;
+    #    中文字体 cmap 里没有 U+1D400–U+1D7FF, 落到 CID 0/.notdef —— 页面豆腐块,
+    #    提取出 NUL(SILAGE 全篇 1518 处 / 第 1 页 32 处, 同引擎对照版 0 处: 那边走
+    #    pdf2zh 原生公式保护, 这些字符由原文字体 CMMI10 画)。
+    res, fails, drops, _n = run(
+        "structure{v0} where {v1} total samples are partitioned into "
+        "{v2} blocks of size {v3}",
+        {"0": ",", "1": "𝑁=𝑛𝑚", "2": "𝑛", "3": "𝑚("},
+        "结构，其中总样本数 𝑁=𝑛𝑚 在逻辑上或物理上被划分为 𝑛 个大小为 𝑚( 的块")
+    check("⑳ 数学字母参与回锚", res.count("{v") == 3, res)
+    check("⑳ 数学字母不再算纯符号",
+          not any(d[0] in ("1", "2", "3") for d in drops), drops)
+    check("⑳ 逗号仍按设计丢弃", [d[0] for d in drops] == ["0"], drops)
+    check("⑳ 无 FAIL", not fails, fails)
+
     print(f"\n结果: {passed} passed, {failed} failed")
     return 1 if failed else 0
 
