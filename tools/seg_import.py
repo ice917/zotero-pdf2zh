@@ -38,6 +38,7 @@ V_TOKEN = re.compile(r"\{v(\d+)\}")
 
 REWORK_SUFFIX = ".rework.md"
 GLYPH_CTX = 60          # 返工单里原文上下文的半宽(按**还原后**字符数)
+HINT_MAX = 20           # 「不必改」一节最多逐条列几条提示(超出只报计数)
 
 
 def load_sidecar_pages(sidecar):
@@ -171,8 +172,15 @@ def write_rework_note(man, src, report, detail):
         sections.append(("其他门禁失败（编号 / 分页断点 / 空段）",
                          ["- %s" % r for r in other_fails]))
     if hints:
-        sections.append(("不必改（工具已自动处理，别动）",
-                         ["- %s" % r for r in hints]))
+        # 瘦身: 一篇几千段的稿子里「纯标点字形丢弃」一类提示能有几百条(实测 640 行的
+        # 单子), 而它们**一条都不用改**(工具已自动丢弃并继续)。逐条列出来只会把
+        # 「必须改」淹没掉, 所以只留前 HINT_MAX 条看形态, 其余报计数。
+        lines = ["- %s" % r for r in hints[:HINT_MAX]]
+        if len(hints) > HINT_MAX:
+            lines.append("- …（同上提示共 %d 条，其余 %d 条不再逐条列出 —— "
+                         "这些段**不用改**，逐字符照抄你上一版即可）"
+                         % (len(hints), len(hints) - HINT_MAX))
+        sections.append(("不必改（工具已自动处理，别动）", lines))
     for n, (title, lines) in enumerate(sections, 1 if not detail else 2):
         L.append("")
         L.append("## %s、%s" % ("一二三四五"[n - 1], title))

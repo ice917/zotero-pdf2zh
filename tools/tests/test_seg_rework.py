@@ -33,6 +33,8 @@ if TOOLS not in sys.path:
 import seg_import as SI  # noqa: E402
 
 NAME = "demo2026"
+HINT_MAX = SI.HINT_MAX          # 与实现同源, 免得阈值改了测试还在断言旧数字
+HINT_N = HINT_MAX + 5           # ⑧ 造 HINT_N 条提示: 超限才会触发截断+计数
 
 # 侧车内部坐标 9 / pageid 5(=真实第 6 页): 正是 Padmaprabhan 的漂移形态
 SIDECAR = [
@@ -171,6 +173,27 @@ def main():
         n3 = read(note3) if os.path.exists(note3) else ""
         check("⑥ 两类小节同时在且编号连续",
               "## 一、必须改" in n3 and "## 二、不必改" in n3, n3)
+
+        # ---- ⑧ 「不必改」一节瘦身: 提示超过 HINT_MAX 条时只列前 N 条 + 报计数 ----
+        # 一篇几千段的稿子「纯标点字形丢弃」能有几百条, 逐条列会把「必须改」淹没掉。
+        # 判据仍是同一份实现(这些段工具已自动处理), 少列几条不影响豆包照抄。
+        man4 = {"name": NAME, "items": [
+            {"key": "S%d" % i, "merged": False,
+             "parts": [{"page": 9, "seg": 0, "true_page": 6}]}
+            for i in range(1, HINT_N + 2)]}          # 末段故意不交, 逼出返工单
+        root4, sp4, mp4 = sandbox(tmp, manifest=man4, sidecar=side2)
+        deliver4 = "".join("#S%d\n3D work done.\n" % i for i in range(1, HINT_N + 1))
+        rc, out, err, note4 = run_import(root4, sp4, mp4, deliver4)
+        check("⑧ 缺段仍判 FAIL", rc == 1, (rc, out, err))
+        n4 = read(note4) if os.path.exists(note4) else ""
+        check("⑧ 提示超限时只列前 %d 条" % HINT_MAX,
+              n4.count("纯标点字形丢弃") == HINT_MAX,
+              n4.count("纯标点字形丢弃"))
+        check("⑧ 其余条数报计数",
+              "同上提示共 %d 条，其余 %d 条不再逐条列出" % (HINT_N, HINT_N - HINT_MAX)
+              in n4, n4[-500:])
+        check("⑧ 截断不影响「必须改」分节",
+              "## 一、其他门禁失败" in n4 and "## 二、不必改" in n4, n4[:300])
 
     # ---- ⑦ 名单为空(取不到论文名)时不写文件、不抛异常 ----
     check("⑦ 取不到 name 就不写单子",
