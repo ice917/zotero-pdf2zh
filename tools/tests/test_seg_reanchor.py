@@ -104,6 +104,57 @@ def main():
     check("⑫ 短字形退到自己的空位",
           res == "有 {v1}。对 {v0} 的序列", res)
 
+    # ⑬~⑯ [v28.34] 定位口径两档放宽 (2026-09-20 SILAGE 篇 21 处 FAIL 逐条定性而来):
+    #    12 处不是"译文缺字", 是译文用了**同一个字的另一种写法**, 或自己补了空格。
+    #    放宽的只有**定位**, 命中后写回的仍是字形原值; 真缺字一律仍然 FAIL。
+    # 下面涉及码点的地方一律写转义 —— 这组用例要断言的正是"码点不同、字是同一个字",
+    # 直接敲字符的话看不出自己敲的是哪个(Ω 的两种写法肉眼看完全一样)。
+    OHM, OMEGA, TILDE = "\u2126", "\u03a9", "\u02dc"     # OHM SIGN / 希腊大写 Ω / 小波浪号
+    MB, MT, MI, MN, MINUS = "\U0001d44f", "\U0001d461", "\U0001d456", "\U0001d45b", "\u2212"
+
+    # ⑬ 上标数字: 版面里 '4' 是独立字形, 中文排版写成 '⁴'(U+2074)
+    res, fails, _d, _n = run(
+        "Then the iteration complexity{v0} of SILAGE to reach",
+        {"0": "4"}, "则 SILAGE 达到 𝜖-近似平稳点的迭代复杂度\u2074为")
+    check("⑬ 上标数字（4 vs ⁴）命中", not fails and "{v0}" in res, (res, fails))
+
+    # ⑭ OHM SIGN(U+2126) 与希腊大写 Ω(U+03A9) 是同一个字的两种码点(NFKC 同字)
+    res, fails, _d, _n = run(
+        "Using {v0} and {v1}, we have",
+        {"0": "|" + OHM + MT + "|=" + MB + "grp" + MINUS + "1",
+         "1": "|" + TILDE + OHM + MT + "|=" + MB + "grp,"},
+        "使用 |" + OMEGA + MT + "|=" + MB + "grp" + MINUS + "1 和 |"
+        + TILDE + OMEGA + MT + "|=" + MB + "grp，我们有")
+    check("⑭ OHM SIGN vs 希腊 Ω 命中", not fails, (res, fails))
+
+    # ⑮ 空白弹性: 译文按可读性补了空格 (字形值里没有); 全角括号与句读仍被吸收进字形块
+    res, fails, _d, _n = run(
+        "with exact initialization {v0}, we have",
+        {"0": "(" + MB + "0" + MI + "=∇" + MB + MI + "(𝑥0)∀" + MI + "∈[" + MN + "]),"},
+        "在精确初始化下（" + MB + "0" + MI + "=∇" + MB + MI + "(𝑥0) ∀" + MI + "∈["
+        + MN + "]），有 Ψ0=∆0")
+    check("⑮ 译文补的空格不影响命中", not fails, (res, fails))
+    check("⑮ 括号与逗号被吸收进字形块", res == "在精确初始化下{v0}有 Ψ0=∆0", res)
+
+    # ⑯ 真缺字仍须 FAIL —— 放宽不能变成"什么都算命中"
+    res, fails, _d, _n = run(
+        "minimizing Φ({v0}) over {v1}, i.e.,",
+        {"0": MB + "grp", "1": MB + "grp∈[" + MN + "],"},
+        "等价于最小化一维函数 Φ(" + MB + "grp)。")
+    check("⑯ 译文真缺的字符仍 FAIL", [f[0] for f in fails] == ["1"], fails)
+
+    # ⑰ 合并段 ⋮ 被挪: 本侧没落点、另侧有 -> 判"挪位"而不是"漏字"
+    #    (SILAGE #S22 实况: 译文把「算法 1 和算法 2 提供下降方向」提到了 ⋮ 左侧)
+    hits = SI.sibling_hits([("12", "1"), ("13", "2" + "\u2014")],
+                           ["即为算法 1 和算法 2 提供下降方向的运行聚合",
+                            "——SILAGE 仅需 𝒪(" + MN + ") 内存\u00b3"],
+                           1)
+    check("⑰ 另侧命中 -> 认出 ⋮ 挪位", sorted(hits) == ["12", "13"], hits)
+
+    # ⑱ 两侧都没有 -> 不误判成挪位(那是真缺字)
+    check("⑱ 两侧都没有 -> 不算挪位",
+          SI.sibling_hits([("12", "1")], ["无数字的一侧", "另一侧也没有"], 1) == {})
+
     print(f"\n结果: {passed} passed, {failed} failed")
     return 1 if failed else 0
 

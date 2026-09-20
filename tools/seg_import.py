@@ -7,6 +7,7 @@
   3. 对账 manifest: 编号集合一致; 合并段 ⋮ 恰好 1 个且两侧非空; 普通段禁止 ⋮
   4. 回锚: 对每段按侧车 raw 的 {vN} 原序, 在译文中定位字形值 -> 还原为 {vN}
      高价值字形 (含字母/数字) 找不到 -> FAIL; 纯标点找不到 -> 丢弃并记提示
+     (定位口径: 标点半/全角等价 + 上标数字·OHM 号等 NFKC 同字写法 + 译文自己补的空格)
   5. 产出 out/<name>.imported.json: {(page,seg): 带{vN}的译文} + 校验报告
   6. FAIL 时落一份**给豆包的返工单**到 inbox/<name>.rework.md(桥的 list_inbox /
      get_payload 直接读得到): 每条写明 真实页码 + #S编号 + 缺的字符 + 原文上下文,
@@ -23,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import unicodedata
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
@@ -156,6 +158,12 @@ def write_rework_note(man, src, report, detail):
                 ctx = glyph_context(d["raw"], d["vv"], vn)
                 if ctx:
                     L.append("- 原文里它在哪: %s" % ctx)
+            if d.get("moved"):
+                L.append("- **这一处的修法不同**: 上面这些字符的译文被写到了 ⋮ 的**另一侧**。"
+                         "本段是「跨页续接」合并来的（⋮ 左右各对应原 PDF 的一页），"
+                         "版面上这些字符属于那一页。请把 ⋮ 摆回原文那一处："
+                         "⋮ 左边只写 ⋮ 左边原文的译文，右边只写右边原文的译文，"
+                         "**不要把某一侧的短语提到另一侧去**（同侧内部可以按中文习惯调语序）。")
     # 小节编号随实际出现的小节走: 只写"一、必须改"和"三、不必改"、中间空着"二"，
     # 读的人会以为单子缺了一节。
     sections = []
@@ -232,19 +240,87 @@ PUNCT_EQUIV = {
 }
 
 
+# [自研补丁 2026-09-20] 兼容等价类 + 空白弹性。
+# 来源: SILAGE 篇 21 处 FAIL 逐条定性(用码点逐字符比对), 其中 12 处根本不是
+# "译文缺字", 而是译文用了**同一个字的另一种写法**, 字面匹配认不出来:
+#   - 上标数字: 版面里 '4'/'5'/'3' 是独立字形, 中文排版写成 '⁴'(U+2074)/'⁵'/'³'(U+00B3);
+#   - OHM SIGN: 字形值是 'Ω'(U+2126), 译文写同义的希腊大写 'Ω'(U+03A9)
+#     —— NFKC 把前者折成后者, Unicode 认定二者是同字符的两种码点;
+#   - 空格: 译文按可读性补空格(公式与 ∀ 之间、'𝑏grp∈[𝑛]2:' 里 ' 2' 之前), 字形值里没有。
+# 判据收口: 只并入「NFKC 折成同一个**单字符**、且折出来是字母/数字」的写法
+# (³/³/₃/３ 同类), 多字符折叠(Ⅲ -> III、℃ -> °C)一律不收 —— 否则会把无关字符
+# 拉进等价类, 制造错锚。空白只在字与字**之间**放宽为 \s*, 两端不放, 免得匹配区间外溢。
+_EQ_RANGES = ((0x00A0, 0x2FFF), (0xFB00, 0xFB4F), (0xFF00, 0xFFEF))
+_EQ_INDEX = None
+
+
+def _eq_index():
+    """{NFKC 折出的单字符: {其它写法}} —— 懒建一次(约 12k 字符, 毫秒级)。"""
+    global _EQ_INDEX
+    if _EQ_INDEX is None:
+        idx = {}
+        for lo, hi in _EQ_RANGES:
+            for cp in range(lo, hi + 1):
+                c = chr(cp)
+                n = unicodedata.normalize("NFKC", c)
+                if len(n) == 1 and n != c:
+                    idx.setdefault(n, set()).add(c)
+        _EQ_INDEX = idx
+    return _EQ_INDEX
+
+
+def _eq_class(ch):
+    """ch 的兼容等价类(含自身)。折不出单字符字母/数字的, 只返回自己。
+
+    取法是「**所有**折到同一个正体的写法」: ch 自己 + 索引里那些异体 + 正体本身
+    (仅当正体本身就是范围里的字符, 即非 ASCII)。
+
+    正体必须补进来 —— 索引是按"'正体' -> {异体}"建的, 只查 idx[key] 拿到的是
+    **异体**; 当 ch 本身就是异体时(如 OHM SIGN U+2126, 正体是希腊 Ω U+03A9),
+    查出来只有它自己, 恰好漏掉译文实际会写的那一个字 (v28.34 测试 ⑭ 逮到)。
+
+    正体是 ASCII 时**不**并进来 —— 否则数学斜体字母(U+1D400 段, 在范围外)会被
+    折成 ASCII, "𝑏" 去匹配译文里任意一个 'b', 把短 core 的全局唯一性打散。
+    实测需要的就是范围里那几类(上标数字 U+2074/U+00B3、OHM SIGN U+2126),
+    范围外的一律按原样匹配。
+    """
+    key = unicodedata.normalize("NFKC", ch)
+    if len(key) != 1 or not key.isalnum():
+        return {ch}
+    cls = {ch} | _eq_index().get(key, set())
+    if not key.isascii():
+        cls.add(key)
+    return cls
+
+
+def _char_pattern(ch):
+    """单字符 -> 正则片段(标点优先走 PUNCT_EQUIV, 其余走兼容等价类)。"""
+    if ch in PUNCT_EQUIV:
+        return "[%s]" % re.escape(PUNCT_EQUIV[ch])
+    eq = _eq_class(ch)
+    if len(eq) == 1:
+        return re.escape(ch)
+    return "[%s]" % re.escape("".join(sorted(eq)))
+
+
 def _core_pattern(core):
-    """core -> 正则。标点位允许半/全角等价; 数字间的逗号额外允许整块消失
-    (豆包把 2,000 写成 2000 时仍能命中, 渲染时仍用字形原值)。"""
+    """core -> 正则。三条放宽都只是**定位**口径, 命中后仍写回字形原值:
+      ① 标点等价类: 半/全角等价 (2.1,(20) -> 2.1，(20)); 数字间的逗号额外允许
+         整块消失(豆包把 2,000 写成 2000 时仍能命中);
+      ② 兼容等价类: 上标数字 / OHM SIGN / 全角数字等 NFKC 同字写法;
+      ③ 空白弹性: 字与字之间允许译文自己补的空格。"""
     parts = []
     for k, ch in enumerate(core):
-        if ch in PUNCT_EQUIV:
-            cls = "[%s]" % re.escape(PUNCT_EQUIV[ch])
-            if (ch == "," and 0 < k < len(core) - 1
-                    and core[k - 1].isdigit() and core[k + 1].isdigit()):
-                cls += "?"      # 千分位弹性
-            parts.append(cls)
-        else:
-            parts.append(re.escape(ch))
+        if ch.isspace():
+            parts.append(r"\s*")
+            continue
+        cls = _char_pattern(ch)
+        if (ch == "," and 0 < k < len(core) - 1
+                and core[k - 1].isdigit() and core[k + 1].isdigit()):
+            cls += "?"      # 千分位弹性
+        parts.append(cls)
+        if k < len(core) - 1:
+            parts.append(r"\s*")
     return re.compile("".join(parts))
 
 
@@ -270,6 +346,29 @@ def split_value(val):
     while j > i and val[j - 1] in PUNCT_CHARS:
         j -= 1
     return val[:i], val[i:j], val[j:]
+
+
+def sibling_hits(fails, parts_zh, idx):
+    """合并段里, 本侧没落点的字形是否出现在**别侧**的译文里 -> {字形号: 值}。
+
+    [自研补丁 2026-09-20] 跨页续接合并成的段, ⋮ 左右各对应原 PDF 的一页; 回锚是
+    **按侧**做的(缓存行也按页), 所以译文只要把断点位置挪了(把下一页开头的短语提到
+    这一侧), 本侧就找不到那些字形。这类 FAIL 让译者"把它原样写回"是**无解的** ——
+    他那侧的译文本来就不该有这段内容, 照着改只会来回打转(实测 SILAGE #S22: 原文
+    断点落在 "…the running aggregate⋮that supplies the descent direction in
+    Algorithms 1 and 2—…", 译文把「算法 1 和算法 2 提供下降方向」提到了 ⋮ 左侧,
+    右侧那侧的 '1'/'2—' 两个字形于是没落点)。
+    判"挪了位置"而不是"漏了内容", 报错才有可执行的修法: 把 ⋮ 摆回原文那一处。
+    """
+    out = {}
+    for vn, val in fails:
+        _pre, core, _post = split_value(val)
+        pat = _core_pattern(core)
+        for j, zh in enumerate(parts_zh):
+            if j != idx and pat.search(zh):
+                out[vn] = val
+                break
+    return out
 
 
 def reanchor(seg_zh, raw, vars_):
@@ -420,7 +519,7 @@ def main():
             report.append("FAIL #S%d 译文为空" % key)
             continue
         # 回锚
-        for p, seg_zh in zip(it["parts"], parts_zh):
+        for i, (p, seg_zh) in enumerate(zip(it["parts"], parts_zh)):
             pg, seg = p["page"], p["seg"]
             o = pages[pg]
             vv = o.get("vars") or {}
@@ -435,11 +534,17 @@ def main():
             imported["%d#%d" % (pg, seg)] = fixed
             if fails:
                 ok = False
-                line = "FAIL %s 高价值字形未回锚: %s" % (
-                    loc, ["{v%s}=%r" % f for f in fails[:8]])
+                moved = sibling_hits(fails, parts_zh, i) if it["merged"] else {}
+                if moved:
+                    line = ("FAIL %s 合并段的 ⋮ 位置被挪: %s 的译文出现在 ⋮ 另一侧"
+                            "（本段由跨页续接合并而来: ⋮ 左只写左页内容、右只写右页内容）"
+                            % (loc, sorted(set(moved.values()))))
+                else:
+                    line = "FAIL %s 高价值字形未回锚: %s" % (
+                        loc, ["{v%s}=%r" % f for f in fails[:8]])
                 report.append(line)
                 detail.append({"key": key, "tp": part_true_page(p, o), "line": line,
-                               "raw": raw, "vv": vv, "fails": fails})
+                               "raw": raw, "vv": vv, "fails": fails, "moved": moved})
             if drops:
                 report.append("提示 %s 纯标点字形丢弃 %d 个: %s" % (
                     loc, len(drops), [d[1] for d in drops[:6]]))
