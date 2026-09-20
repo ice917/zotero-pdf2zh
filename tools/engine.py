@@ -14,12 +14,17 @@
 【两个画像】
     pdf2zh  现产线 pdf2zh 1.x。八项全接线; 也是缺省画像, 行为与本模块引入前一致。
     next    pdf2zh_next 2.9.0 / BabelDOC (实验)。**八项全接线**(B 类收口):
-              段表 = <working_root>/<stem>/translate_tracking.json  (须跑 --debug)
+              段表 = <working_root>/<stem>/translate_tracking.json
+                     <working_root> = config.toml 的 [translation].working_dir
+                     (v28.45: 该键靠我们给 pdf2zh_next **配置层**打的补丁才存在 ——
+                      上游 2.9.0 只在 debug=True 时落段表, working_dir 参数面没接出来。
+                      补丁把 upstream 库早就支持的 working_dir 变成配置键, 于是**第一
+                      公里(server 起 pdf2zh_next)与第二公里(本工具)读同一份 config**,
+                      不再需要 debug。缓存键/行为都不变, 产物名也不再带 .debug。)
               缓存 = ~/.cache/pdf2zh_next/cache.v1.db  (表结构与 1.x 逐字相同)
               渲染 = pdf2zh_next CLI 子进程(没有服务端) —— 上游出错仍退出码 0, 判成败
-                     只能看产物; 且 `--debug` 必带(不带时 working_dir 落
-                     tempfile.mkdtemp(), 段表根本不落盘), config 里的 ignore_cache 必须
-                     为 false(见 force_rerender 的 _off_in_config)。
+                     只能看产物; config 里的 ignore_cache 必须为 false(见 force_rerender
+                     的 _off_in_config)。
               撤销 = **行级**还原(不是拿 inject 前的 .bak 整库回滚 —— 缓存库是全机共用的,
                      整库还原会把别的论文合法落下的译文一并退掉; 见 seg_inject.rollback_next)。
             export/import/inject/rollback 能接线, 是因为 {vN}/<style> 在 next 上是**引擎
@@ -127,6 +132,31 @@ class Profile(object):
 # 而不是让它按 1.x 口径跑出个"看起来对"的结果。
 _NEXT_NO = {}
 
+PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
+NEXT_WORKING_FALLBACK = os.path.join(HOME, ".cache", "babeldoc", "working")
+
+
+def next_working_dir(config_path=None):
+    """next 段表根 = config.toml 的 [translation].working_dir (v28.45 起的权威来源)。
+
+    为什么读 config 而不是写死: 这个值必须**两侧同一个** —— 第一公里 server 起
+    pdf2zh_next 时读它(补丁把上游只在 debug 下落段表的行为变成配置键), 第二公里本工具
+    按它定位段表。写死就会随 config 改动而错位, 且错位是静默的(找不到段表 = 空载荷)。
+    没有该键(或键为 "null")时回落到上游 debug 缺省, 只对"仍在用 --debug 跑"的旧读数
+    有效; 这种情况由调用方给出"段表没落盘"的告警, 不静默。
+    """
+    cfg = config_path or os.path.join(PROJ, "server", "config", "config.toml")
+    try:
+        import tomllib
+        with open(cfg, "rb") as f:
+            wd = (tomllib.load(f).get("translation") or {}).get("working_dir")
+    except Exception:
+        wd = None
+    if wd and str(wd).strip().lower() != "null":
+        return os.path.abspath(str(wd))
+    return NEXT_WORKING_FALLBACK
+
+
 PROFILES = {
     "pdf2zh": Profile(
         key="pdf2zh",
@@ -147,12 +177,13 @@ PROFILES = {
         cache_db=os.path.join(HOME, ".cache", "pdf2zh_next", "cache.v1.db"),
         seg_source="tracking_json",
         sidecar_dir=None,
-        working_root=os.path.join(HOME, ".cache", "babeldoc", "working"),
+        working_root=next_working_dir(),
         cache_engines=("siliconflow", "bing", "siliconflowfree"),
         wired=dict({"export": None, "import": None, "inject": None, "deliver": None,
                     "gate": None, "status": None, "render": None, "rollback": None},
                    **_NEXT_NO),
-        notes="段表 = working/<stem>/translate_tracking.json (须 --debug; 上游无 working_dir 参数); "
+        notes="段表 = <translation.working_dir>/<stem>/translate_tracking.json "
+              "(v28.45: config 键, 靠 pdf2zh_next 配置层补丁; 上游 2.9.0 只在 debug 下写); "
               "缓存键 = **整条 prompt**, 但该 prompt 原文就存在段表的 llm_translate_trackers[].input "
               "里 -> inject 是精确匹配, 不需要 1.x 的文档指纹作用域; "
               "render = pdf2zh_next CLI 子进程(无服务端/不轮询 taskId), 判成败只看产物, "
@@ -733,8 +764,9 @@ def main():
     if p.seg_source == "tracking_json":
         rep["tracking"] = tracking_report(p)
         if not p.tracking_json(a.name):
-            print("[engine] 注意: 工作根下没有 translate_tracking.json —— 上游只在 "
-                  "--debug(或显式 working_dir)时才落盘; 没拿到段表不等于没翻译过")
+            print("[engine] 注意: 工作根下没有 translate_tracking.json —— 段表只在 "
+                  "[translation].working_dir 设了(v28.45 配置键, 靠 pdf2zh_next 补丁)或 "
+                  "debug=true 时才落盘; 没拿到段表不等于没翻译过")
     if a.json:
         print(json.dumps(rep, ensure_ascii=False, indent=1))
         return 0

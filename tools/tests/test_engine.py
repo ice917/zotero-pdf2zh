@@ -55,12 +55,14 @@
        导出时 --pdf 的锚定结果, 重推参数一变就整列错位(真样本 129 段 #S11 起全错);
        旧版 manifest(无定位键) 拒收并指路重新导出
   渲染出口 (next: pdf2zh_next CLI 子进程; v28.42)
-    ㉜ 用 .py 假引擎把整条出口跑通: `--debug` 必带(否则段表不落盘)、config 走临时副本
-       且 ignore_cache 置 false(否则上游不读不写缓存 = 第二公里整体失效且无痕)、
-       生产 config 一字节不动、--skip-last 按 pypdf 换算成 --pages、判成败只看新鲜产物、
-       产物命名认得出 next 的 `<stem>.no_watermark.<lang>.mono.pdf`(只认 1.x 的
-       `-mono.pdf` = 渲染成功却报"没等到新产物"; 且 adopt 的 mono 判据要能挑出 mono,
-       否则 gate 拿 dual 做验收)、渲染前 0 命中必须告警(整篇重译 = 既花钱又慢)
+    ㉜ 用 .py 假引擎把整条出口跑通: **不带 `--debug`**(v28.45 起段表根改由 config 的
+       [translation].working_dir 决定 —— debug 会把调试图层烘进产物并给产物名加 .debug,
+       交付件不能带)、config 走临时副本且 ignore_cache 置 false(否则上游不读不写缓存 =
+       第二公里整体失效且无痕)、生产 config 一字节不动、--skip-last 按 pypdf 换算成
+       --pages、判成败只看新鲜产物、产物命名认得出 next 的
+       `<stem>.no_watermark.<lang>.mono.pdf`(只认 1.x 的 `-mono.pdf` = 渲染成功却报
+       "没等到新产物"; 且 adopt 的 mono 判据要能挑出 mono, 否则 gate 拿 dual 做验收)、
+       渲染前 0 命中必须告警(整篇重译 = 既花钱又慢)
   撤销通道 (next: 行级还原; v28.43)
     ㉝ next rollback **不整库回滚**(缓存库全机共用, .bak 还原会退掉别的篇):
        · 按 provenance 逐段还原 —— 现行值 == imported.json 里我们注入的那一版才动,
@@ -69,6 +71,10 @@
        · prompt 行已不在 -> 报无残留而不是失败; --dry 只演算; 撤销也先备份
        · 三个输入缺一不可(argparse 层拦)、--fp 在 next 上拒答、段表与载荷对不上
          -> 拒收**且一个字节都不写**
+  段表根 (next; v28.45)
+    ㉞ next 段表根 = config 的 [translation].working_dir(engine.next_working_dir):
+       有键 -> 取该值; 缺键/为 "null" -> 回落上游 debug 缺省(<HOME>/.cache/babeldoc/
+       working)。这是"第一公里与第二公里必须同一个值"的唯一保证, 写死就会错位
 
 运行: venv python test_engine.py, 退出码 0=全过
 """
@@ -989,8 +995,10 @@ def main():
         #    **子进程**(next 根本没有服务端)。本用例拿一个 `.py` 假引擎把整条出口跑通
         #    (force_rerender 见到 `.py` 就用本解释器起它, 那是专为回归留的口子), 只锁
         #    "我们传下去的东西对不对" —— 这三条正是会**静默**失效的地方:
-        #      · `--debug` 必带: 不带时上游把 working_dir 落 tempfile.mkdtemp(),
-        #        段表(translate_tracking.json)根本不落盘, 第二公里就没有段身份;
+        #      · `--debug` **不许带**(v28.45): 带 debug 确实能让段表落盘(上游只在 debug
+        #        或显式 working_dir 时写), 但它会把页码/段号标签、彩色框**烘进产物**,
+        #        产物名还多一段 .debug —— 交付件不能带。段表根改由 config 的
+        #        [translation].working_dir 决定, 两侧读同一份 config;
         #      · config 必须走**临时副本**且 ignore_cache=false: 上游 BaseTranslator
         #        在 true 时**既不读也不写**缓存(改缓存行 = 白改, 且不报错不留痕),
         #        而生产那份不许动(子进程 ConfigManager 会规范化写回);
@@ -1059,8 +1067,9 @@ def main():
             with open(flog, encoding="utf-8") as f:
                 rec = json.load(f)
         av = rec.get("argv") or []
-        check("㉜ 子进程参数形状: 原文 + 服务开关 + --debug + 语言 + 输出目录",
-              av and av[0] == rpdf and "--bing" in av and "--debug" in av
+        check("㉜ 子进程参数形状: 原文 + 服务开关 + 语言 + 输出目录, 且**不带 --debug**"
+              "(debug 会往交付件里烘调试图层 + 改产物名)",
+              av and av[0] == rpdf and "--bing" in av and "--debug" not in av
               and av[av.index("--lang-out") + 1] == "zh-CN"
               and av[av.index("--output") + 1] == rdir, av)
         check("㉜ --skip-last 1 按 pypdf 换算成 --pages 1-2(不是把末页也译了)",
@@ -1086,6 +1095,31 @@ def main():
         check("㉜ 渲染前 0 命中要告警(整篇重译 = 既花钱又慢, 不能默默跑)",
               "自检: 缓存命中 0/1 段" in pr.stdout and "⚠ 0 命中" in pr.stdout,
               pr.stdout[-300:])
+
+        # ---------------- 段表根 = config 的 [translation].working_dir (v28.45) -------------
+        # ㉞ 这是"第一公里(server 起 pdf2zh_next)与第二公里(本工具定位段表)必须同一个值"
+        #    的唯一保证: 双方都读同一份 config 的同一个键。写死或按 debug 缺省推都会错位,
+        #    而错位的症状是"找不到段表" = 空载荷 = 静默。
+        wd_cfg = os.path.join(rdir, "wd.toml")
+        with open(wd_cfg, "w", encoding="utf-8") as f:
+            f.write('[translation]\nworking_dir = "%s"\n'
+                    % os.path.join(rdir, "nextwork").replace("\\", "/"))
+        check("㉞ next 段表根取自 config 的 [translation].working_dir",
+              EG.next_working_dir(wd_cfg)
+              == os.path.abspath(os.path.join(rdir, "nextwork")),
+              EG.next_working_dir(wd_cfg))
+        nul_cfg = os.path.join(rdir, "nul.toml")
+        with open(nul_cfg, "w", encoding="utf-8") as f:
+            f.write('[translation]\nworking_dir = "null"\n')
+        check("㉞ working_dir 为 \"null\"(toml 版的 None) -> 回落上游 debug 缺省, 不把 "
+              "\"null\" 当目录名",
+              EG.next_working_dir(nul_cfg) == EG.NEXT_WORKING_FALLBACK,
+              EG.next_working_dir(nul_cfg))
+        miss_cfg = os.path.join(rdir, "nope.toml")
+        check("㉞ config 不存在/没有该键 -> 回落缺省(不抛异常, 旧配置当场失效但不崩)",
+              EG.next_working_dir(miss_cfg) == EG.NEXT_WORKING_FALLBACK
+              and EG.next_working_dir(rdir) == EG.NEXT_WORKING_FALLBACK,
+              EG.next_working_dir(rdir))
 
         shutil.rmtree(root, ignore_errors=True)
     finally:

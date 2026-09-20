@@ -15,8 +15,10 @@
   pdf2zh (1.x)  POST 本机服务端 /translate(异步任务, 轮询 taskId);
   next          pdf2zh_next CLI **子进程**(没有服务端) —— 上游 ignore_error=True,
                 内部出错退出码仍是 0, 所以判成败**只看产物**; 额外两条:
-                  · `--debug` 必带: 不带时上游把 working_dir 落 tempfile.mkdtemp(),
-                    段表(translate_tracking.json)根本不落盘, 第二公里就没有段身份;
+                  · 段表由 config 的 [translation].working_dir 决定(v28.45): 上游
+                    2.9.0 只在 debug=true 时写 translate_tracking.json, 而 debug 会把
+                    调试图层**烘进产物**并给产物名加 .debug —— 交付件不能带。所以走
+                    配置键, 不带 --debug; 段表根与第一公里(server)读同一份 config;
                   · config 的 [translation] ignore_cache 必须 false: 为 true 时上游
                     **既不读也不写**缓存, 改缓存行 = 白改。本工具在临时副本上强制置
                     false, 生产 config 一个字节不动。
@@ -30,8 +32,9 @@
   next 画像(缺省要 P2Z_ENGINE=next):
   & $PY tools/force_rerender.py --pdf "..." --service siliconflow ^
         --config "D:/zotero-pdf2zh/server/config/config.toml" ^
-        --output "D:/zotero-pdf2zh/server/translated" ^
-        --tracking "C:/Users/<user>/.cache/babeldoc/working/<stem>/translate_tracking.json"
+        --output "D:/zotero-pdf2zh/server/translated"
+  段表路径由 config 的 [translation].working_dir 推出(engine.next_working_dir()), 也可用
+  --tracking 直接指定。
   可执行文件按 "与本解释器同级的 zotero-pdf2zh-next-venv" 约定找, 或用 --exe /
   P2Z_NEXT_EXE 指定。
 """
@@ -227,7 +230,9 @@ def render_next(args):
     与 1.x 的三处不同全是引擎性质, 不是实现取舍:
       1. **没有服务端**: 不需要 8890 在跑, 也没有 taskId 可轮询 —— 直接起子进程;
       2. **判成败只能看产物**: 上游 ignore_error=True, 内部出错也退 0;
-      3. **缓存开关和 working_dir 都在 config/CLI 上**: 见 _off_in_config 与 --debug。
+      3. **缓存开关与段表根都在 config 上**: ignore_cache 见 _off_in_config; 段表根见
+         [translation].working_dir(v28.45 配置键) —— 于是**不再传 --debug**: debug 会把
+         调试图层(页码/段号标签、彩色框)烘进产物, 还给产物名加 .debug, 交付件不能带。
     产物行(`产物: <path>`)与耗时行(`耗时 N 秒 -> ...`)与 1.x **同格式** —— adopt 的
     stage_render 靠它们记台账, 不必分两套解析。
     """
@@ -253,15 +258,15 @@ def render_next(args):
         os.makedirs(outdir)
 
     stem = os.path.splitext(os.path.basename(pdf))[0]
-    # 上游: working_dir = <babeldoc 缓存>/working/Path(input).stem, 且**只在 debug 时**
-    # (translation_config.py:287-292) —— 缺省是 tempfile.mkdtemp(), 所以段表路径就是它。
+    # 段表根 = config 的 [translation].working_dir(v28.45 配置键; 上游 babeldoc 再拼
+    # <stem>)。缺省根是上游 debug 用的 ~/.cache/babeldoc/working —— 只对旧读数有效,
+    # 本工具已不带 --debug, 所以那种情况下段表不会落盘(下面会告警, 不静默)。
     tk = args.tracking or os.path.join(
-        _PROF.working_root or "", stem, "translate_tracking.json")
+        _ENG.next_working_dir(cfg), stem, "translate_tracking.json")
     _probe_before_render(tk)
 
     cmd = [exe, pdf, "--" + (args.service or "siliconflow"), "--output", outdir,
-           "--lang-in", args.lang_in, "--lang-out", args.lang_out,
-           "--debug"]
+           "--lang-in", args.lang_in, "--lang-out", args.lang_out]
     if args.skip_last:
         total = _pdf_pages(pdf)
         end = total - int(args.skip_last)
@@ -355,6 +360,11 @@ def render_next(args):
         print("产物: %s" % p)
     if os.path.exists(tk):
         print("  段表: %s" % tk)
+    elif not args.tracking:
+        print("  ⚠ 段表没落盘(%s): config 的 [translation].working_dir 没设(或 pdf2zh_next "
+              "配置层补丁被覆盖)时就会这样 —— 第二公里拿不到段身份。修法: 在该 config 的 "
+              "[translation] 下加 working_dir = \"D:\\\\<目录>\"(见 patches/pdf2zh_next_*.py)"
+              % tk)
     print("耗时 %d 秒 -> 成功" % secs)
     return 0
 

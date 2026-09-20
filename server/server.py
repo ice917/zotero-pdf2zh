@@ -221,15 +221,23 @@ def _adopt_run_name(pdf_path):
     return (name or "run")[:60]
 
 
-def _run_tool(script, argv, timeout=None):
+def _run_tool(script, argv, timeout=None, engine=""):
     """跑项目内工具(adopt.py 等), 返回 (rc, 输出尾部)。用本进程解释器, cwd=项目根。
 
     工具失败**不能**让翻译任务崩: 一律返回 rc!=0 交给调用方回落处理。
+
+    [v28.44] engine 非空时把画像透传给子进程(P2Z_ENGINE)。不透传的后果不是报错而是
+    **静默走错产线**: adopt/force_rerender 会按缺省画像 pdf2zh 跑 —— 缓存库、段表来源、
+    侧车路径全指向 1.x。adopt 自己的 engine 戳与 guard 都拦不住, 因为子进程压根不知道
+    这条产线是哪个引擎。adopt 再往下 spawn 的 pre_render_check/force_rerender 靠环境
+    继承拿到同一个画像, 所以这一处设了就够。
     """
     proj = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
     cmd = [sys.executable, os.path.join(proj, "tools", script)] + [str(a) for a in argv]
     env = dict(os.environ)
     env["P2Z_PROJ"] = proj
+    if engine:
+        env["P2Z_ENGINE"] = engine
     try:
         p = subprocess.run(cmd, cwd=proj, env=env, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout)
@@ -1200,7 +1208,7 @@ class PDFTranslator:
             time.sleep(5)
             waited += 5
 
-    def _two_pass_adopt(self, task_id, input_path, config):
+    def _two_pass_adopt(self, task_id, input_path, config, engine):
         """[v28.23] 两趟回路的**开关还原壳**。
 
         坑(实测踩到, 症状极具欺骗性): 第一趟要把 PAUSE_TRANSLATE 置 1、第二趟
@@ -1208,17 +1216,20 @@ class PDFTranslator:
         第一个任务跑完, 后续任务读不到开关, 静默退回"直接机器翻译"(第二个任务
         照样烧钱, 而日志看起来一切正常)。运营开关是环境变量, 不是一次性令牌:
         一进一出原样还回去。
+
+        [v28.44] engine 一路透传到 adopt 子进程(见 _run_tool): 本回路眼下只在
+        engine == pdf2zh 分支上挂, 但子进程不能靠"调用方总是 1.x"这条隐含前提活着。
         """
         _op_switch = os.environ.get("PAUSE_TRANSLATE")
         try:
-            return self._two_pass_run(task_id, input_path, config)
+            return self._two_pass_run(task_id, input_path, config, engine)
         finally:
             if _op_switch is None:
                 os.environ.pop("PAUSE_TRANSLATE", None)
             else:
                 os.environ["PAUSE_TRANSLATE"] = _op_switch
 
-    def _two_pass_run(self, task_id, input_path, config):
+    def _two_pass_run(self, task_id, input_path, config, engine):
         """[v28.23] 一趟任务内的两趟采纳回路。
 
         第一趟 PAUSE_TRANSLATE=1 → 引擎不调翻译 LLM、不写缓存、返回原文, 跑完即得
@@ -1250,7 +1261,7 @@ class PDFTranslator:
             print(f"⚠️ [两趟] {why}，撤骨架行后回落成正常翻译")
             rc2, out2 = _run_tool("adopt.py", [
                 "rollback", "--name", name, "--pdf", os.path.abspath(input_path), "--force",
-            ])
+            ], engine=engine)
             if rc2 != 0:
                 print(f"⚠️ [两趟] rollback 也失败了(rc={rc2})，残留骨架行需人工核：\n{out2}")
             task_manager.update_task(task_id, {
@@ -1334,7 +1345,7 @@ class PDFTranslator:
             "export", "--name", name,
             "--pages", f"1-{total_pages}" if total_pages else "1-1",
             "--pdf", os.path.abspath(input_path), "--force",
-        ])
+        ], engine=engine)
         if rc != 0:
             return abort_fallback(f"载荷导出失败(rc={rc})：{out[-400:]}")
         # [v28.26] 「待译」搬到 export **成功之后**再置: 以前是引擎一跑完就报待译,
@@ -1364,7 +1375,7 @@ class PDFTranslator:
             for stage in (["deliver", "--name", name, "--text", delivered, "--force", "--waive"],
                           ["import", "--name", name, "--force"],
                           ["inject", "--name", name, "--force"]):
-                rc, out = _run_tool("adopt.py", stage)
+                rc, out = _run_tool("adopt.py", stage, engine=engine)
                 if rc != 0:
                     # [v28.28] 交件阶段失败 = 有交件可留 -> 保留现场判失败, 不回落机翻。
                     # 段号守恒 / ⋮ 对账 / 逐段不变量 / import / inject 任一不过都算。
@@ -1393,7 +1404,7 @@ class PDFTranslator:
             # [v28.23] 两趟采纳回路: 开着开关才走「提字 → 待译 → 重渲染」;
             # 关着时行为与过去完全一致(默认关, 别的用户路径不变)。
             if _two_pass_enabled():
-                fileList = self._two_pass_adopt(task_id, input_path, config)
+                fileList = self._two_pass_adopt(task_id, input_path, config, engine)
             else:
                 fileList = self.translate_pdf(input_path, config, task_id)
             mono_path, dual_path = fileList[0], fileList[1]

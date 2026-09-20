@@ -1,5 +1,6 @@
 server/translated/
 server/fonts/
+server/nextwork/
 server/__pycache__/
 server/utils/__pycache__/
 server/zip/

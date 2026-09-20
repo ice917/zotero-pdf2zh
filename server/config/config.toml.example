@@ -58,6 +58,7 @@ rpc_doclayout = "null"
 lang_in = "en"
 lang_out = "zh-CN"
 output = "null"
+working_dir = "D:/zotero-pdf2zh/server/nextwork"
 qps = 200
 ignore_cache = false
 custom_system_prompt = "null"

@@ -456,8 +456,9 @@ def stage_export_next(args, led):
         return die("本 run 已导出过; 重做请加 --force (会覆盖 inbox 同名件)")
     tk = args.tracking or (ENGINE.tracking_json("") or "")
     if not tk:
-        return die("拿不到 next 的段表 translate_tracking.json —— 上游只在 --debug(或显式 "
-                   "working_dir)时才落盘; 用 `--tracking` 指一份(工作根见 `engine.py --list`)")
+        return die("拿不到 next 的段表 translate_tracking.json —— 段表只在 config 的 "
+                   "[translation].working_dir 设了(v28.45 配置键)或 debug=true 时才落盘; "
+                   "用 `--tracking` 指一份(工作根见 `engine.py --list`)")
     if not os.path.exists(tk):
         return die("段表不存在: %s" % tk)
     print("[adopt] 段表: %s (%s)" % (tk, "显式指定" if args.tracking else "工作根下最新一份"))

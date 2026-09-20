@@ -13,7 +13,9 @@
      每条 part 同时记 page=侧车内部坐标 与 true_page=真实 PDF 页码)
 
   next / BabelDOC  translate_tracking.json -> 载荷 (v28.40)
-  1. 段表 = <working_root>/<篇名>/translate_tracking.json (须跑 --debug), 用 --tracking 指
+  1. 段表 = <translation.working_dir>/<篇名>/translate_tracking.json, 用 --tracking 指
+     (v28.45: 上游 2.9.0 只在 debug 下写段表, 而 debug 会污染产物; 靠 pdf2zh_next 配置层
+      补丁把 working_dir 变成 config 键, 段表根与第一公里读同一份 config —— 见 engine.py 节头)
   2. 正文取 `input` **原样**: {vN}/<style> 是引擎原生协议, 载荷带着它发出去, 收回来
      的译文里它照样落回原公式/原字体 —— 所以**不回锚、不还原**, 与 1.x 正好相反
      (把 pdf_unicode 那套"显示形态"发出去 = 豆腐块, 见 engine.py 节头)
@@ -314,14 +316,15 @@ def export_next(args, pages_want):
     """next 画像: translate_tracking.json -> 载荷条目(阅读序) -> _emit。"""
     tk = args.tracking or (_PROF.tracking_json("") or "")
     if not tk:
-        print("FAIL: 拿不到 next 的段表 translate_tracking.json —— 上游只在 --debug(或显式 "
-              "working_dir)时才落盘; 用 --tracking 显式指一份")
+        print("FAIL: 拿不到 next 的段表 translate_tracking.json —— 段表只在 config 的 "
+              "[translation].working_dir 设了(v28.45 配置键)或 debug=true 时才落盘; "
+              "用 --tracking 显式指一份")
         return 1
     if not os.path.exists(tk):
         # 这是**业务错**不是接线错(rc=1 而非 2): 换篇论文后工作根下的旧段表会被覆盖,
         # 报错必须告诉人怎么修 —— 不然拿到 rc=1 只会去怀疑引擎没接好。
         print("FAIL: 段表不存在: %s\n      用 --tracking 显式指一份 translate_tracking.json "
-              "(上游只在 --debug / 显式 working_dir 时落盘)" % tk)
+              "(段表根 = config 的 [translation].working_dir, v28.45 配置键)" % tk)
         return 1
     try:
         items, warnings = _ENG.tracking_payload_items(tk, pdf=args.pdf,
