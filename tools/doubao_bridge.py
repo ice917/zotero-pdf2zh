@@ -7,7 +7,7 @@
   参数:     <项目根>/tools/doubao_bridge.py
   环境变量: P2Z_PROJ=<项目根>   (不设则退回 D:\\zotero-pdf2zh)
 
-暴露八个工具:
+暴露九个工具:
   list_inbox()                 列出待译 payload (<项目根>/inbox)
   get_payload(name)            读取 payload 全文 (编号段落包, #S1..#Sn, ⋮ 为跨页断点)
   list_reports(kind, limit)    列出质检/体检报告 (<项目根>/server/translated/review),
@@ -28,6 +28,12 @@
                                文件名统一落成 `<名>.doubao.txt` —— 与 tools/adopt.py
                                的 deliver 自动发现规则 (out/<name>.doubao*.txt) 对齐;
                                否则豆包交的件 deliver 认不到, 纯豆包环境就断在这
+  merge_result(name, patch)    按段号把补丁并进**已有的**交件 (2026-09-20)。
+                               只改了几段时用它, 不要整篇重吐 —— 整篇重吐要再吐全篇,
+                               输出一长就撞上输出上限被截断, 下一轮又冒出一批"只译了
+                               开头"的新段(实测自锁回路); 且替换会静默不生效(实测按段号
+                               补 28 段, 脚本写错、没落地就交了)。这里逐段回读比对,
+                               没生效当场报错; 未点到的段一个字节都不动
   search_term(term)            术语证据检索(等价于本地版搜索工具): 命中 Zotero 库 PDF 原文
                                上下文 + OpenAlex 学术文献, 返回证据供裁决; 只出证据,
                                不改译文、不写术语表
@@ -386,6 +392,62 @@ def tool_submit_result(args):
     return stats
 
 
+def _resolve_result(raw):
+    """把豆包给的名字解析成 out/ 里**真实存在的那一份**(唯一); 返回 (文件名, 全路径)。
+
+    与 get_result 同一口径(只认 listdir 命中的名字, 不拼路径), 额外允许直接给 payload
+    原名 —— 名字经 _result_name 规范化后再找一遍, 这样"egophys2026.txt"也认。
+    """
+    names = _result_names()
+    hit = [n for n in names if n == raw] or [n for n in names if raw in n]
+    if not hit:
+        norm = _result_name(_safe_name(raw))
+        hit = [n for n in names if n == norm]
+    if not hit:
+        raise FileNotFoundError("out/ 下没有匹配 %r 的交件 (先用 list_results 查看)" % raw)
+    if len(hit) > 1:
+        raise ValueError("%r 匹配到 %d 份交件, 请写全名:\n%s"
+                         % (raw, len(hit), "\n".join("  " + n for n in hit[:10])))
+    return hit[0], os.path.join(OUTDIR, hit[0])
+
+
+def tool_merge_result(args):
+    """按段号把补丁并进已有交件 —— **只改了少数几段时用这个, 不要整篇重吐**。
+
+    为什么单开一个工具: submit_result 收的是**全文**。门禁每轮只点名几十段, 而"整篇重交"
+    要把 ~790 段再吐一遍, 输出一长就撞上模型输出上限被截断 —— 下一轮又冒出一批"只译了
+    开头"的新段(实测自锁回路)。更坏的是替换会**静默不生效**: 实测按段号补 28 段, 脚本的
+    替换逻辑写错、改完没落地就交了, 全程无人察觉。所以这里写回前逐段回读比对,
+    没生效当场报出段号; 要么全部生效, 要么交件完全没动。
+
+    patch 只写要改的段(格式与交件相同, 只少掉不改的段); 未在 patch 里出现的段
+    **一个字节都不动**(不是重排全文, 不会顶掉 ⋮ 断点或段间空行)。
+    返回值附"长度比自查": 仍偏低(15%~30%)的段一并列出来 —— 与门禁报告同一口径。
+    """
+    raw = str(args.get("name") or "").strip()
+    if not raw:
+        raise ValueError("name 为空 (先用 list_results 取文件名)")
+    patch_text = str(args.get("patch") or "")
+    if not patch_text.strip():
+        raise ValueError("patch 为空, 拒绝合稿")
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import seg_merge as SM          # 懒加载: 桥本身零依赖, 只有这条路径需要它
+
+    patch = SM.parse_patch(patch_text)
+    fn, path = _resolve_result(raw)
+    ok, info = SM.merge_file(path, patch)
+    if not ok:
+        raise ValueError("%s (交件 %s 未被改动)" % (info["error"], fn))
+    stats = ("已按段号合入 %d 段到 %s; 未点到的段一个字节都没动 (字节 %d -> %d)"
+             % (info["applied"], fn, info["bytes_before"], info["bytes_after"]))
+    if info["noop"]:
+        stats += ("\n⚠️ 这些段的新文本与原文**一模一样**(等于没改, 确认是有意为之?): %s"
+                  % ", ".join("#S%d" % k for k in info["noop"]))
+    stats += "\n" + "\n".join(SM.audit_text(_RESULT_FILE.match(fn).group(1), info["text"]))
+    _log("合稿 %s: %d 段生效, %d 段未改动" % (fn, info["applied"], len(info["noop"])))
+    return stats
+
+
 def tool_search_term(args):
     """术语证据检索——给豆包一个可调用的"搜索工具"（等价于本地版 tavily）。
 
@@ -527,6 +589,27 @@ TOOLS = [
         },
     },
     {
+        "name": "merge_result",
+        "description": "按段号把补丁并进已有交件 —— **只改了几段时用这个, 不要整篇重吐**。"
+                       "门禁每轮只点名几十段; 整篇重交要把全篇再吐一遍, 输出一长就撞上输出上限被截断, "
+                       "下一轮又冒出一批'只译了开头'的新段(SILAGE 第四轮 43 段就是这么来的)。"
+                       "这里只把 patch 里的段并进去, 未点到的段**一个字节都不动**, "
+                       "且写回前逐段回读比对 —— 没生效会当场报错, 不会再有'以为改了实际没改'。"
+                       "patch 只写要改的段, 格式与交件相同(#S编号 行 + 该段正文), 例如: "
+                       "#S386\\n新译文……\\n#S442\\n另一段新译文……"
+                       "返回: 生效段数 + 仍未改的段 + 长度比自查(哪些段还是偏短)",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string",
+                         "description": "要改的交件名(list_results 里的名字, 或 payload 原名), 如 egophys2026.doubao.txt"},
+                "patch": {"type": "string",
+                          "description": "只含要改的段: #S编号 行 + 该段新译文; 没出现的段一律不动"},
+            },
+            "required": ["name", "patch"],
+        },
+    },
+    {
         "name": "search_term",
         "description": (
             "从**用户自己的文献库**取术语的用法证据。这不是通用搜索——"
@@ -562,6 +645,7 @@ _DISPATCH = {
     "list_results": tool_list_results,
     "get_result": tool_get_result,
     "submit_result": tool_submit_result,
+    "merge_result": tool_merge_result,
     "search_term": tool_search_term,
 }
 

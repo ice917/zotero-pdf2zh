@@ -422,6 +422,15 @@ _REPORT_SNIP_TAIL = 60
 _GAP_MIN_SRC = 40       # 源段短于这个字符数不判覆盖率: 短段比值噪声大(中文天然短)
 _GAP_RATIO = 0.15
 
+# [自研补丁 2026-09-20d] 「全篇长度比」自查层 (SILAGE 第四轮, 豆包自述"报告只列它检出的段,
+# 我就只改那些段")。硬线 _GAP_RATIO=0.15 是**0 误报下限**(定标见上), 不能抬: 抬到 30% 会把
+# 中文天然精简的正常段全判死。但 0.15 与"人一眼看出没译完"之间有片灰区 —— 第四轮那 43 条
+# 只译开头的段, 交付/载荷比全落在 0.15~0.52, 硬门禁一条都没拦住。病不在判据松, 而在
+# **报告只列判死的段**: 译者手上没有全篇分布, 只能头痛医头。故硬门禁一格不动, 报告另加一层
+# **候补清单**(明写"不判 FAIL"), 只供自查。与硬门禁同一份实现(ratio_audit), 两处不会漂。
+_ADVISORY_RATIO = 0.30                     # 候补线: 门禁放行、但短到值得自己再看一眼
+_ADVISORY_BUCKETS = (0.15, 0.30, 0.50)     # 分布分档: <15% / 15~30% / 30~50% / >=50%
+
 # [自研补丁 2026-09-20c] 上标/下标数字归一化。载荷里的脚注/指数经 PDF 提取常常落成
 # 行内 ASCII 数字(原文 "complexity4"), 译者按语义写成上标(译文 "复杂度⁴") —— 同一个
 # 数字, 两种写法, 不该判成"数字变了"。实测 SILAGE: 不归一化有 3 条伪影(#S22/#S90/#S557),
@@ -459,6 +468,38 @@ def gap_defects(src, dst):
         elif len(s) >= _GAP_MIN_SRC and len(t) < _GAP_RATIO * len(s):
             short.append((k, len(s), len(t)))
     return empty, short
+
+
+def ratio_audit(src, dst):
+    """全篇长度比自查: (长段数, 比值中位数, 四档计数, 候补清单)。
+
+    长段 = 源段去空白后 >= _GAP_MIN_SRC 字 —— 与硬门禁同一口径(短段比值噪声大, 不计)。
+    候补 = 比值落在 [_GAP_RATIO, _ADVISORY_RATIO) 的段: 硬门禁放行, 但短得可疑。
+    已在硬线以下的不重复进候补(它们归 gap_defects 的 short, 报告另有专表)。
+
+    这是**自查层, 不参与判定** —— 调用方不许拿它当拒收条件。
+    """
+    ratios, cands = [], []
+    for k in sorted(src):
+        s = " ".join((src.get(k) or "").split())
+        t = " ".join((dst.get(k) or "").split())
+        if len(s) < _GAP_MIN_SRC:
+            continue
+        r = len(t) / len(s)
+        ratios.append(r)
+        if _GAP_RATIO <= r < _ADVISORY_RATIO:
+            cands.append((k, len(s), len(t)))
+    if not ratios:
+        return 0, None, (0, 0, 0, 0), []
+    ratios.sort()
+    n = len(ratios)
+    mid = ratios[n // 2] if n % 2 else (ratios[n // 2 - 1] + ratios[n // 2]) / 2.0
+    lo, mo, hi = _ADVISORY_BUCKETS
+    buckets = (sum(1 for r in ratios if r < lo),
+               sum(1 for r in ratios if lo <= r < mo),
+               sum(1 for r in ratios if mo <= r < hi),
+               sum(1 for r in ratios if r >= hi))
+    return n, mid, buckets, cands
 
 
 def _toks(t):
@@ -628,12 +669,47 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
         for b in bad_cut[:_REPORT_ROWS]:
             L.append("- %s" % b)
         L.append("")
+    # 全篇长度比 (自查层, 2026-09-20d) —— 放在「改法」之前、与判死段分家的理由:
+    # 门禁不拦它, 但它正是上一轮"只改被点名的段、其余照旧"的补丁。见 _ADVISORY_RATIO 注释。
+    adv_n, adv_mid, adv_bk, adv_cands = ratio_audit(src, got)
+    if adv_n:
+        lo, mo, hi = _ADVISORY_BUCKETS
+        b1, b2, b3, b4 = adv_bk
+        L.append("## 附：全篇长度比（自查用，**不判 FAIL**）")
+        L.append("")
+        L.append("门禁的硬线是「交付不足载荷 %d%%」——低于它才拒收。但**没被判死不等于译完了**："
+                 "本节把全篇 %d 个长段（载荷 ≥ %d 字）的长度比全算了一遍。比值落在 %d%%~%d%% 的"
+                 "**候补 %d 段**，门禁这一轮**没有**因此拒收你 —— 但请自己扫一遍，"
+                 "它们短得可疑，多半也是只译了开头。"
+                 % (int(_GAP_RATIO * 100), adv_n, _GAP_MIN_SRC,
+                    int(_GAP_RATIO * 100), int(_ADVISORY_RATIO * 100), len(adv_cands)))
+        L.append("")
+        L.append("- 全篇分布（长段 %d 个，中位 %d%%）：< %d%% %d 段 ｜ %d%%~%d%% %d 段 ｜ "
+                 "%d%%~%d%% %d 段 ｜ ≥ %d%% %d 段"
+                 % (adv_n, round(100.0 * adv_mid),
+                    int(lo * 100), b1,
+                    int(lo * 100), int(mo * 100), b2,
+                    int(mo * 100), int(hi * 100), b3,
+                    int(hi * 100), b4))
+        L.append("")
+        if adv_cands:
+            L.append("| 段号 | 载荷 | 交付 | 比值 |")
+            L.append("| --- | --- | --- | --- |")
+            for k, ls, lt in adv_cands[:_REPORT_ROWS]:
+                L.append("| #S%d | %d | %d | %d%% |" % (k, ls, lt, round(100.0 * lt / ls)))
+            if len(adv_cands) > _REPORT_ROWS:
+                L.append("")
+                L.append("（只列前 %d 段，共 %d 段。）" % (_REPORT_ROWS, len(adv_cands)))
+            L.append("")
     L.append("## 改法")
     L.append("")
-    L.append("1. 只改上面点到号的段；其余段一个字都不要动（整篇重译 = 重新引入错位）。")
+    L.append("1. 只改上面点到号的段（**含「附：全篇长度比」列出的候补段**）；其余段一个字都不要动"
+             "（整篇重译 = 重新引入错位）。")
     L.append("2. **每段都要整段译完**：第三节每条都标了「载荷 N 字 → 交付 M 字」—— M 明显偏小的"
              "（如载荷 398 字只交了 65 字），就是**只译了开头**，回载荷把没译的句子补完。"
-             "自查：中文译文通常约为载荷字数的三到六成，远低于这个比例的多半是没译完。")
+             "自查：中文译文通常约为载荷字数的三到六成，远低于这个比例的多半是没译完。"
+             "**别只改门禁点名的那些**：「附：全篇长度比」一节列的是全篇所有比值低的段"
+             "（含门禁这一轮没判死的），照它一次扫完，否则下一轮又冒出一批同病的新段。")
     L.append("3. 相邻的碎片段（如 \"…average component\" 与 \"t error:\"）**各译各的**，"
              "不要并成一句 —— 并段会顶掉一个段号，后面整片上移、末尾留空。"
              "**并段/重切正是内容漂移的头号成因**：一句跨两段时，你按语义重切，切点就跟载荷"
@@ -643,7 +719,11 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
              "段落它可能**漏报**。所以第三节的并排若读出\"译文其实是相邻段的译文\"，"
              "即便第二节没列，也当错位带处理。")
     L.append("6. 改完**用同一个文件名覆盖**重交（`%s.doubao.txt`）—— out/ 里留两份候选"
-             "（比如又存一份 `.doubao2.txt`）会让 deliver 判\"交件件不唯一\"直接拒收。" % name)
+             "（比如又存一份 `.doubao2.txt`）会让 deliver 判\"交件件不唯一\"直接拒收。"
+             "**只改了几段就别整篇重吐**（输出一长就被截断，下一轮又冒出一批没译完的）："
+             "用 `merge_result` 工具——patch 里只写要改的段（`#S386` + 该段新译文），"
+             "它只替换点到的段（其余段一个字节不动），写回后**逐段回读比对**，"
+             "没生效会当场报出段号。" % name)
     L.append("")
     with open(p, "w", encoding="utf-8") as f:
         f.write("\n".join(L))
