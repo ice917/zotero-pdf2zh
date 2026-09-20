@@ -658,6 +658,69 @@ def main():
           AD.ratio_audit({1: "short"}, {1: "x"}) == (0, None, (0, 0, 0, 0), []),
           AD.ratio_audit({1: "short"}, {1: "x"}))
 
+    # ---- ㉗ 不变量判据: "不漏 + 不幻觉", **复述不算改动** (2026-09-20e) ----
+    #      老判据是"数字多重集必须逐个相等", 于是中文把英文省略的主语补出来时
+    #      ("𝛿1 is small when… and large when…" -> "…时 𝛿1 小, …时 𝛿1 大") 数字跟着
+    #      复述一遍就被判成"增了数字", 报告把译者指去改**本来是对的**段落。
+    #      SILAGE 实测: #S699 属这类(零幻觉零真漏), #S348 更早为绕它白改过一轮。
+    #      要保住的是"载荷的数字还在不在"和"有没有冒出新的", 不是出现次数。
+    S699_SRC = ("Hence 𝛿1 is small when the group mixtures are similar across groups and "
+                "large when different groups place mass on different latent families. "
+                "Analogously, 𝛿2 is small when each mixture concentrates on one component.")
+    S699_DST = ("因此，当组混合在组间相似时 𝛿1 小，当不同组在不同隐族上放置质量时 𝛿1 大。"
+                "类似地，当每个混合集中在单个成分上时 𝛿2 小，当每个混合将质量散布在"
+                "良好分离的成分上时 𝛿2 大。")
+    check("㉗a 复述型(载荷的数字在译文里多出现几次)不判不符 —— 复述不是改数字",
+          AD.diff_invariants(S699_SRC, S699_DST) == [],
+          AD.diff_invariants(S699_SRC, S699_DST))
+
+    # ㉗b 真漏仍判不符(SILAGE #S11 的形状: 载荷 "complexity2" 的脚注数字被丢掉)
+    S11_SRC = "standard gradient descent solves it with a gradient evaluation complexity2 of O(nmL)"
+    S11_DST = "标准梯度下降求解它的梯度评估复杂度为 O(nmL)"
+    check("㉗b 真漏数字(载荷有的数字在译文里不见了)仍判不符",
+          len(AD.diff_invariants(S11_SRC, S11_DST)) == 1
+          and AD.diff_invariants(S11_SRC, S11_DST)[0][0] == "数字",
+          AD.diff_invariants(S11_SRC, S11_DST))
+
+    # ㉗c 幻觉仍判不符(译文冒出载荷里根本没有的数字)
+    check("㉗c 幻觉数字(译文冒出载荷没有的数字)仍判不符",
+          len(AD.diff_invariants("see Section 2 for details",
+                                 "详见第 2 节与第 5 节")) == 1,
+          AD.diff_invariants("see Section 2 for details", "详见第 2 节与第 5 节"))
+
+    # ㉗d 复述与真漏同时存在时, 漏仍要被抓住(别让"复述放行"变成漏报的挡箭牌)
+    check('㉗d 复述掩盖不了真漏(重复了 2 却丢了 3, 仍判不符)',
+          len(AD.diff_invariants("Theorem 2 and Theorem 3 hold",
+                                 "定理 2、定理 2 成立")) == 1,
+          AD.diff_invariants("Theorem 2 and Theorem 3 hold", "定理 2、定理 2 成立"))
+
+    # ㉗e [n] 引用同一套判据: 载荷里的引用组在译文里重复引用算过, 无中生有的引用号仍拦
+    check("㉗e [n] 引用复述不算改动",
+          AD.diff_invariants("as shown in [16,12,25]", "如 [16,12,25] 与 [16,12,25] 所示") == [],
+          AD.diff_invariants("as shown in [16,12,25]", "如 [16,12,25] 与 [16,12,25] 所示"))
+    check("㉗e 译文冒出载荷没有的引用号仍判不符",
+          any(x[0] == "[n]引用" for x in AD.diff_invariants("as shown in [16]",
+                                                           "如 [16] 与 [99] 所示")),
+          AD.diff_invariants("as shown in [16]", "如 [16] 与 [99] 所示"))
+
+    # ㉗f 端到端: 复述段不再被门禁拒收(判据必须落到 deliver 上, 不能只在单元层)
+    reset(mk_manifest("g9", [[(1, 0)]]))
+    run(["export", "--name", "g9", "--pages", "1"])
+    mk_payload("g9", [(1, "Hence 𝛿1 is small when mixtures are similar and 𝛿2 differs")])
+    rc, out = deliver("g9", "#S1\n因此混合相似时 𝛿1 小，而 𝛿1 大时不同；类似地 𝛿2 小、𝛿2 大\n")
+    g9 = AD.load_ledger("g9")["stages"]["deliver"]
+    check("㉗f 端到端: 复述段不再被拒收", rc == 0 and g9["state"] == "ok",
+          (rc, g9, out[-200:]))
+
+    # ㉗g 端到端: 真漏数字仍被拒收(放宽之后不许把真缺陷一起放掉)
+    reset(mk_manifest("g10", [[(1, 0)]]))
+    run(["export", "--name", "g10", "--pages", "1"])
+    mk_payload("g10", [(1, "the iteration complexity2 of SILAGE stays bounded here")])
+    rc, out = deliver("g10", "#S1\nSILAGE 的迭代复杂度在这里保持有界\n")
+    g10 = AD.load_ledger("g10")["stages"]["deliver"]
+    check("㉗g 端到端: 真漏数字仍被拒收", rc == 1 and g10["n_inv"] == 1,
+          (rc, g10, out[-300:]))
+
     # ---- 收尾 ----
     shutil.rmtree(ROOT, ignore_errors=True)
     print("\n结果: %d PASS / %d FAIL" % (passed, failed))

@@ -506,13 +506,37 @@ def _toks(t):
     return ", ".join(t) if t else "无"
 
 
+def _inv_missing(src_toks, dst_toks):
+    """载荷有、交付**缺**的 token(多重集差) —— 这才是"数字被改掉"。"""
+    from collections import Counter
+    return sorted((Counter(src_toks) - Counter(dst_toks)).elements())
+
+
+def _inv_hallucinated(src_toks, dst_toks):
+    """交付里出现、但载荷**根本没有**的 token —— 凭空多出来的数字。
+
+    与上面合起来, 判据就是"不漏 + 不幻觉"。
+    **载荷里已有该 token、交付只是多出现几次的, 一律放行** —— 那是复述, 不是改数字:
+    英文常把主语/宾语省略, 中文要补出来("𝛿1 is small when… and large when…" ->
+    "…时 𝛿1 小, …时 𝛿1 大"), 数字跟着复述一遍是通顺的必然结果。逐个计数相等的老判据
+    会把它判成"增了数字", 让译者去改**本来是对的**段落(2026-09-20 SILAGE: #S699 属这类,
+    #S348 更早为绕它白改过一轮)。要看的是载荷的数字还在不在、有没有冒出新的。
+    """
+    seen = set(src_toks)
+    return sorted({x for x in dst_toks if x not in seen})
+
+
 def diff_invariants(src_text, dst_text):
-    """逐段比对, 返回 (不符项, 载荷侧, 交付侧) 三元组列表(空 = 合格)。"""
+    """逐段比对, 返回 (不符项, 载荷侧, 交付侧) 三元组列表(空 = 合格)。
+
+    数字 / [n] 引用: 判"不漏 + 不幻觉"(见 _inv_missing / _inv_hallucinated),
+    **复述不算改动**; 𝒪( 记号仍按个数相等判。
+    """
     a, b = inv_sig(src_text), inv_sig(dst_text)
     out = []
-    if a[0] != b[0]:
+    if _inv_missing(a[0], b[0]) or _inv_hallucinated(a[0], b[0]):
         out.append(("数字", _toks(a[0]), _toks(b[0])))
-    if a[1] != b[1]:
+    if _inv_missing(a[1], b[1]) or _inv_hallucinated(a[1], b[1]):
         out.append(("[n]引用", _toks(a[1]), _toks(b[1])))
     if a[2] != b[2]:
         out.append(("𝒪(记号", "%d 个" % a[2], "%d 个" % b[2]))
@@ -633,7 +657,9 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
         len(bad_inv), "，列前 %d 条" % _REPORT_ROWS if len(bad_inv) > _REPORT_ROWS else ""))
     L.append("")
     L.append("判据: 数字 / [n] 引用号 / 𝒪( 记号按载荷**原样** —— 不改、不减、不增、不换位"
-             "（上标·下标数字如 `⁴` 与 `4` 视为同一个数字，算过）。")
+             "（上标·下标数字如 `⁴` 与 `4` 视为同一个数字，算过；载荷里的数字在译文中"
+             "**多出现几次**也算过 —— 中文要把英文省略的主语补出来, 数字会跟着复述。"
+             "这一节只抓两件事: **载荷有的数字不见了**、**冒出载荷里没有的数字**）。")
     L.append("")
     L.append("每条都附**载荷原文 ↔ 你的译文**并排（长的留头尾）。改之前先把并排读一遍，"
              "对号入座，三种病三种改法：")
