@@ -609,10 +609,13 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
         L.append("（下面只列前 %d 条；完整条目见台账 detail 字段。）" % _REPORT_ROWS)
         L.append("")
     for k in sorted(bad_inv)[:_REPORT_ROWS]:
+        _s = " ".join((src.get(k) or "").split())
+        _t = " ".join((got.get(k) or "").split())
         L.append("**#S%d**" % k)
         L.append("")
         L.append("- 不符: %s" % "；".join("%s 载荷 `%s` → 交付 `%s`" % (w, a, b)
                                           for w, a, b in bad_inv[k]))
+        L.append("- 长度: 载荷 %d 字 → 交付 %d 字" % (len(_s), len(_t)))
         L.append("- 载荷: %s" % (_snip(src.get(k)) or "（空）"))
         L.append("- 交付: %s" % (_snip(got.get(k)) or "（空）"))
         L.append("")
@@ -628,15 +631,18 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
     L.append("## 改法")
     L.append("")
     L.append("1. 只改上面点到号的段；其余段一个字都不要动（整篇重译 = 重新引入错位）。")
-    L.append("2. 相邻的碎片段（如 \"…average component\" 与 \"t error:\"）**各译各的**，"
+    L.append("2. **每段都要整段译完**：第三节每条都标了「载荷 N 字 → 交付 M 字」—— M 明显偏小的"
+             "（如载荷 398 字只交了 65 字），就是**只译了开头**，回载荷把没译的句子补完。"
+             "自查：中文译文通常约为载荷字数的三到六成，远低于这个比例的多半是没译完。")
+    L.append("3. 相邻的碎片段（如 \"…average component\" 与 \"t error:\"）**各译各的**，"
              "不要并成一句 —— 并段会顶掉一个段号，后面整片上移、末尾留空。"
              "**并段/重切正是内容漂移的头号成因**：一句跨两段时，你按语义重切，切点就跟载荷"
              "对不上了，第三节那一片的\"数字不符\"就是这么来的。")
-    L.append("3. 段尾的公式残留照抄，不要因为\"看着不完整\"就省略。")
-    L.append("4. 第二节的错位判据只认数字 / [n] / 𝒪( —— 载荷里数学记号多、ASCII 数字少的"
+    L.append("4. 段尾的公式残留照抄，不要因为\"看着不完整\"就省略。")
+    L.append("5. 第二节的错位判据只认数字 / [n] / 𝒪( —— 载荷里数学记号多、ASCII 数字少的"
              "段落它可能**漏报**。所以第三节的并排若读出\"译文其实是相邻段的译文\"，"
              "即便第二节没列，也当错位带处理。")
-    L.append("5. 改完**用同一个文件名覆盖**重交（`%s.doubao.txt`）—— out/ 里留两份候选"
+    L.append("6. 改完**用同一个文件名覆盖**重交（`%s.doubao.txt`）—— out/ 里留两份候选"
              "（比如又存一份 `.doubao2.txt`）会让 deliver 判\"交件件不唯一\"直接拒收。" % name)
     L.append("")
     with open(p, "w", encoding="utf-8") as f:
