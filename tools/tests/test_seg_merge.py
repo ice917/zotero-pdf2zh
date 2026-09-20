@@ -5,7 +5,7 @@
 写错, **改完没生效就提交了** —— 全程没有任何东西告诉他"你的替换没落地",
 直到人去追问才发现那 28 段原文未动。
 
-本测试锁八条语义:
+本测试锁十条语义:
   ① 正常合稿: 点到的段真变了, **未点到的段字节一个都不动**(按正文区间切片, 不重排全文)
   ② 补丁里没有 #S编号 块 -> 拒绝执行, 正式交件不动(宁可不动, 不许空跑当成功)
   ③ 补丁点了交件里没有的段号 -> 拒绝执行并点名, 交件不动(段号写错/交件拿错)
@@ -16,6 +16,10 @@
   ⑥ 字节保真: 文件末尾原本没有换行就不许添; 带 BOM 的交件合稿后 BOM 还在
   ⑦ 补丁新文本与原文一模一样 -> 不算失败, 但必须⚠️点名(等于没改)
   ⑧ 交件候选不唯一 -> 拒绝执行并提示 --delivery(合错一份整轮白干)
+  ⑨ 骨架 skeleton_text: 只留 #S 编号行与 ⋮ 断点行、正文一律清空、
+     段号一个不少且顺序不变、合并段数按 ⋮ 算(分批交件的底稿)
+  ⑩ 骨架 write_skeleton: 原子落盘并回读校验; 载荷段号重复/没有段号 -> 拒绝且不落盘;
+     校验不过时已存在的文件一个字节不动(骨架不许冲掉改好的稿子)
 
 运行: venv python test_seg_merge.py, 退出码 0=全过
 """
@@ -209,6 +213,62 @@ def main():
         rc, out, err = run(root, ["--name", "demo", "--patch", p])
         check("⑧ 交件候选不唯一 -> 拒绝并提示 --delivery",
               rc == 1 and "候选 2 份" in out and "--delivery" in out, (rc, out[-400:]))
+
+        # ⑨ 骨架: 只留编号行与 ⋮, 正文一律清空(分批交件的底稿)
+        payload = ("这是引导文字, 不属于任何段\n"
+                   "#S1\n%s\n"
+                   "#S2\n%s\n⋮\n%s\n" % (L1, L2, L2))
+        skel, keys, n_merged = SM.skeleton_text(payload)
+        check("⑨ 段号全立齐且顺序不变", keys == [1, 2], keys)
+        check("⑨ 正文一律清空(不替译者'译'出一段)",
+              L1 not in skel and L2 not in skel, skel)
+        check("⑨ 引导文字不进骨架(它不是任何段)", "引导文字" not in skel, skel)
+        check("⑨ #S 编号行一个不少", skel.count("#S1") == 1 and skel.count("#S2") == 1, skel)
+        check("⑨ ⋮ 断点行原样保留(丢了会被交付侧判「断点不符」)",
+              skel.count(SM.BREAK_MARK) == 1, skel)
+        check("⑨ 合并段数按'正文里含 ⋮'算", n_merged == 1, n_merged)
+        parsed = SM.A.SI.parse_blocks(skel)
+        check("⑨ 除占位 ⋮ 外每段正文都为空(混进译文 = 凭空替译者译了一段)",
+              set(parsed) == {1, 2}
+              and all(v.replace(SM.BREAK_MARK, "").strip() == "" for v in parsed.values()),
+              parsed)
+
+        # ⑩ write_skeleton: 原子落盘 + 回读校验; 非法载荷拒绝且不落盘
+        target = os.path.join(tmp, "skel_dir", "demo.doubao.txt")   # 父目录故意不存在
+        ks, nm, nb = SM.write_skeleton(target, payload)
+        check("⑩ 骨架落盘成功(父目录自动建), 段号与返回一致",
+              ks == [1, 2] and os.path.isfile(target) and nb > 0, (ks, nb))
+        with open(target, "rb") as f:
+            raw = f.read()
+        check("⑩ 落盘的骨架与 skeleton_text 逐字一致(写的就是回读的那份)",
+              raw.decode("utf-8") == skel, raw[:80])
+        check("⑩ 骨架不写 BOM(它是新建的底稿, 不是继承来的文件)",
+              not raw.startswith(b"\xef\xbb\xbf"), raw[:8])
+        check("⑩ 临时文件不残留(要么原子替换, 要么什么都没留下)",
+              not os.path.exists(target + ".skel_tmp"), os.listdir(os.path.dirname(target)))
+
+        try:
+            SM.skeleton_text("#S1\n甲\n#S1\n乙\n")
+            check("⑩ 载荷段号重复 -> 拒绝", False, "未报错")
+        except ValueError as exc:
+            check("⑩ 载荷段号重复 -> 拒绝并说明后果", "出现两次" in str(exc), exc)
+        try:
+            SM.skeleton_text("只有散文, 一个段号行都没有\n")
+            check("⑩ 载荷没有段号 -> 拒绝(它可能根本不是 seg_export 的载荷)", False, "未报错")
+        except ValueError as exc:
+            check("⑩ 载荷没有段号 -> 拒绝并提示", "没有任何 #S编号" in str(exc), exc)
+
+        # 校验不过时必须**不落盘**: 已存在的那份稿子一个字节都不许动
+        keep = write_delivery(root, "demo2.doubao.txt", base)
+        before = open(keep, "rb").read()
+        try:
+            SM.write_skeleton(keep, "#S1\n甲\n#S1\n乙\n")
+            check("⑩ 骨架校验不过 -> 必须抛错", False, "未报错")
+        except ValueError:
+            check("⑩ 骨架校验不过 -> 已存在的文件一个字节不动",
+                  open(keep, "rb").read() == before, "")
+        check("⑩ 失败后没有残留临时文件",
+              not os.path.exists(keep + ".skel_tmp"), os.listdir(os.path.dirname(keep)))
 
     print("\n结果: %d PASS / %d FAIL" % (passed, failed))
     return 1 if failed else 0

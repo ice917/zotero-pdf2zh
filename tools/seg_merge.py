@@ -17,10 +17,15 @@
      不等就列出段号并非零退出。这条就是冲着上面那个"静默失败"去的。
   5. 顺带跑长度比自查(与 tools/adopt.py 的 ratio_audit **同一份实现**),
      报出仍偏低的段 —— 与门禁报告同一口径, 不会漂。
+  6. [D 分批交件] 由载荷生成**交件骨架**(skeleton_text / write_skeleton):
+     保留全部 #S 编号行与 ⋮ 断点行、正文清空。有了骨架, 首轮就可以**分几批**翻、
+     每批只 merge 自己那几百段, 豆包永远不用吐整篇 —— 这才是自锁回路的治本,
+     第 1~5 条只是"整篇吐坏之后怎么救"。
 
 用法:
-  PY = D:/<...>/envs/zotero-pdf2zh-venv/python.exe
+  PY = <venv>/python.exe
   & $PY tools/seg_merge.py --name payload_p2_p4 --patch inbox/patch_p2_p4.txt
+  # 另: 骨架由桥的 start_delivery 生成(见 tools/doubao_bridge.py), 不走本 CLI
 
 补丁文件格式 = 与交件同一套编号块, 只写要改的段(其余段不出现):
   #S386
@@ -51,6 +56,7 @@ except Exception:
 import adopt as A  # noqa: E402
 
 BOM = b"\xef\xbb\xbf"
+BREAK_MARK = "⋮"        # 跨页合并段的断点记号(与 seg_export/seg_import 同一符号)
 
 
 def scan_spans(text):
@@ -177,6 +183,75 @@ def merge_file(path, patch):
     return True, {"applied": len(patch) - len(noop), "noop": noop,
                   "bytes_before": len(text.encode("utf-8")),
                   "bytes_after": len(new_text.encode("utf-8")), "text": new_text}
+
+
+def skeleton_text(payload_text):
+    """由载荷生成「交件骨架」: 只留 #S 编号行与 ⋮ 断点行, 正文一律清空。
+
+    返回 (骨架文本, 段号列表, 合并段数)。
+
+    为什么要骨架 (D: 分批交件)。790 段一次吐会撞上输出上限被截断 -> 只译前半句 ->
+    下一轮又冒出一批同病段(自锁回路)。想分批发, 就必须允许"先立段号、后填正文" ——
+    而 merge_result 只认交件里**已存在**的段号: 没有骨架, 第二批开始就无处可填。
+    有了骨架, 每一批只填自己那几百段, 豆包**永远不用吐整篇**。
+
+    ⋮ 必须留着: 交付侧的断点对账吃它(合并段须恰好 n_parts-1 个), 骨架丢掉它,
+    填完就会被判"断点不符" —— 那是我们自己的骨架造出来的假缺陷。它落在该段正文里,
+    当作"这里要断一页"的占位; 填稿时会被新译文整段替换掉, 数量照抄即可。
+    """
+    keys, seen, out, n_merged = [], set(), [], 0
+    for line in payload_text.splitlines():
+        s = line.strip()
+        m = A.SI.KEY_LINE.match(s)
+        if m:
+            k = int(m.group(1))
+            if k in seen:
+                raise ValueError("载荷里 #S%d 出现两次: 段号必须唯一" % k)
+            seen.add(k)
+            keys.append(k)
+            out.append("#S%d" % k)
+        elif s == BREAK_MARK:
+            out.append(BREAK_MARK)
+    if not keys:
+        raise ValueError("载荷里没有任何 #S编号 块 —— 这不是 seg_export 导出的载荷?")
+    # 合并段数按"正文里含 ⋮"的段算, 与交付侧断点对账同一口径
+    got = A.SI.parse_blocks(payload_text)
+    n_merged = sum(1 for v in got.values() if BREAK_MARK in v)
+    return "\n".join(out) + "\n", keys, n_merged
+
+
+def write_skeleton(path, payload_text):
+    """把骨架原子落到 path(临时文件 -> 回读校验 -> os.replace)。
+
+    返回 (段号列表, 合并段数, 字节数)。
+    **不负责"要不要覆盖"** —— 那是调用方的决定(桥的 start_delivery 会拒绝覆盖已有交件):
+    骨架是"这一版交件的底稿", 把别人已改好的稿子冲掉是最坏的一种失败。
+    回读校验盯着两点: 段号一个不多不少、每段正文里**没有正文** —— 骨架里混进译文,
+    等于凭空替译者"译"了一段, 必须当场拦下。
+    "没有正文"要排除 ⋮ : 合并段的占位 ⋮ 是骨架**故意**留的(见 skeleton_text),
+    只有 ⋮ 与空白的段算空; 拿裸的 `if v` 判会把正常骨架自己拒掉。
+    """
+    text, keys, n_merged = skeleton_text(payload_text)
+    d = os.path.dirname(os.path.abspath(path))
+    if d and not os.path.isdir(d):
+        os.makedirs(d, exist_ok=True)
+    tmp = path + ".skel_tmp"
+    _write(tmp, text, False)
+    try:
+        back, _ = _read(tmp)
+        got = A.SI.parse_blocks(back)
+        dirty = [k for k, v in got.items() if v.replace(BREAK_MARK, "").strip()]
+        bad = (sorted(got) != sorted(keys)) or dirty
+    except Exception as exc:
+        bad = True
+        dirty = ["回读异常: %s" % exc]
+    if bad:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise ValueError("骨架回读校验不符(段号 %d vs %d; 非空正文 %s), 未落盘"
+                         % (len(got), len(keys), dirty[:5]))
+    os.replace(tmp, path)
+    return keys, n_merged, len(text.encode("utf-8"))
 
 
 def audit_text(name, text=""):

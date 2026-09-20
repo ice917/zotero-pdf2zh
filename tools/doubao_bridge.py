@@ -7,9 +7,12 @@
   参数:     <项目根>/tools/doubao_bridge.py
   环境变量: P2Z_PROJ=<项目根>   (不设则退回 D:\\zotero-pdf2zh)
 
-暴露九个工具:
+暴露十一个工具:
   list_inbox()                 列出待译 payload (<项目根>/inbox)
-  get_payload(name)            读取 payload 全文 (编号段落包, #S1..#Sn, ⋮ 为跨页断点)
+  get_payload(name, from_seg, to_seg)
+                               读取 payload 全文 (编号段落包, #S1..#Sn, ⋮ 为跨页断点);
+                               给了 from_seg/to_seg 就**只读那一段号区间** (分批翻用,
+                               一轮只看几百段, 别把全篇挂在上下文里从头读到尾)
   list_reports(kind, limit)    列出质检/体检报告 (<项目根>/server/translated/review),
                                每条附一行结论(门禁判定 PASS/FAIL / 推荐跳页数)。
                                这是"矫正"的入口: 不先知道哪篇没过、为什么没过,
@@ -34,6 +37,16 @@
                                开头"的新段(实测自锁回路); 且替换会静默不生效(实测按段号
                                补 28 段, 脚本写错、没落地就交了)。这里逐段回读比对,
                                没生效当场报错; 未点到的段一个字节都不动
+  start_delivery(name, force)  开一版**交件底稿(骨架)**: 段号全立齐、正文全空
+                               (2026-09-20)。为分批交件而设 —— merge_result 只认交件里
+                               已存在的段号, 没有骨架, 第二批开始就无处可填。
+                               有它就能"分几批翻、每批只 merge 自己那几百段",
+                               永远不用吐整篇。**拒绝覆盖已有交件**(除非 force=true)
+  selfcheck(name, text)        交件前自检 (2026-09-20): 用 tools/adopt.py 里**与 deliver
+                               同一批函数**先在本地过一遍(段号守恒 / ⋮ 断点对账 / 留空 /
+                               只译半截 / 逐段不变量 / 错位带 / 长度比)。判据不另写一套,
+                               结论与门禁不会漂; 只读不写 —— 落报告、拒收仍归 deliver。
+                               交件前自己过一遍, 别把门禁当验收工
   search_term(term)            术语证据检索(等价于本地版搜索工具): 命中 Zotero 库 PDF 原文
                                上下文 + OpenAlex 学术文献, 返回证据供裁决; 只出证据,
                                不改译文、不写术语表
@@ -62,6 +75,9 @@ REVIEW = os.environ.get("P2Z_REVIEW",
 MAX_READ = 4 * 1024 * 1024
 
 S_LINE = re.compile(r"(?m)^\s*#S(\d+)\s*$")
+# 跨页合并段在段内的断点记号 —— 与 seg_export / seg_import / seg_merge 同一符号。
+# selfcheck 的「⋮ 断点对账」按它计数, 口径必须与交付侧一致, 不能各写一个字符。
+BREAK = "⋮"
 _DOUBAO_SUFFIX = re.compile(r"\.doubao\d*$")
 # out/ 下的交件: `<论文名>.doubao[序号].txt`。第 1 组是论文名, 第 2 组是轮次号。
 # 只认这个形态 —— out/ 里还堆着 seg_import/seg_inject 的中间产物
@@ -121,13 +137,64 @@ def tool_list_inbox(args):
     return "inbox/ 共 %d 个文件:\n%s" % (len(items), body)
 
 
+def _stem_of(raw):
+    """从交件名 / run 名 / 载荷名里取出"篇名"stem:
+    payload_x.doubao.txt / payload_x.doubao2.txt / payload_x.txt / payload_x → payload_x
+    """
+    return _RESULT_FILE.match(_result_name(_safe_name(raw))).group(1)
+
+
+def _load_payload(raw):
+    """按名字读 inbox 里的载荷, 返回 (文件名, 正文)。
+
+    名字先原样试, 再补 `.txt` 试 —— 豆包手上更常见的是 run 名(payload_p2_p4),
+    不是文件名(payload_p2_p4.txt)。**只认 inbox 里真实存在的文件**, 不拼路径。
+    """
+    fn = _safe_name(raw)
+    for cand in (fn, fn + ".txt"):
+        p = os.path.join(INBOX, cand)
+        if os.path.isfile(p):
+            with open(p, "r", encoding="utf-8-sig") as f:
+                return cand, f.read(MAX_READ)
+    raise FileNotFoundError("inbox 里不存在 %r (用 list_inbox 查看可用文件)" % raw)
+
+
+def _slice_payload(text, lo, hi):
+    """按段号区间取载荷(闭区间, 缺省一侧 = 不限)。
+
+    为什么要能分批读(2026-09-20): 790 段 / ~110KB 一次读进来, 上下文里从头挂到尾,
+    翻到后半段时前半段已经"不新鲜"了 —— 实测表现就是后面只译前半句。
+    分批读 + 分批交(见 start_delivery / merge_result), 一轮只看几百段。
+    载荷自己的引导文字(第一个 #S 之前)照留 —— 那是 seg_export 写下的说明。
+    合并段的 ⋮ 一并带上(它在段内, 跟着段走)。
+    """
+    head, out, cur, keep = [], [], None, False
+    for line in text.splitlines(keepends=True):
+        m = S_LINE.match(line.rstrip("\r\n"))
+        if m:
+            cur = int(m.group(1))
+            keep = (lo is None or cur >= lo) and (hi is None or cur <= hi)
+        if cur is None:
+            head.append(line)
+        elif keep:
+            out.append(line)
+    if not out:
+        raise ValueError("区间 #S%s..#S%s 里一段都没有" % (lo, hi))
+    keys = [int(m.group(1)) for m in (S_LINE.match(l.rstrip("\r\n"))
+                                      for l in out) if m]
+    note = "[本批: #S%d..#S%d, 共 %d 段 —— 分批交件请配合 start_delivery/merge_result]\n" % (
+        keys[0], keys[-1], len(keys))
+    return "".join(head) + note + "".join(out)
+
+
 def tool_get_payload(args):
-    fn = _safe_name(args.get("name"))
-    p = os.path.join(INBOX, fn)
-    if not os.path.isfile(p):
-        raise FileNotFoundError("不存在: %s (用 list_inbox 查看可用文件)" % fn)
-    with open(p, "r", encoding="utf-8-sig") as f:
-        return f.read(MAX_READ)
+    fn, text = _load_payload(args.get("name"))
+    lo = args.get("from_seg")
+    hi = args.get("to_seg")
+    if lo is None and hi is None:
+        return text
+    return _slice_payload(text, int(lo) if lo is not None else None,
+                          int(hi) if hi is not None else None)
 
 
 def _report_names(kind=None):
@@ -448,6 +515,168 @@ def tool_merge_result(args):
     return stats
 
 
+def _load_manifest(stem):
+    """inbox 里的 manifest(段号 + 每段分页数) —— 与 deliver 读的是同一份文件。"""
+    p = os.path.join(INBOX, stem + ".manifest.json")
+    if not os.path.isfile(p):
+        return None, p
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f), p
+
+
+def tool_start_delivery(args):
+    """为**分批翻译**开一版交件底稿(骨架): 段号全立齐、正文全空。
+
+    为什么需要它(2026-09-20, 治自锁回路): 790 段一次吐会撞上输出上限被截断 ->
+    只译前半句 -> 下一轮又冒出一批同病段。想分批发, 就必须允许"先立段号、后填正文" ——
+    而 merge_result 只认交件里**已存在**的段号: 没有骨架, 第二批开始就无处可填。
+    有了它, 每批只填自己那几百段, **永远不用吐整篇**。
+
+    骨架的段号与 ⋮ 断点直接取自载荷(与 manifest 同源), 所以填满之后 deliver 的
+    段号守恒与断点对账一定能过 —— 除非填的人自己把 ⋮ 弄丢了。
+    **拒绝覆盖已有交件**(除非显式 force=true): 骨架是底稿, 把改好的稿子冲掉是最坏的失败。
+    """
+    raw = str(args.get("name") or "").strip()
+    if not raw:
+        raise ValueError("name 为空 (给 inbox 里的载荷名, 如 payload_p2_p4)")
+    stem = _stem_of(raw)
+    pfn, pay = _load_payload(stem)
+    fn = _result_name(pfn)
+    path = os.path.join(OUTDIR, fn)
+    if os.path.exists(path) and not bool(args.get("force")):
+        raise ValueError("交件 %s 已存在 —— 骨架是底稿, 不许覆盖已有稿子; 确实要重开请显式 "
+                         "force=true(那会丢掉这份稿子已有的译文)" % fn)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import seg_merge as SM          # 懒加载: 桥本身零依赖
+    keys, n_merged, nbytes = SM.write_skeleton(path, pay)
+    stats = ("已开一版交件底稿(骨架): %s\n"
+             "  段号 %d 个已立齐、正文全空 (%d 字节); 其中跨页合并段 %d 个 —— "
+             "这些段的正文里已经放了一个 ⋮ 占位, 新译文**必须自带同数量的 ⋮**"
+             "(少了会被判「断点不符」)。\n"
+             "  下一步: 分批翻(用 get_payload 的 from_seg/to_seg 只读一批), 每批用 merge_result "
+             "只填自己那几百段; 未点到的段一个字节都不会动。\n"
+             "  ⚠️ 不要整篇重吐: 输出一长就撞上限被截断, 下一轮又冒出一批只译了开头的段。\n"
+             "  全填完后用 selfcheck 自检(判据与门禁同源), 再交给交付人跑 deliver。"
+             % (fn, len(keys), nbytes, n_merged))
+    others = [n for n in _result_names(stem) if n != fn]
+    if others:
+        stats += ("\n⚠️ out/ 里还有同篇的其他交件: %s —— deliver 要求交件唯一, "
+                  "请自己确认要留哪一份" % ", ".join(others))
+    _log("开底稿 %s: %d 段" % (fn, len(keys)))
+    return stats
+
+
+def tool_selfcheck(args):
+    """交件前自检: 用**与 deliver 同一批函数**先在本地过一遍(2026-09-20)。
+
+    为什么需要它: 上一轮豆包自述第 4 条 —— "改完没抽查就直接提交, 靠门禁替我验收",
+    于是门禁成了唯一的质控, 退回一轮就跑一轮。桥原来九个工具里没有一个是"交件前自检"
+    (只有事后 list_reports 看被拒的清单)。这里把 deliver 的判据前移: 段号守恒 /
+    ⋮ 断点对账 / 留空 / 只译半截 / 逐段不变量(数字·[n]引用·𝒪() / 错位带 / 长度比自查。
+
+    **判据不另写一套**: 直接 import tools/adopt.py 的同一批函数(gap_defects /
+    diff_invariants / shift_bands / ratio_audit), 所以这里的结论与 deliver 不会漂;
+    唯一差别是它**只读不写** —— 落报告、拒收、记账的事仍然归 deliver。
+
+    text 缺省时按名字去 out/ 取那份交件; 也可以直接传一段文本先自检再提交。
+    """
+    raw = str(args.get("name") or "").strip()
+    if not raw:
+        raise ValueError("name 为空 (给交件名或 run 名, 如 payload_p2_p4)")
+    text = str(args.get("text") or "")
+    if text.strip():
+        label = "内联文本(%d 字符)" % len(text)
+    else:
+        fn, path = _resolve_result(raw)
+        with open(path, "r", encoding="utf-8-sig") as f:
+            text = f.read(MAX_READ)
+        label = fn
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import adopt as A          # 懒加载: 判据必须与 deliver 同源
+    stem = _stem_of(raw)
+    man, man_p = _load_manifest(stem)
+    src, pay_err = {}, ""
+    try:
+        _, pay = _load_payload(stem)
+        src = A.SI.parse_blocks(pay)
+    except FileNotFoundError as exc:
+        pay_err = str(exc)
+    if man:
+        # 与 deliver 完全同源: 段号集合 + 每段分页数都取 manifest
+        exp = {int(str(it["key"]).lstrip("S")): len(it["parts"]) for it in man["items"]}
+        src_of = "inbox 的 manifest(与 deliver 同源)"
+    elif src:
+        # 没有 manifest 就退回载荷自身: 载荷侧"⋮ 计数 +1"等于分页数, 与 manifest 同构
+        exp = {k: (v.count(BREAK) + 1) for k, v in src.items()}
+        src_of = "载荷自身的 ⋮ 计数(无 manifest; 口径与 deliver 同构)"
+    else:
+        raise FileNotFoundError("既没有 manifest 也没有载荷, 无从自检 —— %s" % man_p)
+
+    got = A.SI.parse_blocks(text)
+    miss = sorted(set(exp) - set(got))
+    extra = sorted(set(got) - set(exp))
+    bad_cut = ["#S%d 断点 %d != 预期 %d" % (k, got[k].count(BREAK), exp[k] - 1)
+               for k in sorted(set(exp) & set(got))
+               if got[k].count(BREAK) != exp[k] - 1]
+    empty, short = A.gap_defects(src, got) if src else ([], [])
+    bad_inv = {}
+    if src:
+        for k in sorted(set(src) & set(got)):
+            d = A.diff_invariants(src.get(k), got.get(k))
+            if d:
+                bad_inv[k] = d
+    bands = A.shift_bands(src, got) if src else []
+    rows = A._REPORT_ROWS
+
+    L = ["交件自检: %s" % label,
+         "  期望段号取自 %s: %d 段" % (src_of, len(exp))]
+    L.append("  · 段号守恒: %s" % (
+        "PASS" if not (miss or extra) else "FAIL —— 缺 %d 段 %s%s; 多 %d 段 %s%s"
+        % (len(miss), ["#S%d" % k for k in miss[:rows]],
+           " …" if len(miss) > rows else "",
+           len(extra), ["#S%d" % k for k in extra[:rows]],
+           " …" if len(extra) > rows else "")))
+    L.append("  · ⋮ 断点对账: %s" % ("PASS" if not bad_cut else
+                                     "FAIL %d 条:\n      %s" % (len(bad_cut),
+                                                                "\n      ".join(bad_cut[:rows]))))
+    L.append("  · 留空: %d 段 %s" % (
+        len(empty), ["#S%d" % k for k in empty[:rows]] if empty else "(全段有内容)"))
+    L.append("  · 只译半截(交付 < 载荷 15%%): %d 段 %s" % (
+        len(short), ["#S%d(%d->%d)" % t for t in short[:rows]] if short else "(无)"))
+    if not src:
+        L.append("  · 逐段不变量: ⚠️ 跳过(%s) —— 交付人跑 deliver 时同样会跳过, 但这一层"
+                 "拦不住整段错位" % pay_err)
+    else:
+        L.append("  · 逐段不变量: %s" % ("PASS" if not bad_inv else
+            "FAIL %d 段:\n      %s" % (len(bad_inv), "\n      ".join(
+                "#S%d %s" % (k, "; ".join("%s %s->%s" % t for t in v))
+                for k, v in sorted(bad_inv.items())[:rows]))))
+        L.append("  · 错位带: %s" % ("无" if not bands else
+            "\n      " + "\n      ".join(
+                "载荷 #S%d-#S%d (%d 段) 的译文被放到交付的 #S%d-#S%d"
+                % (k0, k1, n, k0 + off, k1 + off) for off, k0, k1, n in bands[:10])))
+    if src:
+        n_long, mid, bk, cands = A.ratio_audit(src, got)
+        if n_long:
+            lo, mo, hi = A._ADVISORY_BUCKETS
+            L.append("  · 长度比: 长段 %d 个, 中位 %d%% ｜ < %d%% %d 段 ｜ %d%%~%d%% %d 段 ｜ "
+                     "%d%%~%d%% %d 段 ｜ ≥ %d%% %d 段"
+                     % (n_long, round(100.0 * mid), int(lo * 100), bk[0],
+                        int(lo * 100), int(mo * 100), bk[1],
+                        int(mo * 100), int(hi * 100), bk[2], int(hi * 100), bk[3]))
+            if cands:
+                L.append("      ⚠️ %d 段比值偏低(%d%%~%d%%, 门禁**不拦**, 但同样像只译了开头): %s"
+                         % (len(cands), int(A._GAP_RATIO * 100), int(A._ADVISORY_RATIO * 100),
+                            ["#S%d" % k for k, _, _ in cands[:rows]]))
+    hard = len(miss) + len(extra) + len(bad_cut) + len(empty) + len(short) \
+        + len(bad_inv) + len(bands)
+    L.append("结论: " + ("✅ 与门禁预期一致, 可以交"
+                        if hard == 0 else
+                        "❌ 门禁会拒收 —— 先按上面点到号的段改(只改那些段, 用 merge_result), "
+                        "改完再 selfcheck 一遍"))
+    return "\n".join(L)
+
+
 def tool_search_term(args):
     """术语证据检索——给豆包一个可调用的"搜索工具"（等价于本地版 tavily）。
 
@@ -508,11 +737,18 @@ TOOLS = [
     },
     {
         "name": "get_payload",
-        "description": "读取待译 payload 全文: 编号段落包, 每段以 #S编号 行开头; ⋮ 表示原文跨页断点。"
+        "description": "读取待译 payload: 编号段落包, 每段以 #S编号 行开头; ⋮ 表示原文跨页断点。"
+                       "**给了 from_seg/to_seg 就只读那一段号区间**(分批翻用) —— "
+                       "790 段一次读进来挂在上下文里, 翻到后半段时前半段已不新鲜, 实测表现"
+                       "就是后面只译前半句; 分几批读、每批配 merge_result 交回, 一轮只看几百段。"
                        "若某段里有拿不准的术语, 先用 search_term 取该术语在用户库里的原文证据再定译法",
         "inputSchema": {
             "type": "object",
-            "properties": {"name": {"type": "string", "description": "inbox 下的文件名, 如 payload_test.txt"}},
+            "properties": {
+                "name": {"type": "string", "description": "inbox 下的文件名或 run 名, 如 payload_test.txt / payload_test"},
+                "from_seg": {"type": "integer", "description": "起始段号(闭区间, 可只给一侧); 不给则从头"},
+                "to_seg": {"type": "integer", "description": "结束段号(闭区间); 不给则到末尾"},
+            },
             "required": ["name"],
         },
     },
@@ -610,6 +846,46 @@ TOOLS = [
         },
     },
     {
+        "name": "start_delivery",
+        "description": "开一版**交件底稿(骨架)**: 段号 #S1..#Sn 全立齐、正文全空、⋮ 断点照留。"
+                       "**分批翻整篇长文时第一步就调它** —— merge_result 只认交件里已存在的段号, "
+                       "没有骨架, 第二批开始就无处可填, 只能回头整篇重吐(撞输出上限的根因)。"
+                       "有了它: ① get_payload 带 from_seg/to_seg 读一批 → ② 翻这一批 → "
+                       "③ merge_result 只填这一批的几百段 → 下一批。永远不用吐整篇。"
+                       "**拒绝覆盖已有交件**(除非 force=true, 会丢掉那份稿子已有的译文)。"
+                       "返回值给出总段数与跨页合并段数; 合并段的新译文里必须自带 ⋮, 数量与载荷一致",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string",
+                         "description": "inbox 里的载荷名或 run 名, 如 payload_p2_p4"},
+                "force": {"type": "boolean",
+                          "description": "交件已存在时是否重开(会丢掉已有译文); 默认 false = 报错不覆盖"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "selfcheck",
+        "description": "**交件前自己先过一遍门禁**, 别把门禁当验收工。判据与 deliver 用的是 "
+                       "tools/adopt.py 里同一批函数(段号守恒 / ⋮ 断点对账 / 留空 / 只译半截 / "
+                       "逐段不变量(数字·[n]引用·𝒪() / 整段错位带 / 长度比自查), 所以结论与"
+                       "门禁不会漂。**只读不写**: 只打印 PASS/FAIL 与点名的段号, 不落报告、不拒收、"
+                       "不记账 —— 那些仍归交付人跑 deliver。"
+                       "name 传交件名或载荷名(缺省去 out/ 读那份交件); 也可直接传 text 先自查再提交。"
+                       "返回里有 FAIL 的项, 就用 merge_result **只改点到号的段**, 改完再 selfcheck 一次",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string",
+                         "description": "交件名(如 egophys2026.doubao.txt)或载荷名(如 payload_p2_p4); 传了 text 时可省"},
+                "text": {"type": "string",
+                         "description": "要自检的全文(含 #S 编号行); 不传则按 name 去 out/ 取那份交件"},
+            },
+            "required": ["name"],
+        },
+    },
+    {
         "name": "search_term",
         "description": (
             "从**用户自己的文献库**取术语的用法证据。这不是通用搜索——"
@@ -646,6 +922,8 @@ _DISPATCH = {
     "get_result": tool_get_result,
     "submit_result": tool_submit_result,
     "merge_result": tool_merge_result,
+    "start_delivery": tool_start_delivery,
+    "selfcheck": tool_selfcheck,
     "search_term": tool_search_term,
 }
 

@@ -27,10 +27,13 @@
      (改动面过大即提示"你在重译", 让这件事对豆包自己可见)。
 
 本测试锁五点:
-  ① `_result_name` 的规范化边界(原名/带序号/无扩展名/多段扩展名)
-  ② 真跑一次 STDIO JSON-RPC 往返: 九工具齐全 + 交件落到规范名 + 缺件报错不崩
+  ① `_result_name` 的规范化边界(原名/带序号/无扩展名/多段扩展名) + `_stem_of` 取篇名
+  ② 真跑一次 STDIO JSON-RPC 往返: 十一工具齐全 + 交件落到规范名 + 缺件报错不崩
      + 未知方法回 -32601 + stdout 洁净(日志不许混进协议通道)
      + merge_result 只动点到段(未点到段逐字不变) / 名字歧义与段号不存在都当场报错
+     + get_payload 的 from_seg/to_seg 只取那一段号区间(分批翻)
+     + start_delivery 开底稿 / 拒覆盖已有交件 / force 重开
+     + selfcheck 空骨架判 FAIL、填满后判 PASS(判据与 deliver 同源)
   ③ 全流程锁在 P2Z_PROJ 沙箱内 —— 真项目的 inbox/out 一个字节都不碰
   ④ report 两工具: 判定行抽取 / kind 过滤 / limit 截断 / 子串定位 / 歧义报错 /
      路径穿越名进不来
@@ -59,6 +62,23 @@ PAYLOAD = "#S1\nFirst paragraph of the paper.\n#S2\nSecond paragraph with [1] ci
 # 第二轮: 只在 #S2 加了半句 = 1/2 段有改动。2 段时该比例必然越过 30% 阈值,
 # 所以这一条同时也锁住了"改动面过大"的分支。
 PAYLOAD2 = "#S1\nFirst paragraph of the paper.\n#S2\nSecond paragraph with [1] citation, revised.\n"
+# 分批交件用: 含一个**跨页合并段**(#S2 正文里带 ⋮)。两段都 >=40 字符,
+# 才会进长度比自查; 数字/[n] 引用也都留着, 好让 selfcheck 的逐段不变量真跑起来。
+PAYLOAD_Z = ("#S1\n"
+             "The optimizer reduces the gradient storage requirement substantially "
+             "for large scale training runs [1].\n"
+             "#S2\n"
+             "First half of the merged paragraph describing the method.\n"
+             "⋮\n"
+             "Second half mentions 42 layers and also [2] citations for completeness.\n")
+# 填满骨架后的样子(段号守恒 / ⋮ 数量对得上 / 无留空半截 / 数字与 [n] 一个不差)
+FILLED_Z = ("#S1\n"
+            "该优化器在大规模训练中大幅降低了梯度存储需求 [1]，使显存占用显著下降，"
+            "训练成本随之降低。\n"
+            "#S2\n"
+            "这是合并段的前半部分，描述方法本身。\n"
+            "⋮\n"
+            "后半部分提到 42 层，并为完整性引用了 [2]。\n")
 
 
 def main():
@@ -99,6 +119,16 @@ def main():
     check("① 规范化后仍能通过文件名白名单",
           BR._safe_name(BR._result_name("payload p2.txt")) == "payload p2.doubao.txt")
 
+    # ---- ①b 篇名归一: 交件名/载荷原名/run 名 都该归到同一个 stem ----
+    check("① _stem_of 从交件名取篇名",
+          BR._stem_of("payload_x.doubao2.txt") == "payload_x", BR._stem_of("payload_x.doubao2.txt"))
+    check("① _stem_of 从载荷原名取篇名",
+          BR._stem_of("payload_x.txt") == "payload_x", BR._stem_of("payload_x.txt"))
+    check("① _stem_of 从 run 名取篇名",
+          BR._stem_of("payload_x") == "payload_x", BR._stem_of("payload_x"))
+    check("① _stem_of 三条入口归到同一个篇名(否则 selfcheck 找不到载荷)",
+          BR._stem_of("payload_x.doubao2.txt") == BR._stem_of("payload_x.txt") == BR._stem_of("payload_x"))
+
     # ---- ②/③ 真 STDIO 往返, 全程锁在沙箱 ----
     tmp = tempfile.mkdtemp(prefix="p2z_bridge_")
     try:
@@ -107,6 +137,10 @@ def main():
         os.makedirs(inbox)
         with open(os.path.join(inbox, "payload_x.txt"), "w", encoding="utf-8") as f:
             f.write(PAYLOAD)
+        # 分批交件(骨架)那条线用的载荷: 含跨页合并段, 且**没有** manifest ——
+        # 顺带锁住 selfcheck 在无 manifest 时退回"载荷自身 ⋮ 计数"的那条分支。
+        with open(os.path.join(inbox, "payload_z.txt"), "w", encoding="utf-8") as f:
+            f.write(PAYLOAD_Z)
         # 手工放一份"上一版交件": 作为 merge_result 的合稿对象。特意不靠 submit_result
         # 现场生成 —— 那样它就与 ② 段里"交件逐字一致"的读盘断言互相干扰。
         os.makedirs(outdir)
@@ -157,6 +191,24 @@ def main():
              "params": {"name": "merge_result",
                         "arguments": {"name": "payload_y.doubao.txt",
                                       "patch": "#S99\nnope\n"}}},
+            # get_payload 分批读 (2026-09-20 D): 只取 #S2 那一段
+            {"jsonrpc": "2.0", "id": 13, "method": "tools/call",
+             "params": {"name": "get_payload",
+                        "arguments": {"name": "payload_x.txt", "from_seg": 2, "to_seg": 2}}},
+            # start_delivery (D): 开底稿 -> 再开必须被拒 -> force 才重开
+            {"jsonrpc": "2.0", "id": 14, "method": "tools/call",
+             "params": {"name": "start_delivery", "arguments": {"name": "payload_z"}}},
+            {"jsonrpc": "2.0", "id": 15, "method": "tools/call",
+             "params": {"name": "start_delivery", "arguments": {"name": "payload_z"}}},
+            {"jsonrpc": "2.0", "id": 16, "method": "tools/call",
+             "params": {"name": "start_delivery",
+                        "arguments": {"name": "payload_z", "force": True}}},
+            # selfcheck (B): 空骨架必须判 FAIL; 填满后必须判 PASS
+            {"jsonrpc": "2.0", "id": 17, "method": "tools/call",
+             "params": {"name": "selfcheck", "arguments": {"name": "payload_z"}}},
+            {"jsonrpc": "2.0", "id": 18, "method": "tools/call",
+             "params": {"name": "selfcheck",
+                        "arguments": {"name": "payload_z", "text": FILLED_Z}}},
         ]
         env = dict(os.environ)
         env["P2Z_PROJ"] = proj
@@ -175,17 +227,26 @@ def main():
             m = _try_json(ln)
             if m is not None and "id" in m:
                 answers[m["id"]] = m
-        check("② 十二条请求都有应答",
-              sorted(answers) == [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], sorted(answers))
+        check("② 十八条请求都有应答",
+              sorted(answers) == list(range(1, 19)), sorted(answers))
 
         check("② initialize 自报桥名",
               answers[1]["result"]["serverInfo"]["name"] == "pdf2zh-bridge", answers[1])
         names = [t["name"] for t in answers[2]["result"]["tools"]]
-        check("② 九工具齐全",
+        check("② 十一工具齐全",
               names == ["list_inbox", "get_payload", "list_reports", "get_report",
                         "list_results", "get_result", "submit_result", "merge_result",
-                        "search_term"],
+                        "start_delivery", "selfcheck", "search_term"],
               names)
+        schema = {t["name"]: t["inputSchema"] for t in answers[2]["result"]["tools"]}
+        check("② get_payload 声明了 from_seg/to_seg(分批读是契约, 不是暗号)",
+              {"from_seg", "to_seg"} <= set(schema["get_payload"]["properties"]), schema["get_payload"])
+        check("② start_delivery 只需 name, force 可选",
+              schema["start_delivery"]["required"] == ["name"]
+              and "force" in schema["start_delivery"]["properties"], schema["start_delivery"])
+        check("② selfcheck 只需 name, text 可选",
+              schema["selfcheck"]["required"] == ["name"]
+              and "text" in schema["selfcheck"]["properties"], schema["selfcheck"])
         check("② get_payload 取回原文",
               PAYLOAD == answers[3]["result"]["content"][0]["text"],
               answers[3]["result"]["content"][0]["text"][:80])
@@ -239,6 +300,58 @@ def main():
               answers[12])
         with open(merged_path, encoding="utf-8") as f:
             check("② merge_result 被拒时交件原封不动", f.read() == state_after, "")
+
+        # ---- get_payload 分批读: 一轮只看几百段, 不把全篇挂在上下文里 ----
+        r13 = answers[13]["result"]["content"][0]["text"]
+        check("② 分批读只含所取区间(#S2), 不含区外段(#S1)",
+              "#S2" in r13 and "#S1" not in r13, r13[:200])
+        check("② 分批读带上批注(哪一批、几段、配合哪个工具)",
+              "本批" in r13 and "start_delivery" in r13, r13[:200])
+        check("② 分批读的正文与原文逐字一致",
+              "Second paragraph with [1] citation." in r13, r13)
+
+        # ---- start_delivery: 开底稿(骨架) -> 拒覆盖 -> force 重开 ----
+        r14 = answers[14]["result"]["content"][0]["text"]
+        skel_path = os.path.join(outdir, "payload_z.doubao.txt")
+        check("② start_delivery 开出底稿文件", os.path.isfile(skel_path),
+              sorted(os.listdir(outdir)))
+        with open(skel_path, encoding="utf-8") as f:
+            skel = f.read()
+        check("② 骨架段号全立齐、正文全空",
+              skel.count("#S1") == 1 and skel.count("#S2") == 1
+              and "optimizer" not in skel and "merged paragraph" not in skel, skel)
+        check("② 骨架保留 ⋮(丢了会被交付侧判「断点不符」)", skel.count("⋮") == 1, skel)
+        check("② 回执报总段数与跨页合并段数",
+              "段号 2 个" in r14 and "跨页合并段 1 个" in r14, r14)
+        check("② 回执指明分批交件动线(get_payload -> merge_result -> selfcheck)",
+              "merge_result" in r14 and "selfcheck" in r14, r14)
+
+        check("② 已有交件 → 拒绝覆盖(骨架是底稿, 不许冲掉改好的稿子)",
+              answers[15]["result"]["isError"] is True
+              and "已存在" in answers[15]["result"]["content"][0]["text"],
+              answers[15])
+        with open(skel_path, encoding="utf-8") as f:
+            check("② 被拒时底稿一个字节不动", f.read() == skel, "")
+        check("② force=true 才重开",
+              answers[16]["result"]["isError"] is False
+              and "已开一版交件底稿" in answers[16]["result"]["content"][0]["text"],
+              answers[16])
+
+        # ---- selfcheck: 交件前自己过一遍, 判据与 deliver 同源 ----
+        r17 = answers[17]["result"]["content"][0]["text"]
+        check("② selfcheck 空骨架 → 判 FAIL 并点名留空的段",
+              "结论: ❌" in r17 and "#S1" in r17 and "#S2" in r17, r17)
+        check("② selfcheck 报出期望段号取自哪里(无 manifest 时退回载荷 ⋮ 口径)",
+              "载荷自身的 ⋮ 计数" in r17, r17)
+        r18 = answers[18]["result"]["content"][0]["text"]
+        check("② selfcheck 填满后 → 判 PASS, 可以交",
+              "结论: ✅" in r18, r18)
+        check("② selfcheck 逐项 PASS(段号守恒/⋮ 对账/不变量), 一项 FAIL 都没有",
+              r18.count("PASS") >= 3 and "FAIL" not in r18, r18)
+        check("② selfcheck 报出长度比分布(与门禁同一份实现)",
+              "长度比" in r18 and "长段 2 个" in r18, r18)
+        with open(skel_path, encoding="utf-8") as f:
+            check("② selfcheck 只读不写(底稿没被它改过)", f.read() == skel, "")
 
         check("② 缺件走 isError 不崩",
               answers[5]["result"]["isError"] is True
