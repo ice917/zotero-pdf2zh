@@ -60,8 +60,11 @@ _DOUBAO_SUFFIX = re.compile(r"\.doubao\d*$")
 # (.imported.json / .merged.txt / .raw.txt), 一律不能当"上一版交件"甩给豆包。
 _RESULT_FILE = re.compile(r"^(.+?)\.doubao(\d*)\.txt$")
 
-# review/ 下按前缀区分六种报告; 默认取第一种 —— 门禁报告才有 PASS/FAIL 判定
-REPORT_KINDS = ("翻译后质检", "翻译前体检", "审校报告", "存疑清单",
+# review/ 下按前缀区分七种报告; 默认取第一种 —— 门禁报告才有 PASS/FAIL 判定
+# 「门禁拒收」(2026-09-20 加) 是 deliver 阶段内容门禁拦下交件时落的清单: 哪几段
+# 错位、哪几段数字/引用对不上。它比「翻译后质检」更靠前 —— 那份是出 PDF 之后的
+# 质检, 而这份交件根本没进渲染。豆包改稿要照的就是它。
+REPORT_KINDS = ("翻译后质检", "门禁拒收", "翻译前体检", "审校报告", "存疑清单",
                 "术语查证报告", "解析沙盘")
 _VERDICT = re.compile(r"(?m)^.*(?:门禁判定|推荐 skipLastPages).*$")
 LIST_LIMIT_DEFAULT = 20

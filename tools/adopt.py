@@ -69,6 +69,11 @@ OUTDIR = os.path.join(PROJ, "out")
 LEDGER_DIR = os.path.join(PROJ, "logs", "adopt")
 SIDECAR = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow", "latest.jsonl")
 CACHE = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "cache.v1.db")
+# [自研补丁 2026-09-20] 门禁拒收报告落点: 与 post_check.py 的 review_dir() /
+# doubao_bridge.REVIEW 同一目录 —— 桥的 list_reports / get_report 就读这里。
+# 落在文件里而不是只印终端, 是因为"豆包能矫正"的前提是它**看得见**自己哪一段被拒。
+REVIEW = os.environ.get("P2Z_REVIEW",
+                        os.path.join(PROJ, "server", "translated", "review"))
 
 
 def _local_py():
@@ -380,6 +385,142 @@ def stage_export(args):
     return 0
 
 
+# ------------------------------------------------------------------ 逐段不变量
+# [自研补丁 2026-09-20] 交付稿的**内容级**核对。
+#
+# 为什么加: 2026-09-20 SILAGE 那篇, 交付稿在残片密集区**整段错位** —— 源
+# #S277/278/279 的译文出现在交付 #S276/277/278, 几十段整体前移一格。当时的门禁
+# 只比对段号集合与 ⋮ 条数, 两者全过, 于是错位稿一路回灌、渲染成错页论文, 而日志
+# 里只有 4 条"⋮ 不符", 看不出真问题(反被当成"小毛病"放过)。
+#
+# 判据只取"译者不该动的东西": 数字 / [n] 引用号 / 𝒪( 记号 (⋮ 那条已有, 这里并入同一份报告)。
+# 定标用的是 10 篇**历史上已被采纳**的交件(311 个含数字的段): 数字多重集不符 1 例
+# (0.3%, 那例是译者把加粗的 1 展开成"全为 1 的", 属合理改写), [n] 0/25, 𝒪( 0/0,
+# ⋮ 0/7 —— 同一套判据打在问题稿上是 131 段不符 + 13 条错位带。判别力够, 故做
+# **硬门禁**: 不符即拒收, 不再静默回落机翻; 极少数合理改写由 deliver --waive 显式放行(留痕)。
+NUM_TOK = re.compile(r"\d+(?:\.\d+)?")
+REF_TOK = re.compile(r"\[\d+(?:\s*[,\-–]\s*\d+)*\]")
+BIG_O = re.compile(r"[𝒪𝑂]\s*\(")
+_REPORT_ROWS = 60       # 报告里逐段明细的上限(全文可能上百条, 表太长没人看)
+
+
+def inv_sig(text):
+    """一段的不变量签名: (数字多重集, [n]引用多重集, 𝒪( 计数)。"""
+    return (tuple(sorted(NUM_TOK.findall(text or ""))),
+            tuple(sorted(REF_TOK.findall(text or ""))),
+            len(BIG_O.findall(text or "")))
+
+
+def _toks(t):
+    return ", ".join(t) if t else "无"
+
+
+def diff_invariants(src_text, dst_text):
+    """逐段比对, 返回 (不符项, 载荷侧, 交付侧) 三元组列表(空 = 合格)。"""
+    a, b = inv_sig(src_text), inv_sig(dst_text)
+    out = []
+    if a[0] != b[0]:
+        out.append(("数字", _toks(a[0]), _toks(b[0])))
+    if a[1] != b[1]:
+        out.append(("[n]引用", _toks(a[1]), _toks(b[1])))
+    if a[2] != b[2]:
+        out.append(("𝒪(记号", "%d 个" % a[2], "%d 个" % b[2]))
+    return out
+
+
+def shift_bands(src, dst):
+    """诊"整段错位": 源某段的签名出现在交付的相邻号上 -> 内容没丢, 只是号错位。
+
+    返回 [(偏移, 起段, 止段, 段数), ...], 只留连续 >= 2 段的(单段命中是噪声)。
+    邻域只看到 ±2 格 —— 更远就不是"错位"而是"换了一篇", 那种该整篇作废。
+    为什么值得单列: 错位带要改的是**编号**, 不是数字; 不分离出来, 豆包面对的是
+    131 条"数字不符", 会以为要重译那 131 段 —— 而重译正是重新引入错位的做法。
+    """
+    hits = {}
+    for k, s in src.items():
+        sig = inv_sig(s)
+        if sig == ((), (), 0):
+            continue                      # 源段里没有任何不变量 -> 无判别力
+        for off in (-1, 1, -2, 2):        # 近的先试: 近邻全等比远邻全等可信
+            if dst.get(k + off) is not None and inv_sig(dst[k + off]) == sig:
+                hits[k] = off
+                break
+    bands, run = [], None
+    for k in sorted(hits):
+        off = hits[k]
+        if run and run[0] == off and k == run[2] + 1:
+            run[2], run[3] = k, run[3] + 1
+        else:
+            if run:
+                bands.append(tuple(run))
+            run = [off, k, k, 1]
+    if run:
+        bands.append(tuple(run))
+    return [b for b in bands if b[3] >= 2]
+
+
+def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands):
+    """把拒收原因落成一份 review/ 报告并返回路径 —— 这是"交给豆包改"的那份东西。
+
+    头部必须带一行含「门禁判定」的结论: doubao_bridge._headline() 只读前 6KB 抓
+    这一行, 抓不到的话 list_reports 里这条就是空白, 豆包照样看不见。
+    """
+    os.makedirs(REVIEW, exist_ok=True)
+    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    p = os.path.join(REVIEW, "门禁拒收_%s_%s.md" % (stamp, name))
+    L = []
+    L.append("# 门禁拒收：%s" % name)
+    L.append("")
+    L.append("- 门禁判定: FAIL（交件未通过 deliver 内容门禁，已拒收；任务判失败，现场保留）")
+    L.append("- 交件: %s  (sha1=%s)" % (text_path, sha1_8(text_path)))
+    L.append("- 载荷: %s" % os.path.join(INBOX, name + ".txt"))
+    L.append("- 规模: 交付 %d 段 / 载荷 %d 段" % (len(got), len(src)))
+    L.append("- 拒收条目: ⋮ 分页断点 %d 条 · 逐段不变量 %d 条 · 错位带 %d 条"
+             % (len(bad_cut), len(bad_inv), len(bands)))
+    L.append("")
+    if bands:
+        L.append("## 一、整段错位（优先看这里）")
+        L.append("")
+        L.append("下面这些区间里，**载荷某段的译文被放到了交付的相邻号上** —— 内容没丢，"
+                 "只是整片错了一格。请对照载荷把号改回来，**不要重译**（重译只会再错一次）。")
+        L.append("")
+        L.append("| 载荷段号区间 | 偏移 | 段数 | 含义 |")
+        L.append("| --- | --- | --- | --- |")
+        for off, k0, k1, n in bands[:_REPORT_ROWS]:
+            move = "前移 %d 格" % -off if off < 0 else "后移 %d 格" % off
+            L.append("| #S%d – #S%d | %+d | %d | 这批段的译文被放到了交付的 #S%d – #S%d"
+                     "（一律%s） |" % (k0, k1, off, n, k0 + off, k1 + off, move))
+        L.append("")
+    L.append("## 二、逐段不变量不符（%d 条%s）" % (
+        len(bad_inv), "，列前 %d 条" % _REPORT_ROWS if len(bad_inv) > _REPORT_ROWS else ""))
+    L.append("")
+    L.append("数字 / [n] 引用号 / 𝒪( 记号按载荷**原样**：不改、不减、不增、不换位。")
+    L.append("")
+    L.append("| 段号 | 不符项 | 载荷 | 交付 |")
+    L.append("| --- | --- | --- | --- |")
+    for k in sorted(bad_inv)[:_REPORT_ROWS]:
+        for what, a, b in bad_inv[k]:
+            L.append("| #S%d | %s | %s | %s |" % (k, what, a, b))
+    L.append("")
+    if bad_cut:
+        L.append("## 三、分页断点 ⋮ 不符（%d 条）" % len(bad_cut))
+        L.append("")
+        L.append("⋮ 只允许出现在该段**确实跨页**处，条数必须与载荷清单一致，"
+                 "且不得出现在普通段里。")
+        L.append("")
+        for b in bad_cut[:_REPORT_ROWS]:
+            L.append("- %s" % b)
+        L.append("")
+    L.append("## 改法")
+    L.append("")
+    L.append("1. 只改上面点到号的段；其余段一个字都不要动（整篇重译 = 重新引入错位）。")
+    L.append("2. 改完按同一命名重交（如 `%s.doubao2.txt`），重走 deliver 即可。" % name)
+    L.append("")
+    with open(p, "w", encoding="utf-8") as f:
+        f.write("\n".join(L))
+    return p
+
+
 # ------------------------------------------------------------------ 阶段 2: deliver
 def stage_deliver(args):
     led = load_ledger(args.name)
@@ -433,25 +574,71 @@ def stage_deliver(args):
         if extra:
             print("[adopt] 多段 %d 个: %s" % (len(extra), extra[:20]))
         return die("段号集合与 manifest 不一致, 拒绝进入回锚")
-    bad = []
+    # 载荷(源文)是逐段不变量的比对基准, 由 export 落在 inbox, 台账记了路径。
+    # 读不到就**明说跳过 + 台账记 inv_ok=False**(不冒充全过), 但**不据此拒收整份交件**:
+    # 缺的是我们自己产物的路径, 拿它挡住豆包的稿子是本末倒置 —— 而且段号守恒与 ⋮
+    # 对账这两道不依赖载荷, 上面已经跑过了。注意此时绝不能拿空基准去逐段比:
+    # 那会把每一段都判成"数字多出来", 全线误杀。
+    pay = (led["stages"].get("export") or {}).get("txt") or ""
+    src = {}
+    if pay and os.path.exists(pay):
+        with open(pay, encoding="utf-8-sig") as f:
+            src = SI.parse_blocks(f.read())
+    else:
+        print("[adopt] ⚠️ 载荷不可读(%s) —— 跳过逐段不变量核对(整段错位这一轮拦不住), "
+              "台账记 inv_ok=False" % (pay or "台账未记录路径"))
+    inv_on = bool(src)
+    bad_cut, bad_inv = [], {}
     for k, it in sorted(want.items()):
         n_parts = len(it["parts"])
         n_cut = got[k].count("⋮")
         if it["merged"] and n_cut != n_parts - 1:
-            bad.append("#S%d 断点 %d != 预期 %d" % (k, n_cut, n_parts - 1))
+            bad_cut.append("#S%d 断点 %d != 预期 %d" % (k, n_cut, n_parts - 1))
         elif not it["merged"] and n_cut:
-            bad.append("#S%d 普通段出现 ⋮" % k)
-    if bad:
-        mark(led, "deliver", "failed", reason="分页断点不符", detail=bad[:20])
+            bad_cut.append("#S%d 普通段出现 ⋮" % k)
+        if inv_on:
+            d = diff_invariants(src.get(k), got[k])
+            if d:
+                bad_inv[k] = d
+    if bad_cut or bad_inv:
+        bands = shift_bands(src, got) if inv_on else []
+        if args.waive:
+            # 显式放行: 极少数合理改写(实测 311 个含数字的段里 1 例)不该把整篇卡死。
+            # 放行必须留痕 —— 台账记 waive + 报告照落, 事后查得出"谁放过了什么"。
+            rep = write_gate_report(args.name, path, src, got, bad_cut, bad_inv, bands)
+            mark(led, "deliver", "ok", file=path, sha1=sha1_8(path),
+                 n_seg=len(got), chars=len(text), waive=True, waive_at=now(),
+                 waived={"cut": len(bad_cut), "inv": len(bad_inv)}, report=rep)
+            save_ledger(led)
+            print("[adopt] ⚠️ --waive 放行 %d 条门禁不符(⋮ %d / 不变量 %d), 留痕于台账与 %s"
+                  % (len(bad_cut) + len(bad_inv), len(bad_cut), len(bad_inv), rep))
+            return 0
+        rep = write_gate_report(args.name, path, src, got, bad_cut, bad_inv, bands)
+        mark(led, "deliver", "failed", reason="内容门禁不符", file=path,
+             sha1=sha1_8(path), n_cut=len(bad_cut), n_inv=len(bad_inv), report=rep,
+             detail=(bad_cut + ["#S%d %s" % (k, "; ".join(x[0] for x in v))
+                                for k, v in sorted(bad_inv.items())])[:20])
         save_ledger(led)
-        for b in bad[:20]:
+        for b in bad_cut[:20]:
             print("[adopt]   " + b)
-        return die("⋮ 分页断点对账不符, 拒绝进入回锚")
+        for k in sorted(bad_inv)[:20]:
+            print("[adopt]   #S%d %s" % (k, "; ".join(
+                "%s %s->%s" % (w, a, b) for w, a, b in bad_inv[k])))
+        for off, k0, k1, n in bands[:10]:
+            print("[adopt]   ⚠️ 错位带: 载荷 #S%d-#S%d (%d 段) 的译文被放到交付的 #S%d-#S%d"
+                  % (k0, k1, n, k0 + off, k1 + off))
+        print("[adopt] 报告: %s" % rep)
+        return die("内容门禁不符(⋮ %d 条 / 逐段不变量 %d 条 / 错位带 %d 条), 拒绝进入回锚。"
+                   "这不是可忽略的小毛病: 整段错位会让整篇译文对不上号。"
+                   "请让豆包照报告只改点到号的段后重交; 确认无毒可用 --waive 显式放行"
+                   % (len(bad_cut), len(bad_inv), len(bands)))
 
     mark(led, "deliver", "ok", file=path, sha1=sha1_8(path),
-         n_seg=len(got), chars=len(text))
+         n_seg=len(got), chars=len(text), inv_ok=inv_on)
     save_ledger(led)
-    print("[adopt] deliver OK: %d 段 / %d 字符 / sha1=%s" % (len(got), len(text), sha1_8(path)))
+    print("[adopt] deliver OK: %d 段 / %d 字符 / sha1=%s (%s)"
+          % (len(got), len(text), sha1_8(path),
+             "逐段不变量全过" if inv_on else "⚠️ 未做逐段不变量核对(缺载荷)"))
     return 0
 
 
@@ -735,10 +922,13 @@ def main():
     p.add_argument("--terms", default="", help="术语表 csv; 缺省用 seg_export 默认(server/glossary/terms.csv)")
     p.set_defaults(fn=stage_export)
 
-    p = sub.add_parser("deliver", help="2 登记豆包交件 (段号守恒门禁)")
+    p = sub.add_parser("deliver", help="2 登记豆包交件 (段号守恒 + 逐段不变量门禁)")
     common(p)
     p.add_argument("--text", default="", help="交件文件; 缺省自动找 out/<name>.doubao*.txt")
     p.add_argument("--clip", action="store_true", help="从剪贴板取并落盘为 out/<name>.doubao.txt")
+    p.add_argument("--waive", action="store_true",
+                   help="[2026-09-20] 显式放行内容门禁不符(留痕于台账+报告)。"
+                        "只给「确认过的合理改写」用; --force 跳的是顺序门禁, 不跳内容门禁")
     p.set_defaults(fn=stage_deliver)
 
     p = sub.add_parser("import", help="3 回锚 -> imported.json")

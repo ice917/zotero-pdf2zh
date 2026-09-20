@@ -59,6 +59,16 @@ def _two_pass_enabled():
     return str(os.environ.get("PAUSE_TRANSLATE", "")).strip().lower() in ("1", "true", "on", "yes")
 
 
+class TwoPassGateRejected(RuntimeError):
+    """[v28.28] 豆包交件被内容门禁拒收 —— 两趟回路**显式失败**的专用类型。
+
+    它不表示"代码坏了", 而表示"这份交件不能回灌"。之所以用异常往上抛: 服务端的
+    "任务失败"这条路本来就是异常驱动的(引擎侧也是 `raise ValueError(...)`, 见
+    "pdf2zh_next 未产出任何 mono/dual 文件"), 抛出去就能落进既有的
+    complete_task(failed) + 失败根因提取, 不必在 _execute_translate_job 里另开分支。
+    """
+
+
 def _two_pass_wait_minutes():
     """等豆包交稿的上限(分钟), 可用 PAUSE_WAIT_MINUTES 覆盖; 超时回落成正常翻译。"""
     try:
@@ -1216,8 +1226,10 @@ class PDFTranslator:
         豆包交件后 deliver/import/inject 把译文灌回缓存库; 第二趟关掉开关重跑,
         全命中缓存 → 零翻译调用, 产物仍由引擎排版。
 
-        止损: 导出失败或交件阶段失败都回落成「正常翻译」重跑第二趟, 不让用户
-        拿不到东西; 无人交稿则等满 PAUSE_WAIT_MINUTES 后同样回落。
+        止损两条路(2026-09-20 分家, 见下面 abort_fallback / abort_keep_delivery):
+        「没有交件可留」的中断(导出失败、等稿超时)撤骨架行后回落成正常翻译, 用户至少
+        拿到东西; 「交件被内容门禁拒收」保留现场并判失败 —— 静默回落机翻会让用户拿着
+        一份机翻产物以为是自己的稿渲染出来的。
         """
         name = _adopt_run_name(input_path)
         try:
@@ -1227,12 +1239,13 @@ class PDFTranslator:
         wait_min = _two_pass_wait_minutes()
         t_start = time.time()   # 交件判据的下界: 只认此刻之后落盘的文件
 
-        def abort(why):
-            """回路半途失败 -> **先撤骨架行**, 再回落成正常翻译。
+        def abort_fallback(why):
+            """止损坏收场: **撤骨架行** -> 回落成正常机器翻译。
 
-            撤骨架行这步不能省: 第一趟为了让 seg_inject(UPDATE-only)有行可改,
-            按最终键形态落了 raw→raw 行; 不撤就重跑, 第二趟全命中它们 —— 整篇
-            出英文 PDF。撤干净了才敢回落成机器翻译。
+            只给"没有交件可留"的中断用(载荷导出失败 / 等稿超时)。撤骨架行这步不能
+            省: 第一趟为了让 seg_inject(UPDATE-only)有行可改, 按最终键形态落了
+            raw→raw 行; 不撤就重跑, 第二趟全命中它们 —— 整篇出英文 PDF。撤干净了
+            才敢回落成机器翻译, 用户至少拿到东西。
             """
             print(f"⚠️ [两趟] {why}，撤骨架行后回落成正常翻译")
             rc2, out2 = _run_tool("adopt.py", [
@@ -1245,6 +1258,36 @@ class PDFTranslator:
                 'message': '回路中断：已撤骨架行，按正常翻译重跑',
             })
             return self.translate_pdf(input_path, config, task_id)
+
+        def abort_keep_delivery(why, out=""):
+            """[v28.28] 交件被内容门禁拒收 -> **保留现场 · 判失败 · 不跑机翻**。
+
+            为什么不能沿用"撤骨架行 + 回落机翻"(2026-09-20 SILAGE 那晚的真相):
+              ① 撤了就白跑 —— 骨架行是 seg_inject(UPDATE-only)唯一的落脚点, 撤掉
+                 之后修复回路得从整趟提字(81 页)重来;
+              ② 不撤又跑机翻更糟 —— 骨架行按最终键形态躺在库里, 机翻会整篇命中
+                 它们, 直接出一份**整页英文**的 PDF;
+              ③ 真正的坑是"静默": 用户拿到的是机翻产物, 却以为是自己交的稿渲染出来
+                 的, 对着"翻译重复、排版乱序"排查了一整晚 —— 而那份 PDF 里一个豆包
+                 的字都没有。
+            所以这里判失败, 把拒收原因指给用户(adopt 已把清单落成 review/ 报告),
+            现场原样留着等豆包照报告改完重交 —— 重交只走 deliver/import/inject + 重渲染。
+            """
+            print("\n" + "=" * 70)
+            print(f"🛑 [两趟] {why} —— 保留现场, 任务判失败(不再回落机翻)")
+            print("   交件已被拒收：骨架行与交件都还在，**不必重跑提字**。")
+            print("   修法：让豆包按 server/translated/review/ 下最新的「门禁拒收」报告"
+                  "改完后重交（桥的 list_reports / get_report 可直接读）。")
+            print("   ⚠️ 切勿改回「正常档」重跑本篇：库里的骨架行会被机翻整篇命中，"
+                  "产物会是全英文 PDF。")
+            if out:
+                print("   —— adopt 输出（含拒收清单与报告路径）——")
+                print(out[-1500:])
+            print("=" * 70 + "\n")
+            raise TwoPassGateRejected(
+                f"{why}。交件未通过内容门禁，已拒收；现场保留（骨架行与交件都在，"
+                f"不必重跑提字）。请让豆包按 server/translated/review/ 下最新的"
+                f"「门禁拒收」报告改完后重交，再走 deliver/import/inject + 重渲染。")
 
         # ---- 第一趟: 提字（翻译这一步整篇不走 LLM）----
         print(f"🔍 [两趟] 第一趟·提字 (PAUSE_TRANSLATE=1, run={name}, {total_pages} 页)")
@@ -1293,7 +1336,7 @@ class PDFTranslator:
             "--pdf", os.path.abspath(input_path), "--force",
         ])
         if rc != 0:
-            return abort(f"载荷导出失败(rc={rc})：{out[-400:]}")
+            return abort_fallback(f"载荷导出失败(rc={rc})：{out[-400:]}")
         # [v28.26] 「待译」搬到 export **成功之后**再置: 以前是引擎一跑完就报待译,
         # 而那份"待译"可能对应一次失败的导出 —— 卡片会撒谎(载荷还没落盘就叫人来交稿)。
         _notify_payload_ready(task_id, name, f"1-{total_pages}" if total_pages else "1")
@@ -1310,9 +1353,11 @@ class PDFTranslator:
                           ["inject", "--name", name, "--force"]):
                 rc, out = _run_tool("adopt.py", stage)
                 if rc != 0:
-                    return abort(f"{stage[0]} 失败(rc={rc})：{out[-400:]}")
+                    # [v28.28] 交件阶段失败 = 有交件可留 -> 保留现场判失败, 不回落机翻。
+                    # 段号守恒 / ⋮ 对账 / 逐段不变量 / import / inject 任一不过都算。
+                    return abort_keep_delivery(f"{stage[0]} 阶段被拒", out)
         else:
-            return abort(f"等待交稿超时（{wait_min:g} 分钟）")
+            return abort_fallback(f"等待交稿超时（{wait_min:g} 分钟）")
 
         # ---- 第二趟: 重渲染（有回灌则全命中缓存, 零翻译调用）----
         task_manager.update_task(task_id, {

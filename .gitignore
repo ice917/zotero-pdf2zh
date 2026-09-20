@@ -48,3 +48,6 @@ tools/dedouble_sweep.py
 .DS_Store
 __MACOSX/
 server/config/package_update_state.json
+
+# 本机探针/临时产物 (xpi 解包试验、声音试听; 代码不引用, 防漏提交)
+state/
