@@ -13,7 +13,9 @@
   list_reports(kind, limit)    列出质检/体检报告 (<项目根>/server/translated/review),
                                每条附一行结论(门禁判定 PASS/FAIL / 推荐跳页数)。
                                这是"矫正"的入口: 不先知道哪篇没过、为什么没过,
-                               就无从改起
+                               就无从改起。**不传 kind 时列全部类型** —— 交件被拒时
+                               要看的是『门禁拒收』(逐段清单), 缺省藏起任何一类
+                               都会让豆包"只看到失败、看不到哪几段"
   get_report(name)             读取一份报告全文(问题清单: 哪页、什么断言、原文片段)
   list_results(name, limit)    列出已经交过的译文 (<项目根>/out, 按时间倒序, 附段数)。
                                与 list_reports 配对: 报告说"哪儿错了", 这里给"上一版
@@ -152,26 +154,14 @@ def _headline(path):
     return m.group(0).lstrip("- ").strip() if m else ""
 
 
-def tool_list_reports(args):
-    """列出质检/体检报告, 每条附一行结论。
+_ALL_KIND_SHOWN = 3      # 概览模式(不传 kind)下, 每类最多列几份
 
-    这是"豆包能矫正"的关键一环: 矫正的前提是先知道**哪篇没过、为什么**。
-    没有这个工具时, 豆包面前只有 inbox/ 里的原文 —— 活儿它干得了, 但它不知道
-    自己上一轮哪一段被门禁判死了, 只能整篇重抄。
-    """
-    kind = str(args.get("kind") or REPORT_KINDS[0]).strip()
-    if kind not in REPORT_KINDS:
-        raise ValueError("未知报告类型: %s (可选: %s)"
-                         % (kind, " / ".join(REPORT_KINDS)))
-    try:
-        limit = int(args.get("limit") or LIST_LIMIT_DEFAULT)
-    except (TypeError, ValueError):
-        limit = LIST_LIMIT_DEFAULT
-    limit = max(1, min(limit, LIST_LIMIT_MAX))
 
+def _list_one_kind(kind, limit):
+    """单类报告的清单文本, 每条附一行结论; 读某份全文用 get_report。"""
     names = _report_names(kind)
     if not names:
-        return "review/ 下没有「%s」报告。目录: %s" % (kind, REVIEW)
+        return "「%s」: 0 份" % kind
     shown = names[:limit]
     lines = ["%s  (%d 字节)  %s" % (n, os.path.getsize(os.path.join(REVIEW, n)),
                                     _headline(os.path.join(REVIEW, n)))
@@ -179,8 +169,41 @@ def tool_list_reports(args):
     tail = ("" if len(names) <= limit
             else "\n… 另有 %d 份更早的未列出 (调大 limit 可取, 上限 %d)"
                  % (len(names) - limit, LIST_LIMIT_MAX))
-    return ("review/「%s」共 %d 份, 最近 %d 份 (用 get_report 读全文):\n%s%s"
+    return ("「%s」共 %d 份, 最近 %d 份 (用 get_report 读全文):\n%s%s"
             % (kind, len(names), len(shown), "\n".join(lines), tail))
+
+
+def tool_list_reports(args):
+    """列出质检/体检报告, 每条附一行结论。
+
+    这是"豆包能矫正"的关键一环: 矫正的前提是先知道**哪篇没过、为什么**。
+    没有这个工具时, 豆包面前只有 inbox/ 里的原文 —— 活儿它干得了, 但它不知道
+    自己上一轮哪一段被门禁判死了, 只能整篇重抄。
+
+    [2026-09-20 修] 缺省**不再替豆包选一类**。旧版缺省取 REPORT_KINDS[0]
+    『翻译后质检』, 于是 deliver 阶段落的『门禁拒收』(逐段清单: 哪几段留空/
+    半截/错位) 在缺省调用里根本列不出来。实测 SILAGE: 豆包只看到一份泛泛的
+    『翻译后质检 FAIL』(那是出 PDF **之后**的质检), 看不到那 30 段半截的明细,
+    于是连着三轮把那批段原样重交 —— 回路卡死不收敛, 而"报告已落盘"这件事在
+    代码与台账两侧都显示为正常。缺省必须"先让豆包看见有什么", 不是替它选一类。
+    """
+    raw = str(args.get("kind") or "").strip()
+    try:
+        limit = int(args.get("limit") or LIST_LIMIT_DEFAULT)
+    except (TypeError, ValueError):
+        limit = LIST_LIMIT_DEFAULT
+    limit = max(1, min(limit, LIST_LIMIT_MAX))
+
+    if not raw:
+        return ("review/ 报告概览 (不传 kind 列全部类型, 每类最近 %d 份; "
+                "只看一类请传 kind):\n\n%s"
+                % (_ALL_KIND_SHOWN,
+                   "\n\n".join(_list_one_kind(k, _ALL_KIND_SHOWN)
+                               for k in REPORT_KINDS)))
+    if raw not in REPORT_KINDS:
+        raise ValueError("未知报告类型: %s (可选: %s)"
+                         % (raw, " / ".join(REPORT_KINDS)))
+    return _list_one_kind(raw, limit)
 
 
 def tool_get_report(args):
@@ -435,13 +458,15 @@ TOOLS = [
         "name": "list_reports",
         "description": "列出质检报告, 每条附一行结论。**改稿前先看这里** —— 报告里写着哪篇/哪页/哪段被门禁判死"
                        "(如「第11,12页: 文献区汉化断言失败」), 照着改才叫矫正; 不看就整篇重交, 等于重抄一遍。"
-                       "默认看『翻译后质检』(门禁报告, 判定行是 PASS/FAIL)。kind 可选: "
-                       "翻译后质检 / 翻译前体检 / 审校报告 / 存疑清单 / 术语查证报告 / 解析沙盘",
+                       "**不传 kind 时列出全部类型的概览(每类最近 3 份, 一类都不藏)** —— 上一条交件被拒时, "
+                       "要看的是『门禁拒收』: 那是逐段清单(哪几段留空/只译半截/整段错位), "
+                       "比『翻译后质检』更靠前 —— 后者是出 PDF 之后的质检, 而被拒的交件根本没进渲染。"
+                       "kind 可选: 翻译后质检 / 门禁拒收 / 翻译前体检 / 审校报告 / 存疑清单 / 术语查证报告 / 解析沙盘",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "kind": {"type": "string", "description": "报告类型, 默认『翻译后质检』"},
-                "limit": {"type": "integer", "description": "最多列几份(按时间倒序), 默认 20, 上限 100"},
+                "kind": {"type": "string", "description": "报告类型; 不传 = 列全部类型概览"},
+                "limit": {"type": "integer", "description": "该类最多列几份(按时间倒序), 默认 20, 上限 100; 不传 kind 时按每类 3 份"},
             },
             "required": [],
         },

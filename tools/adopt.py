@@ -406,6 +406,12 @@ NUM_TOK = re.compile(r"\d+(?:\.\d+)?")
 REF_TOK = re.compile(r"\[\d+(?:\s*[,\-–]\s*\d+)*\]")
 BIG_O = re.compile(r"[𝒪𝑂]\s*\(")
 _REPORT_ROWS = 60       # 报告里逐段明细的上限(全文可能上百条, 表太长没人看)
+# [2026-09-20c] 第三节"载荷↔交付"并排片段的口径: 段长不超过 _SNIP_FULL 就整段照出,
+# 否则留头(认得出是哪一句) + 尾(数字常落在没译的尾部)。定这类数只看"人读起来够不够",
+# 不参与任何判定 —— 它是证据, 不是判据。
+_REPORT_SNIP_FULL = 180
+_REPORT_SNIP_HEAD = 110
+_REPORT_SNIP_TAIL = 60
 
 # [自研补丁 2026-09-20b] 留空/只译半截判据 (SILAGE doubao2 事故)。定标: SILAGE 790 段
 # vs 4 篇**已被采纳**的交件(324 个 >=40 字符的长段) —— 空段 8 例 / 0 例,
@@ -416,12 +422,24 @@ _REPORT_ROWS = 60       # 报告里逐段明细的上限(全文可能上百条, 
 _GAP_MIN_SRC = 40       # 源段短于这个字符数不判覆盖率: 短段比值噪声大(中文天然短)
 _GAP_RATIO = 0.15
 
+# [自研补丁 2026-09-20c] 上标/下标数字归一化。载荷里的脚注/指数经 PDF 提取常常落成
+# 行内 ASCII 数字(原文 "complexity4"), 译者按语义写成上标(译文 "复杂度⁴") —— 同一个
+# 数字, 两种写法, 不该判成"数字变了"。实测 SILAGE: 不归一化有 3 条伪影(#S22/#S90/#S557),
+# 报告会让译者去改**本来是对的**数字, 白跑一轮。归一化对**两侧**都做, 只影响签名, 不改交付文本。
+_SCRIPT_DIGITS = {ord(c): str(i) for i, c in enumerate("⁰¹²³⁴⁵⁶⁷⁸⁹")}
+_SCRIPT_DIGITS.update({ord(c): str(i) for i, c in enumerate("₀₁₂₃₄₅₆₇₈₉")})
+_SCRIPT_DIGITS.update({0x207B: "-", 0x208B: "-"})   # ⁻ / ₋ 上标·下标负号
+
 
 def inv_sig(text):
-    """一段的不变量签名: (数字多重集, [n]引用多重集, 𝒪( 计数)。"""
-    return (tuple(sorted(NUM_TOK.findall(text or ""))),
-            tuple(sorted(REF_TOK.findall(text or ""))),
-            len(BIG_O.findall(text or "")))
+    """一段的不变量签名: (数字多重集, [n]引用多重集, 𝒪( 计数)。
+
+    数字先做上标/下标归一化(见 _SCRIPT_DIGITS): "⁴" 与 "4" 是同一个数字的两种写法。
+    """
+    t = (text or "").translate(_SCRIPT_DIGITS)
+    return (tuple(sorted(NUM_TOK.findall(t))),
+            tuple(sorted(REF_TOK.findall(t))),
+            len(BIG_O.findall(t)))
 
 
 def gap_defects(src, dst):
@@ -499,6 +517,18 @@ def shift_bands(src, dst):
     return [b for b in bands if b[3] >= 2]
 
 
+def _snip(t):
+    """报告里引用一段文本: 短的整段照出, 长的保留头尾。
+
+    为什么要留尾: "数字不符"最常见的一种是**漏译尾巴**(数字落在没译的后半句里),
+    只给开头等于把现场截掉; 而"内容漂移"又必须看开头才认得出是**哪一句**。故两头都留。
+    """
+    s = " ".join((t or "").split())
+    if len(s) <= _REPORT_SNIP_FULL:
+        return s
+    return "%s …(中略)… %s" % (s[:_REPORT_SNIP_HEAD], s[-_REPORT_SNIP_TAIL:])
+
+
 def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(None, None)):
     """把拒收原因落成一份 review/ 报告并返回路径 —— 这是"交给豆包改"的那份东西。
 
@@ -561,15 +591,31 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
     L.append("## 三、逐段不变量不符（%d 条%s）" % (
         len(bad_inv), "，列前 %d 条" % _REPORT_ROWS if len(bad_inv) > _REPORT_ROWS else ""))
     L.append("")
-    L.append("数字 / [n] 引用号 / 𝒪( 记号按载荷**原样**：不改、不减、不增、不换位。")
-    L.append("**若某段同时出现在上面第一/二节，它的数字不符是后果：先修上面，不要单独调这里的数字。**")
+    L.append("判据: 数字 / [n] 引用号 / 𝒪( 记号按载荷**原样** —— 不改、不减、不增、不换位"
+             "（上标·下标数字如 `⁴` 与 `4` 视为同一个数字，算过）。")
     L.append("")
-    L.append("| 段号 | 不符项 | 载荷 | 交付 |")
-    L.append("| --- | --- | --- | --- |")
+    L.append("每条都附**载荷原文 ↔ 你的译文**并排（长的留头尾）。改之前先把并排读一遍，"
+             "对号入座，三种病三种改法：")
+    L.append("")
+    L.append("1. **译文读起来是相邻段载荷的译文**（内容整体挪了位，往后翻几条会连着挪）"
+             "→ 这是内容漂移，按第二节的法子把这一片**按载荷重新对齐**（只改位置，别重译），"
+             "**不要去动数字**。")
+    L.append("2. **译文只译了载荷的前半句**（数字落在你没译的后半句/段尾）→ 把后半句补译完，"
+             "数字自然就回来了。")
+    L.append("3. **译文把载荷里的公式/表达式改写成了文字**（如 `1𝑛∑︀𝑛𝑖=1` 意译成\"平均值\"）"
+             "→ 按载荷把公式**整块照抄**（rule 7），数字随之还原。")
+    L.append("")
+    if len(bad_inv) > _REPORT_ROWS:
+        L.append("（下面只列前 %d 条；完整条目见台账 detail 字段。）" % _REPORT_ROWS)
+        L.append("")
     for k in sorted(bad_inv)[:_REPORT_ROWS]:
-        for what, a, b in bad_inv[k]:
-            L.append("| #S%d | %s | %s | %s |" % (k, what, a, b))
-    L.append("")
+        L.append("**#S%d**" % k)
+        L.append("")
+        L.append("- 不符: %s" % "；".join("%s 载荷 `%s` → 交付 `%s`" % (w, a, b)
+                                          for w, a, b in bad_inv[k]))
+        L.append("- 载荷: %s" % (_snip(src.get(k)) or "（空）"))
+        L.append("- 交付: %s" % (_snip(got.get(k)) or "（空）"))
+        L.append("")
     if bad_cut:
         L.append("## 四、分页断点 ⋮ 不符（%d 条）" % len(bad_cut))
         L.append("")
@@ -583,9 +629,15 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
     L.append("")
     L.append("1. 只改上面点到号的段；其余段一个字都不要动（整篇重译 = 重新引入错位）。")
     L.append("2. 相邻的碎片段（如 \"…average component\" 与 \"t error:\"）**各译各的**，"
-             "不要并成一句 —— 并段会顶掉一个段号，后面整片上移、末尾留空。")
+             "不要并成一句 —— 并段会顶掉一个段号，后面整片上移、末尾留空。"
+             "**并段/重切正是内容漂移的头号成因**：一句跨两段时，你按语义重切，切点就跟载荷"
+             "对不上了，第三节那一片的\"数字不符\"就是这么来的。")
     L.append("3. 段尾的公式残留照抄，不要因为\"看着不完整\"就省略。")
-    L.append("4. 改完按同一命名重交（如 `%s.doubao2.txt`），重走 deliver 即可。" % name)
+    L.append("4. 第二节的错位判据只认数字 / [n] / 𝒪( —— 载荷里数学记号多、ASCII 数字少的"
+             "段落它可能**漏报**。所以第三节的并排若读出\"译文其实是相邻段的译文\"，"
+             "即便第二节没列，也当错位带处理。")
+    L.append("5. 改完**用同一个文件名覆盖**重交（`%s.doubao.txt`）—— out/ 里留两份候选"
+             "（比如又存一份 `.doubao2.txt`）会让 deliver 判\"交件件不唯一\"直接拒收。" % name)
     L.append("")
     with open(p, "w", encoding="utf-8") as f:
         f.write("\n".join(L))
