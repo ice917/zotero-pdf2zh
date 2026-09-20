@@ -32,6 +32,7 @@
    18. test_backfill_pages.py    v28.15 零可译段页判定(真实页码+按页聚合) (9 例)
    19. test_seg_inject.py        v28.21+ 文档指纹探测平票取最新世代 + 注入后自检 (9 例)
    20. test_seg_merge.py         v28.30 按段号合稿: 未动段字节不变 + 回读校验哨兵 (18 例)
+   21. test_engine.py            引擎接缝: 画像/接线/段表契约/同引擎不重绑/子工具单跑门禁 (42 例)
 
 设计约定:
     - 全部 stdlib + venv 内 pdf2zh, 不需要 pytest
@@ -66,6 +67,7 @@ SUITES = [
     "test_backfill_pages.py",     # v28.15 零可译段页判定(真实页码+按页聚合)
     "test_seg_inject.py",         # v28.21+ 文档指纹探测平票取最新世代 + 注入后自检
     "test_seg_merge.py",          # v28.30 按段号合稿(未动段字节不变 + 回读校验哨兵)
+    "test_engine.py",             # 引擎接缝(画像/接线/段表契约)
 ]
 
 # 套件 → 它的"被测对象"(相对项目根)。**只在对象不随包分发时才需要登记** ——

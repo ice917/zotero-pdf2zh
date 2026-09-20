@@ -28,6 +28,12 @@ import urllib.request
 
 HOST = "http://127.0.0.1:8890"
 
+# [v28.39] 引擎画像: 本工具 POST 的是 **1.x 服务端**(engine=pdf2zh, 8890)。next 画像下
+# 该服务端不接这条产线, 单跑必须当场拒答 —— 否则会安静地让 1.x 服务端渲染一份"不属于
+# 本画像"的产物, 而下游 gate 拿它当验收对象。
+import engine as _ENG                                     # noqa: E402
+_PROF = _ENG.active()
+
 # 与 Zotero 插件直提时等价的配置; 缺一不可(见模块 docstring 的事故)
 PLUGIN_CONFIG = {
     "engine": "pdf2zh",
@@ -98,6 +104,11 @@ def main():
     ap.add_argument("--timeout", type=int, default=900, help="等待上限秒数")
     ap.add_argument("--no-wait", action="store_true", help="只提交不等待")
     args = ap.parse_args()
+
+    _ok, _why = _PROF.stage_ok("render")
+    if not _ok:
+        print("FAIL: 引擎 %s 上未接线: %s" % (_PROF.key, _why))
+        return 2
 
     pdf = os.path.abspath(args.pdf)
     if not os.path.exists(pdf):

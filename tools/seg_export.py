@@ -37,7 +37,11 @@ import sys
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
-SIDECAR = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow", "latest.jsonl")
+# [v28.39] 引擎画像: 侧车路径随 P2Z_ENGINE 走(adopt 会把该变量传给子进程); 缺省画像
+# pdf2zh 1.x —— 与引入本层之前逐字节一致。next 画像不产侧车, 此时为 ""(下面 main 会拦)。
+import engine as _ENG                                     # noqa: E402
+_PROF = _ENG.active()
+SIDECAR = _PROF.sidecar or ""
 PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
 INBOX = os.environ.get("P2Z_INBOX", os.path.join(PROJ, "inbox"))
 TERMS_CSV = os.path.join(PROJ, "server", "glossary", "terms.csv")
@@ -208,6 +212,13 @@ def main():
                     help="术语表 csv (english,chinese 无表头); 缺省 %s; 传空串则不注入具体术语" % TERMS_CSV)
     ap.add_argument("--force", action="store_true", help="续接检测失败也照常导出(逐段独立)")
     args = ap.parse_args()
+
+    # 引擎接线门禁: next 画像的段表在 translate_tracking.json 里、不产侧车, 本工具在
+    # 该引擎上未接线 —— 拦在这里, 免得下游报一个看不懂的"侧车不存在: "。
+    _ok, _why = _PROF.stage_ok("export")
+    if not _ok:
+        print("FAIL: 引擎 %s 上未接线: %s" % (_PROF.key, _why))
+        return 2
 
     # 页码解析: 支持 "2-4" / "2,3,4" / 混合 "1,21-22" (逗号分隔, 每项为单页或区间)
     pages_want = set()

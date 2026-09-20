@@ -28,7 +28,11 @@ import unicodedata
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
-SIDECAR = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow", "latest.jsonl")
+# [v28.39] 引擎画像: 侧车路径随 P2Z_ENGINE 走(adopt 会把该变量传给子进程); 缺省画像
+# pdf2zh 1.x —— 与引入本层之前逐字节一致。
+import engine as _ENG                                     # noqa: E402
+_PROF = _ENG.active()
+SIDECAR = _PROF.sidecar or ""
 PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
 OUTDIR = os.path.join(PROJ, "out")
 INBOX = os.environ.get("P2Z_INBOX", os.path.join(PROJ, "inbox"))
@@ -520,6 +524,13 @@ def main():
     ap.add_argument("--text", default="", help="从文件取译文")
     ap.add_argument("--sidecar", default=SIDECAR, help="侧车路径; 与导出时一致")
     args = ap.parse_args()
+
+    # 引擎接线门禁: 回锚口径(1.x 的 var[]/sstk 吸收)在新引擎里没有对应物, 单跑本工具
+    # 时同样要拦 —— adopt 拦的是它自己派发的调用。
+    _ok, _why = _PROF.stage_ok("import")
+    if not _ok:
+        print("FAIL: 引擎 %s 上未接线: %s" % (_PROF.key, _why))
+        return 2
 
     with open(args.manifest, encoding="utf-8") as f:
         man = json.load(f)

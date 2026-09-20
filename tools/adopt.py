@@ -71,8 +71,9 @@ PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
 INBOX = os.environ.get("P2Z_INBOX", os.path.join(PROJ, "inbox"))
 OUTDIR = os.path.join(PROJ, "out")
 LEDGER_DIR = os.path.join(PROJ, "logs", "adopt")
-SIDECAR = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow", "latest.jsonl")
-CACHE = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "cache.v1.db")
+# [自研补丁 2026-09-20] SIDECAR / CACHE / ENGINE 由引擎画像(tools/engine.py)决定, 赋值
+# 挪到 sys.path 就绪之后 —— 见下方 use_engine()。缺省画像 = pdf2zh 1.x, 于是这两个
+# 路径与引入本层之前逐字节一致; 换引擎走 --engine / P2Z_ENGINE。
 # [自研补丁 2026-09-20] 门禁拒收报告落点: 与 post_check.py 的 review_dir() /
 # doubao_bridge.REVIEW 同一目录 —— 桥的 list_reports / get_report 就读这里。
 # 落在文件里而不是只印终端, 是因为"豆包能矫正"的前提是它**看得见**自己哪一段被拒。
@@ -145,6 +146,47 @@ if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 SI, SJ = _load_siblings()
 
+import engine as ENG                                    # noqa: E402  (须在 sys.path 之后)
+
+ENGINE = None          # 当前引擎画像; 由 use_engine() 设定
+SIDECAR = ""           # pdf2zh: 全局侧车; next: 空串(next 无侧车, 由 resolve_sidecar 拒绝)
+CACHE = ""             # 译文缓存库
+
+# argparse 缺省哨兵: 用来区分"没给这个选项"与"显式给了空串"。引擎相关的缺省路径
+# 不能在**建 parser 时**取 —— 那时画像还是 import 期那一个(args.engine 尚未解析),
+# 换引擎会把上一个引擎的路径当缺省带进子进程。故 parser 里只放哨兵, 解析完再补。
+NOT_GIVEN = object()
+
+
+def use_engine(key=""):
+    """切引擎: 重绑 ENGINE / SIDECAR / CACHE 三个模块级名字。
+
+    [自研补丁 2026-09-20] 必须重绑全局名而不是只改 argparse 缺省值 —— probe_db /
+    resolve_sidecar / 子进程读的都是这几个全局名, 只改缺省值会让"拿着旧画像去动旧库"
+    这种错法悄无声息地发生(正是引入本层要防的那类事故)。
+    未知名返回 None(由调用方 die), 不回落缺省。
+
+    **同一引擎重复调用不重绑**: 调用方(测试沙箱/嵌入式使用)在 import 之后显式覆盖过
+    SIDECAR/CACHE 时, 每次 main() 都重绑会当场踩掉那份覆盖 —— 表现为"拿着真实库去跑
+    假数据", 症状离现场很远(test_adopt ④/⑩/⑫)。故只在**真的换引擎**时重绑。
+    """
+    global ENGINE, SIDECAR, CACHE
+    try:
+        prof = ENG.select(key)
+    except ValueError as e:
+        print("[adopt] %s" % e)
+        return None
+    if ENGINE is not None and ENGINE.key == prof.key:
+        return ENGINE                                  # 同一引擎: 保持现有绑定
+    ENGINE = prof
+    SIDECAR = ENGINE.sidecar or ""
+    CACHE = ENGINE.cache_db
+    return ENGINE
+
+
+if use_engine() is None:                # P2Z_ENGINE 写错就当场停, 别带着空路径往下跑
+    sys.exit(2)
+
 
 # ------------------------------------------------------------------ 基础
 def now():
@@ -171,7 +213,10 @@ def ledger_path(name):
 def load_ledger(name):
     p = ledger_path(name)
     if not os.path.exists(p):
-        return {"name": name, "created": now(), "updated": now(), "stages": {}}
+        # [自研补丁 2026-09-20] 台账盖上引擎戳: 同一个 run 名换引擎重做时必须能被发现
+        # (见 guard), 否则 next 的段落会被拿去改 1.x 的库 —— 两边都不报错。
+        return {"name": name, "engine": (ENGINE.key if ENGINE else ENG.DEFAULT_ENGINE),
+                "created": now(), "updated": now(), "stages": {}}
     with open(p, encoding="utf-8") as f:
         return json.load(f)
 
@@ -218,7 +263,21 @@ def mark(led, stage, state, **kw):
 
 
 def guard(led, stage, force):
-    """顺序强制: 前置阶段必须 state == ok。"""
+    """顺序强制: 前置阶段必须 state == ok。
+
+    [自研补丁 2026-09-20] 引擎接缝带来的两条:
+      a) 台账的引擎戳必须与当前引擎一致 —— 不一致说明这是"换引擎拿旧台账接着做",
+         后果是 next 的段落到 1.x 库里去找、或反过来, 两边都不报错。
+         老台账没有 engine 字段(引入本层之前写的) -> 不判, 免得历史台账全部作废。
+      b) 当前引擎上**未接线**的前置阶段不构成前置: 那些阶段跑不了, 拿它当门禁只会把
+         回路锁死(next 画像上 gate 要能独立对一份成品跑验收)。
+    """
+    eng = ENGINE or ENG.active()
+    led_key = led.get("engine")
+    if led_key and led_key != eng.key:
+        die("台账 %s 是 %s 引擎下做的, 当前引擎是 %s; 换引擎请另起 run 名"
+            % (led.get("name"), led_key, eng.key))
+        return False
     if force:
         print("[adopt] --force: 跳过顺序门禁 (%s)" % stage)
         led.setdefault("forced_stages", [])
@@ -226,6 +285,11 @@ def guard(led, stage, force):
             led["forced_stages"].append(stage)
         return True
     for dep in NEED[stage]:
+        ok_dep, why = eng.stage_ok(dep)
+        if not ok_dep:
+            print("[adopt] 前置 %s 在 %s 引擎上未接线, 不构成前置 (%s)"
+                  % (dep, eng.key, why[:60]))
+            continue
         st = (led["stages"].get(dep) or {}).get("state")
         if st != "ok":
             die("阶段 %s 的前置 %s 当前为 %s; 请先跑 `adopt.py %s ...`"
@@ -315,6 +379,8 @@ def pdf_md5_16(pdf):
 
 def archived_sidecar(pdf):
     """该篇"按文档归档"的侧车路径 (存在才返回)。见 converter._segflow_paths。"""
+    if not SIDECAR:
+        return None                     # next 画像不产侧车, 调用方按"没有"处理
     p = os.path.join(os.path.dirname(SIDECAR), "pdf-%s.jsonl" % pdf_md5_16(pdf))
     return p if os.path.exists(p) else None
 
@@ -326,6 +392,9 @@ def resolve_sidecar(args):
     给了 --pdf 却找不到归档件时**拒绝执行**, 不回落 latest.jsonl —— 那里躺的是
     "最近翻过的那一篇", 拿错侧车会安静地导出一份别人的载荷(下游回锚还会 PASS)。
     """
+    if not SIDECAR:                     # next 画像: 没有侧车, 段表是 tracking json
+        return None, ("当前引擎 %s 不产侧车 (段表来源 %s); 该阶段在本引擎上未接线"
+                      % ((ENGINE.key if ENGINE else "?"), (ENGINE.seg_source if ENGINE else "?")))
     if os.path.abspath(args.sidecar) != os.path.abspath(SIDECAR):
         return args.sidecar, "显式指定"
     if not args.pdf:
@@ -1120,7 +1189,15 @@ def stage_gate(args):
     if not args.expect:
         return die("gate 必须至少给一条 --expect (期望落页的新串); "
                    "否则无法证明'缓存改了且真落到了页上'")
-    mono = args.mono or led["stages"]["render"].get("mono") or latest_mono()
+    mono = args.mono or (led["stages"].get("render") or {}).get("mono")
+    # [自研补丁 2026-09-20] "最新 mono"兜底只对 1.x 成立: latest_mono() 扫的是 1.x 的
+    # 产物目录, 换成 next 时那里躺着的是**别的引擎的成品**, 兜底就会拿错东西来验收。
+    if not mono:
+        eng = ENGINE or ENG.active()
+        if eng.key != ENG.DEFAULT_ENGINE:
+            return die("引擎 %s 上不做「最新 mono」兜底 —— 那是 1.x 产物目录里的东西, "
+                       "拿错等于把别人的成品当自己的验收; 请用 --mono 显式指定" % eng.key)
+        mono = latest_mono()
     if not mono or not os.path.exists(mono):
         return die("找不到 mono 译文 PDF; 用 --mono 指定")
     print("[adopt] 验收对象: %s" % mono)
@@ -1200,12 +1277,17 @@ def main():
     def common(p):
         p.add_argument("--name", required=True, help="run 名 = payload 名 (不含扩展名)")
         p.add_argument("--force", action="store_true", help="跳过顺序门禁(单步重跑用)")
+        # [自研补丁 2026-09-20] 引擎画像开关。写进环境变量是为了让子进程(seg_export /
+        # seg_inject / force_rerender)拿到**同一个**画像, 不至于父进程按 next 算、子进程
+        # 按 1.x 写。
+        p.add_argument("--engine", default="",
+                       help="引擎画像: pdf2zh(缺省) | next; 等价于 P2Z_ENGINE")
 
     p = sub.add_parser("export", help="1 侧车 -> inbox payload")
     common(p)
     p.add_argument("--pages", required=True, help="如 2-4 或 1,21-22")
-    p.add_argument("--sidecar", default=SIDECAR,
-                   help="缺省 latest.jsonl; 给了 --pdf 就按文档自动认领归档件")
+    p.add_argument("--sidecar", default=NOT_GIVEN,
+                   help="缺省用当前引擎的全局侧车; 给了 --pdf 就按文档自动认领归档件")
     p.add_argument("--pdf", default="",
                    help="原文 PDF 绝对路径; 按文档(md5)自动认领该篇侧车, 免得手工归档")
     p.add_argument("--doc", default="", help='文档抬头(写进 payload 首行), 如 "标题 (期刊, 年份)"')
@@ -1270,8 +1352,20 @@ def main():
     p.set_defaults(fn=stage_status)
 
     args = ap.parse_args()
+    # [自研补丁 2026-09-20] 引擎在**任何阶段动手之前**定下来, 并写进环境给子进程继承。
+    if getattr(args, "engine", ""):
+        os.environ["P2Z_ENGINE"] = args.engine
+    if use_engine(os.environ.get("P2Z_ENGINE", "")) is None:
+        return 2
+    if getattr(args, "sidecar", None) is NOT_GIVEN:     # 引擎定了才补引擎相关缺省
+        args.sidecar = SIDECAR
     if hasattr(args, "name") and args.name and not SAFE_NAME.match(args.name):
         return die("非法 run 名: %r (仅限字母数字-_ . 与空格)" % args.name)
+    stage = args.fn.__name__[len("stage_"):]
+    ok, why = ENGINE.stage_ok(stage)
+    if not ok:
+        return die("引擎 %s 上「%s」未接线: %s" % (ENGINE.key, stage, why))
+    print("[adopt] 引擎=%s (%s)  阶段=%s" % (ENGINE.key, ENGINE.label, stage))
     return args.fn(args)
 
 

@@ -28,8 +28,14 @@ import sys
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
 _HOME = os.path.expanduser("~")
-SIDECAR = os.path.join(_HOME, ".cache", "pdf2zh", "segflow", "latest.jsonl")
-CACHE = os.path.join(_HOME, ".cache", "pdf2zh", "cache.v1.db")
+# [v28.39] 引擎画像: 缓存库与侧车路径随 P2Z_ENGINE 走(adopt 会把该变量传给子进程)。
+# 缺省画像 = pdf2zh 1.x, 于是这两条路径与引入本层之前逐字节一致。**必须在这里取画像
+# 而不是写死** —— CACHE 没有 CLI 覆盖口, 写死等于"父进程按 next 算、子进程往 1.x 库写",
+# 那是最难发现的一类静默错(更新报成功, 渲染器读的却是另一个库)。
+import engine as _ENG                                     # noqa: E402
+_PROF = _ENG.active()
+SIDECAR = _PROF.sidecar or ""
+CACHE = _PROF.cache_db
 DOC_FP_DEFAULT = "docsummary:3768fd6fce999176:bc4a2947"  # Cactaceae 2009 (兜底默认)
 FP_RE = re.compile(r"docsummary:[0-9a-f]{8,}:[0-9a-f]{4,}")
 
@@ -219,6 +225,13 @@ def main():
     ap.add_argument("--rollback", action="store_true",
                     help="[v28.23] 撤销模式: 删本篇(或本文档指纹作用域下)的 raw→raw 骨架行, 不做注入")
     args = ap.parse_args()
+
+    # 引擎接线门禁: 单跑本工具时也要拦 —— adopt 那边拦的是它自己派发的调用, 拦不住
+    # 手工 `python seg_inject.py`(画像说 next 而缓存手术口径只对 1.x 验过)。
+    _ok, _why = _PROF.stage_ok("inject" if not args.rollback else "rollback")
+    if not _ok:
+        print("FAIL: 引擎 %s 上未接线: %s" % (_PROF.key, _why))
+        return 2
 
     if args.rollback:
         raws = []
