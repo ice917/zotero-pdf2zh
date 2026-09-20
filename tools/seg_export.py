@@ -23,6 +23,10 @@
           时会给豆包一个错误的文档先验 (旧版硬编码 Cactaceae, 导出任何一篇都带它)。
   --terms 术语表 csv (english,chinese, 无表头)。缺省 server/glossary/terms.csv;
           传空串则退化为"按学科惯例统一译名", 不注入任何具体术语。
+第 4 条(术语)无论走哪条分支, 末尾都带一段**术语查证子项**(2026-09-20): 表里没有的专业
+术语要求先用 search_term 查证(Zotero 库 PDF 原文 + OpenAlex 学术文献)、查不到证据才按学科
+惯例定名并首次括注原文, 禁止凭直觉生造。子项里明写"手边没有该工具就直接进入定名" ——
+规则文本会随载荷发给任何人的豆包, 不能假设桥一定注册了。
 """
 import argparse
 import io
@@ -80,6 +84,23 @@ RULES = """[文档] {doc}第{pages}页
 
 TERMS_FALLBACK = "4. 术语统一：按学科惯例统一译名，同一术语全文译法一致。\n"
 
+# [自研补丁 2026-09-20] 术语查证子项: 挂在第 4 条下(缩进子项), **不动编号** ——
+# 第 4 条本就是"术语"条, 查证是它的下一条动作, 单列成第 9 条会离术语表太远。
+# 判据来自豆包侧反馈"术语拿不准时凭直觉生造译名"; 项目已有查证能力, 就是
+# doubao_bridge 的 search_term(Zotero 库 PDF 原文上下文 + OpenAlex 学术文献)。
+# (a) 明写"手边没有该工具就直接进入 (b)": 别的用户不注册桥也不会被这条卡住 ——
+# 规则文本会随载荷发给任何人的豆包, 不能假设工具一定在。
+TERMS_LOOKUP = """   术语表里**没有**的专业术语不要凭直觉定名 —— 按下述顺序定，并保证同一术语全文一致：
+   (a) 先查证：用 search_term 工具查该词（命中 Zotero 库 PDF 原文上下文 + OpenAlex 学术文献），
+       中文学术文献里用过的译名优先照它；手边没有该工具就直接进入 (b)；
+   (b) 再定名：查不到证据的，按学科惯例给出**一个**译名；首次出现处可在译名后括注原文
+       （如「热带气旋(tropical cyclone)」），之后不再括注；
+   (c) 不得生造：不认识的词不要硬凑一个像术语的中文词，也不要原样留英文蒙混过去 ——
+       宁可先用 (b) 的括注形式写上，也不要猜一个"看着像术语"的说法。
+   自查办法：把译文里所有像术语的中文词列一遍，逐个答出依据（术语表 / 查证结果 / 学科惯例）；
+   答不出依据的，回原句重译。
+"""
+
 
 def load_terms(path):
     """读术语表 csv (无表头, 'english,chinese') -> [(en, zh), ...]; 缺文件即空表"""
@@ -101,11 +122,12 @@ def load_terms(path):
 
 
 def terms_line(path):
-    """术语表 -> RULES 第 4 条的整行; 空表/缺文件退化为通用要求(不撒谎不误导向)"""
+    """术语表 -> RULES 第 4 条整块(术语行 + 术语查证子项); 空表/缺文件退化为通用要求(不撒谎不误导向)"""
     terms = load_terms(path)
     if not terms:
-        return TERMS_FALLBACK
-    return "4. 术语统一：%s。\n" % "；".join("%s=%s" % (en, zh) for en, zh in terms)
+        return TERMS_FALLBACK + TERMS_LOOKUP
+    return ("4. 术语统一：%s。\n" % "；".join("%s=%s" % (en, zh) for en, zh in terms)
+            + TERMS_LOOKUP)
 
 
 def true_page(o):
