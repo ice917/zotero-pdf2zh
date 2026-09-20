@@ -301,6 +301,47 @@ def main():
     check("⑭ render 解析 mono 路径 (文件名含空格)", rc == 0 and r["mono"] == mono_fake, r)
     check("⑭ render 解析耗时", r["seconds"] == 99, r)
 
+    # ⑭b [v28.35] 重渲染等待上限与 server 的"等豆包交稿"上限同源(PAUSE_WAIT_MINUTES),
+    #     不再由 force_rerender 的 900 秒硬编码当家 —— 两处都在回答"这一轮我愿意等
+    #     多久", 各配一套必有一处偏短(实测 81 页的稿子重渲染一轮 > 15 分钟, 超时被
+    #     记成 render failed, 而任务其实还在跑)。900 秒留作下限。
+    rr = [a for s, a in FAKE["calls"] if s == "force_rerender.py"]
+    check("⑭b render 把 --timeout 传给 force_rerender",
+          bool(rr) and "--timeout" in rr[-1], rr[-1] if rr else "没调到 force_rerender")
+    _env = os.environ.get("PAUSE_WAIT_MINUTES")
+    try:
+        os.environ.pop("PAUSE_WAIT_MINUTES", None)
+        check("⑭b 缺省 30 分 -> 1800 秒", AD.render_timeout() == 1800, AD.render_timeout())
+        os.environ["PAUSE_WAIT_MINUTES"] = "5"
+        check("⑭b 配得比一轮渲染还短 -> 900 秒保底",
+              AD.render_timeout() == 900, AD.render_timeout())
+        os.environ["PAUSE_WAIT_MINUTES"] = "60"
+        check("⑭b 配 60 分 -> 3600 秒", AD.render_timeout() == 3600, AD.render_timeout())
+        os.environ["PAUSE_WAIT_MINUTES"] = "abc"
+        check("⑭b 坏值回落 30 分", AD.render_timeout() == 1800, AD.render_timeout())
+    finally:
+        os.environ.pop("PAUSE_WAIT_MINUTES", None)
+        if _env is not None:
+            os.environ["PAUSE_WAIT_MINUTES"] = _env
+
+    # ⑭c [v28.35] 长阶段出门写台账只并**自己那一条**, 不能拿进门快照整份覆盖:
+    #     render 跑一轮要几分钟, 期间 deliver/import/inject 若写了台账, 整份覆盖就
+    #     把它们抹回旧值 —— 台账自相矛盾(render 说 failed, 而 import 明明是后写的 ok),
+    #     事后按台账排查会被带偏。
+    AD.save_ledger({"name": "c8m", "created": AD.now(), "updated": AD.now(),
+                    "stages": {"render": {"state": "running"}}})
+    stale = AD.load_ledger("c8m")                     # render 进门时的快照
+    disk = AD.load_ledger("c8m")
+    AD.mark(disk, "inject", "ok", rows=999)           # 期间别的阶段写了台账
+    AD.save_ledger(disk)
+    AD.mark(stale, "render", "ok", mono="x.pdf")
+    AD.save_ledger_merge(stale, "render")
+    merged = AD.load_ledger("c8m")
+    check("⑭c 本阶段的改动落盘", merged["stages"]["render"].get("mono") == "x.pdf",
+          merged["stages"]["render"])
+    check("⑭c 期间并发写入没被抹掉", merged["stages"]["inject"].get("rows") == 999,
+          merged["stages"].get("inject"))
+
     # ⑮ gate: 缺 --expect -> 拦
     rc, out = run(["gate", "--name", "c8"])
     check("⑮ gate 缺 --expect 被拦", rc == 1 and "落页" in out, out[-200:])
@@ -641,7 +682,7 @@ def main():
           "merge_result" in body8 and "逐段回读比对" in body8, "")
 
     # ㉖c ratio_audit 单元: 边界/分档/中位/短段不计 —— 口径错了整套都错, 单独钉住
-    src_u = {1: "a" * 200, 2: "b" * 200, 3: "c" * 200, 4: "d" * 39}   # 4 号 39 字 < 40
+    src_u = {1: "a" * 200, 2: "b" * 200, 3: "c" * 200, 4: "d" * 39}   # 4 号 39 字 < 60
     got_u = {1: "x" * 44,    # 22%  候补
              2: "y" * 10,    # 5%   硬线以下 -> 不进候补
              3: "z" * 80,    # 40%  正常

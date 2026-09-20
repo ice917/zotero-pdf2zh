@@ -79,6 +79,23 @@ CACHE = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "cache.v1.db")
 REVIEW = os.environ.get("P2Z_REVIEW",
                         os.path.join(PROJ, "server", "translated", "review"))
 
+# [自研补丁 2026-09-20] 重渲染等待上限 —— 与 server 的"等豆包交稿"上限同源
+# (PAUSE_WAIT_MINUTES, 默认 30 分), 而不是让 force_rerender 的 900 秒硬编码当家。
+# 由来: 两处都在回答同一个问题"这一轮我愿意等多久", 各配一套必然有一处偏短 ——
+# 实测 81 页的稿子重渲染一轮超过 15 分钟, 超时被 adopt 记成 render failed, 而任务
+# 其实还在跑(用户看到"渲染失败", PDF 过一会儿自己出来了)。
+# 900 秒留作下限: 上限配得比一轮渲染本身还短时, 超时就不再是"任务卡住"的信号。
+RENDER_TIMEOUT_MIN = 900
+
+
+def render_timeout():
+    """重渲染等待上限(秒): max(900, PAUSE_WAIT_MINUTES * 60)。"""
+    try:
+        v = float(os.environ.get("PAUSE_WAIT_MINUTES", "") or 30)
+    except ValueError:
+        v = 30.0
+    return max(RENDER_TIMEOUT_MIN, int(max(0.0, v) * 60))
+
 
 def _local_py():
     """本机解释器路径, 读 git-ignored 的 server/config/local_paths.json
@@ -167,6 +184,23 @@ def save_ledger(led):
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(led, f, ensure_ascii=False, indent=1)
     os.replace(tmp, p)          # 原子替换, 半截台账不会覆盖上一版
+
+
+def save_ledger_merge(led, stage):
+    """只把 stage 这一条并回**磁盘上最新**的台账, 而不是拿进门快照整份覆盖。
+
+    [自研补丁 2026-09-20] render 从进门 load_ledger 到出门 save 之间要跑一整轮重渲染
+    (分钟级)。这期间若有别的阶段写过台账(deliver/import/inject —— 复核回路里很常见),
+    整份覆盖就把那些记录**抹回旧值**: 台账变成自相矛盾的两句话(render 记 failed, 而
+    import/inject 明明是后写的 ok), 事后按台账排查会被带偏。
+    """
+    name = led["name"]
+    disk = load_ledger(name)
+    if stage in led.get("stages", {}):
+        disk.setdefault("stages", {})[stage] = led["stages"][stage]
+    disk["name"] = name
+    disk.setdefault("created", led.get("created", now()))
+    save_ledger(disk)
 
 
 def mark(led, stage, state, **kw):
@@ -414,12 +448,21 @@ _REPORT_SNIP_HEAD = 110
 _REPORT_SNIP_TAIL = 60
 
 # [自研补丁 2026-09-20b] 留空/只译半截判据 (SILAGE doubao2 事故)。定标: SILAGE 790 段
-# vs 4 篇**已被采纳**的交件(324 个 >=40 字符的长段) —— 空段 8 例 / 0 例,
-# 覆盖率 < 0.15 共 33 例 / 0 例。干净到可以当硬门禁。
+# vs 4 篇**已被采纳**的交件(324 个长段) —— 空段 8 例 / 0 例, 覆盖率 < 0.15 共 33 例
+# / 0 例。干净到可以当硬门禁。
 # 为什么必须单列: 这类段的"数字不符"是**结果**不是原因。上一版报告把它们全列成
 # "数字按载荷原样, 不改不减不增", 译者照那条改会去抠数字, 而真相是"这段没译完" ——
 # 改法指错地方, 白跑一轮。分出来之后改法才对得上病因(把丢掉的尾巴补上)。
-_GAP_MIN_SRC = 40       # 源段短于这个字符数不判覆盖率: 短段比值噪声大(中文天然短)
+#
+# [定标修订 2026-09-20e] 分母下限 40 -> 60。原定标那句"0 误报"**没覆盖 40~59 这一档**
+# (对照的 4 篇采纳稿里没这么短的段)。SILAGE 第五轮实测: 40~59 档 2 例双双落在硬线
+# 以下, 却都是**完整译文** —— "Substituting this into the previous display yields"
+# 50 字译成"代入前一式得" 6 字(比值 0.120), 英文 50 字本来就是一句短话。这一档整档
+# **没有判别力**: 中文短句的自然下限 6~8 字, 与"只译了开头"的下限重叠, 越拦越错。
+# 代价还不止误报 —— 误报会走"拒绝交件 -> 保留现场判失败"那条路, **自动回路直接卡死**。
+# 60 的由来: 0.15 × 60 = 9 字, 刚好高过 6~8 字的自然下限。改后 SILAGE 790 段中
+# 512 段参与判定, < 0.15 的 0 例(最低 0.163); 40~59 档并入"短段比值噪声大"不再判。
+_GAP_MIN_SRC = 60       # 源段短于这个字符数不判覆盖率: 短段比值噪声大(中文天然短)
 _GAP_RATIO = 0.15
 
 # [自研补丁 2026-09-20d] 「全篇长度比」自查层 (SILAGE 第四轮, 豆包自述"报告只列它检出的段,
@@ -454,7 +497,7 @@ def inv_sig(text):
 def gap_defects(src, dst):
     """返回 (留空段号, [(截断段号, 源长, 交付长)...]) —— 源段有内容而交付没译完的段。
 
-    留空 = 交付该段一个字符都没有; 截断 = 交付长度不到源段的 15%(源段 >= 40 字符)。
+    留空 = 交付该段一个字符都没有; 截断 = 交付长度不到源段的 15%(源段 >= 60 字符)。
     源段本身为空的跳过 —— 那种"空对空"不是缺陷。
     """
     empty, short = [], []
@@ -1030,19 +1073,19 @@ def stage_render(args):
         if rc_c != 0:
             mark(led, "render", "failed", pdf=pdf,
                  pre_render="FAIL", reason="渲染前预检: 文献区汉化")
-            save_ledger(led)
+            save_ledger_merge(led, "render")
             return die("渲染前预检 FAIL —— 文献区被汉化, **未渲染**。"
                        "修法: 让豆包照质检报告把文献条目还原成原文后重交, "
                        "再重走 import -> inject")
         print("[adopt] 渲染前预检 PASS")
 
     rc, out = run_tool("force_rerender.py",
-                       ["--pdf", pdf]
+                       ["--pdf", pdf, "--timeout", str(render_timeout())]
                        + (["--skip-last", str(args.skip_last)] if args.skip_last else []),
                        capture=True)
     if rc != 0:
         mark(led, "render", "failed", reason="force_rerender 退出码 %d" % rc, pdf=pdf)
-        save_ledger(led)
+        save_ledger_merge(led, "render")
         return rc
     # [自研补丁 2026-09-19] 产物路径按**整行剩余**解析: 原文文件名可能带空格
     # (实测 "Wang 等 - 2026 - Differentially Private Consensus for Time-Delay
@@ -1058,7 +1101,7 @@ def stage_render(args):
     mark(led, "render", "ok", pdf=pdf, mono=prod,
          seconds=int(secs[0]) if secs else None, pre_render="PASS",
          skip_last=int(args.skip_last))
-    save_ledger(led)
+    save_ledger_merge(led, "render")
     print("[adopt] render OK: %s" % prod)
     return 0
 

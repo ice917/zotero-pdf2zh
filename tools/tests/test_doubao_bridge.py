@@ -62,7 +62,7 @@ PAYLOAD = "#S1\nFirst paragraph of the paper.\n#S2\nSecond paragraph with [1] ci
 # 第二轮: 只在 #S2 加了半句 = 1/2 段有改动。2 段时该比例必然越过 30% 阈值,
 # 所以这一条同时也锁住了"改动面过大"的分支。
 PAYLOAD2 = "#S1\nFirst paragraph of the paper.\n#S2\nSecond paragraph with [1] citation, revised.\n"
-# 分批交件用: 含一个**跨页合并段**(#S2 正文里带 ⋮)。两段都 >=40 字符,
+# 分批交件用: 含一个**跨页合并段**(#S2 正文里带 ⋮)。两段都 >=60 字符,
 # 才会进长度比自查; 数字/[n] 引用也都留着, 好让 selfcheck 的逐段不变量真跑起来。
 PAYLOAD_Z = ("#S1\n"
              "The optimizer reduces the gradient storage requirement substantially "

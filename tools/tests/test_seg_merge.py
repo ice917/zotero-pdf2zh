@@ -42,7 +42,7 @@ except Exception:
 
 import seg_merge as SM    # noqa: E402  (它内部复用 adopt 的解析/自查口径)
 
-# 两段都 >=40 字符(adopt._GAP_MIN_SRC), 才会进长度比自查
+# 两段都 >=60 字符(adopt._GAP_MIN_SRC), 才会进长度比自查
 L1 = ("Artificial intelligence is transforming how we conduct scientific research "
       "in modern laboratories around the world today, enabling faster discovery.")
 L2 = ("The proposed memory efficient optimizer reduces the gradient storage "

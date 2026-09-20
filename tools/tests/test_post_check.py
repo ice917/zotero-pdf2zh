@@ -359,6 +359,35 @@ def main():
     check("⑱ 报告断言项编号齐 1-5",
           all(f"{i}. **" in md for i in range(1, 6)), md[-400:])
 
+    # ---------- ⑲ 引用标号判据容忍提取空隙 ----------
+    # [v28.35] 事故: SILAGE 逐页对账"原文 69 / 译文 88, 差 19"判 FAIL, 而页面
+    # 已干净(无 `],]` 残留)。真根因是**提取形态**: 原文侧引用是公式字体字形,
+    # pypdf 提取带空隙(实测第2页 `SVRG[ 16, 20],SCSG[ 22],` 8 处全 `[ ` 开头),
+    # 译文侧回填字形原值无空隙(`[22]`)。旧判据 `\[\d{1,3}\]` 只认后者 → 虚高。
+    # 放宽是**两侧同样放宽**(同一正则对原文与译文各跑一遍), 不是只放过译文。
+    CITE = post_check.CITE_ANY
+    check("⑲ 认无空隙引用", CITE.findall("[22]") == ["[22]"], CITE.findall("[22]"))
+    check("⑲ 认前导空隙", CITE.findall("[ 22]") == ["[ 22]"],
+          CITE.findall("[ 22]"))
+    check("⑲ 认尾随空隙", CITE.findall("[22 ]") == ["[22 ]"],
+          CITE.findall("[22 ]"))
+    check("⑲ 认两侧空隙", CITE.findall("[ 22 ]") == ["[ 22 ]"],
+          CITE.findall("[ 22 ]"))
+    # 放宽不等于放开: 带逗号的多引(`[16, 20]`)与超三位数, 两侧都不认
+    check("⑲ 带逗号多引不计", CITE.findall("[16, 20]") == [],
+          CITE.findall("[16, 20]"))
+    check("⑲ 超三位数不计", CITE.findall("[1234]") == [], CITE.findall("[1234]"))
+    # 同一段文本两侧形态不同(原文带空隙/译文无空隙) → 计数必须相等
+    _o = post_check.text_features("SVRG[ 16, 20],SCSG[ 22], and SSRGD[ 24]", 1)
+    _t = post_check.text_features("SVRG [16,20],SCSG [22], and SSRGD [24]", 1)
+    check("⑲ 两侧形态不同但计数一致", _o["cites"] == _t["cites"] == 2,
+          (_o["cites"], _t["cites"]))
+    # 放宽后译文**真丢**引用仍要判 FAIL(容差外的差距不会被这条正则吃掉)
+    fs, v = post_check.run_checks(
+        [feat(2, chars=100, alnum=100, cites=8)],
+        [feat(2, chars=100, alnum=100, cites=0)])
+    check("⑲ 译文真丢引用仍判 FAIL", v == "FAIL", v)
+
     print(f"\npost_check 门禁单元测试: {passed} PASS / {failed} FAIL")
     return 1 if failed else 0
 

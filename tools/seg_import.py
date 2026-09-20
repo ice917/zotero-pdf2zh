@@ -293,6 +293,24 @@ def _eq_class(ch):
     return cls
 
 
+def _punct_eq(a, b):
+    """a 与 b 是"同一个标点的两种写法"吗 —— 供**吸收**用。
+
+    [自研补丁 2026-09-20] 口径必须与定位(_char_pattern)同源。原先吸收只认
+    `_fw(a) == _fw(b)`(_FW 只折 `（）：；，` 六个), 而定位认 PUNCT_EQUIV 整类 ——
+    两者不一致的地方就会**漏吸**: 字形值 `[16,20],` 定位时 core=`16,20`、
+    pre=`[`、post=`],`; 译文 `SVRG [16,20]、SCSG` 里 `]`(_FW 折得出)被吞进占位符,
+    `、`(≡ `,`, _FW 折不出)留在译文外。而占位符渲染时会把字形原值**整个**写回,
+    页面上于是出现 `[16,20],]、` —— 多一个 `]`, post_check 引用计数随之虚高。
+    SILAGE 实测 30 处残留 / 20 段(其中 19 处正好把"引用完整性 69 vs 88"顶出容差)。
+    """
+    if a == b:
+        return True
+    if a in PUNCT_EQUIV or b in PUNCT_EQUIV:
+        return a in PUNCT_EQUIV.get(b, b) or b in PUNCT_EQUIV.get(a, a)
+    return _fw(a) == _fw(b)
+
+
 def _char_pattern(ch):
     """单字符 -> 正则片段(标点优先走 PUNCT_EQUIV, 其余走兼容等价类)。"""
     if ch in PUNCT_EQUIV:
@@ -373,7 +391,12 @@ def sibling_hits(fails, parts_zh, idx):
 
 def reanchor(seg_zh, raw, vars_):
     """只回锚高价值字形(核心=字母/数字), 纯标点字形按设计丢弃。
-    核心命中后向两侧吸收与字形值一致的标点(全角兼容), 避免渲染时双重标点。
+    核心命中后向两侧吸收与字形值一致的标点(等价类同 _char_pattern, 见 _punct_eq),
+    避免渲染时双重标点: 占位符写回的是字形**原值**(含首尾标点), 译文里已写出的那套
+    标点必须删掉, **漏一个就多一个字** —— 实测 `SVRG [16,20], SCSG [22],` 这类引用
+    字形, `],` 里的 `]` 若留在占位符外, 页面就出现 `[16,20],]、` 两个 `]`, 引用完整性
+    断言随之虚高(SILAGE 篇 30 处残留 / 20 段, 把 69 vs 88 顶出容差)。译文省掉字形
+    尾部标点时同理: 写出的那部分(如 `[22]` 的 `]`)照样要吞。
 
     两阶段定位 (2026-09-19 Wang 篇实测: 单遍单调游标 99 处 FAIL; 两遍后 21,
     其中 7 处是短字形抢位造成的假 FAIL):
@@ -432,18 +455,27 @@ def reanchor(seg_zh, raw, vars_):
             continue
         s, e = placed[vn]
         os_, oe_ = s, e
+        # 两侧都按**字形值原序**逐字对账(pre 从右往左、post 从左往右), 每个位置用
+        # _punct_eq 判"同一个标点的两种写法"。**能吃多少吃多少**, 不要求整段对上 ——
+        # 只要译文写了字形尾部的一部分标点, 那部分就必须吞掉: 占位符渲染时写回的是
+        # 字形**原值**, 漏掉的部分会与译文自己写的标点并排出现(实测 SILAGE `[22],`
+        # + 译文 `[22] ` -> 页面 `[22],]`)。逐位对账保证首位不等价即停, 不会误吞
+        # 译文里字形并不覆盖的标点。
         if pre:
-            k = s
-            while k > 0 and seg_zh[k - 1] in PUNCT_CHARS and _fw(seg_zh[k - 1]) in pre:
+            k, pi = s, len(pre)
+            while (k > 0 and pi > 0 and seg_zh[k - 1] in PUNCT_CHARS
+                   and _punct_eq(seg_zh[k - 1], pre[pi - 1])):
                 k -= 1
-            if k < s and _fw(seg_zh[k:s]) == _fw(pre):
-                s = k
+                pi -= 1
+            s = k
         if post:
-            k = e
-            while k < len(seg_zh) and seg_zh[k] in PUNCT_CHARS and _fw(seg_zh[k]) in post:
+            k, pi = e, 0
+            while (k < len(seg_zh) and pi < len(post)
+                   and seg_zh[k] in PUNCT_CHARS
+                   and _punct_eq(seg_zh[k], post[pi])):
                 k += 1
-            if k > e and _fw(seg_zh[e:k]) == _fw(post):
-                e = k
+                pi += 1
+            e = k
         if _overlaps(s, e, [x for x in taken if x != (os_, oe_)]):
             s, e = os_, oe_     # 吸收越界(语序重排后) -> 退回裸匹配, 不侵占用区间
         pieces.append((s, e, "{v%s}" % vn))

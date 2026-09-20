@@ -1348,7 +1348,20 @@ class PDFTranslator:
             # --text 显式点名: 认的就是刚等到的这一份, 不让 deliver 去 glob
             # (同名历史交件一堆)。--force 是给"同一篇重跑"开的: 它只跳过**顺序**
             # 门禁, 段号守恒 / ⋮ 断点对账 / dry 演算这些内容门禁一个不减。
-            for stage in (["deliver", "--name", name, "--text", delivered, "--force"],
+            # [v28.35] deliver 追加 --waive: 自动回路里内容门禁**留痕放行**。
+            # v28.28 立的"拒收 -> 判失败"是**人在场**时的正确收场(用户看到失败,
+            # 让豆包照报告改完重交); 但这一趟是无人值守的复核回路 —— 收件、回锚、
+            # 重渲染连着跑, 一旦拒收整条动线就停在这里, 而真正能改内容的豆包拿不到
+            # 这条失败(桥只读 inbox/out 与 review/, 读不到任务状态), 用户回来只看
+            # 到"失败", 稿子却还躺在 out/ 里没人用。SILAGE 那轮就是这么卡了 12 分钟
+            # 等人工抬 mtime 才推进。
+            # 放行不是静默: 报告照落 review/(桥的 list_reports/get_report 直接可读)、
+            # 台账记 waive/waived 计数、这条日志与下面的告警都点名。清单仍在, 只是
+            # 不再挡住渲染 —— 用户看得见"这一轮放行了哪几类、各几条"。
+            # 覆盖面仅限**内容门禁不符**(留空/半截/⋮/逐段不变量/错位带); 段号守恒、
+            # 载荷不可读、交件不唯一这些结构错误走的是 die, waive 到不了那里, 仍然拒收。
+            # 要恢复严格口径: 把下面的 --waive 去掉即可(v28.28 的行为一字未删)。
+            for stage in (["deliver", "--name", name, "--text", delivered, "--force", "--waive"],
                           ["import", "--name", name, "--force"],
                           ["inject", "--name", name, "--force"]):
                 rc, out = _run_tool("adopt.py", stage)
@@ -1356,6 +1369,9 @@ class PDFTranslator:
                     # [v28.28] 交件阶段失败 = 有交件可留 -> 保留现场判失败, 不回落机翻。
                     # 段号守恒 / ⋮ 对账 / 逐段不变量 / import / inject 任一不过都算。
                     return abort_keep_delivery(f"{stage[0]} 阶段被拒", out)
+                if stage[0] == "deliver" and "--waive 放行" in out:
+                    # 放行必须让人看见 —— 报告路径已经在 adopt 的输出里, 这里再点一次名
+                    print("⚠️ [两趟] 内容门禁**留痕放行**: " + out.strip().splitlines()[-1])
         else:
             return abort_fallback(f"等待交稿超时（{wait_min:g} 分钟）")
 
