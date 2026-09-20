@@ -151,11 +151,13 @@ def main():
     check("⑧ 只报汉化页", len(hits) == 1 and "第9页" in hits[0][1], str(hits))
     check("⑧ 不牵连原样页", bool(hits) and "第10页" not in hits[0][1], str(hits))
 
-    # ---------- ⑨ 串联: 汉化率断言与第四断言同时触发 ----------
+    # ---------- ⑨ 串联: 全篇汉化率断言与第四断言同时触发 ----------
+    # [v28.46] 断言1 改全篇口径后, 要让它出高危必须"参与页合计"低于阈值 ——
+    # 第5页单独零汉字即足够(它是唯一参与页), 第12页是文献页被豁免、不参与合计。
     o = [feat(5, chars=2000, alnum=2000),
          feat(12, chars=3000, alnum=3000, ref_entries=14)]
     t = [feat(5, chars=2000, alnum=2000),
-         feat(12, chars=3000, cjk=900, alnum=2100, ref_entries=14,
+         feat(12, chars=3000, alnum=3000, ref_entries=14,
               ref_zh_blocks=6)]
     fs, v = post_check.run_checks(o, t)
     highs = [f for f in fs if f[0] == "高"]
@@ -163,6 +165,10 @@ def main():
     check("⑨ 门禁判 FAIL", v == "FAIL", v)
 
     # ---------- ⑩ 常量口径回归(防阈值被误改) ----------
+    check("⑩ CJK_FAIL=0.05(逐页读数)", post_check.CJK_FAIL == 0.05,
+          post_check.CJK_FAIL)
+    check("⑩ WHOLE_DOC_CJK_FAIL=0.18(全篇判定)",
+          post_check.WHOLE_DOC_CJK_FAIL == 0.18, post_check.WHOLE_DOC_CJK_FAIL)
     check("⑩ REF_ZH_MIN=2", post_check.REF_ZH_MIN == 2, post_check.REF_ZH_MIN)
     check("⑩ REF_DENSITY=2.5", post_check.REF_DENSITY == 2.5,
           post_check.REF_DENSITY)
@@ -387,6 +393,52 @@ def main():
         [feat(2, chars=100, alnum=100, cites=8)],
         [feat(2, chars=100, alnum=100, cites=0)])
     check("⑲ 译文真丢引用仍判 FAIL", v == "FAIL", v)
+
+    # ---------- ⑳ 断言1 全篇口径（v28.46 起） ----------
+    # 背景: Mandujano 第3,9,10,11,12,13,14 页是 Table 10.1/10.2(+continued)
+    # 整页表格, 引擎按版面分类不翻 → 逐页口径判 FAIL 属假阳性; 且 PDF 文本层
+    # 分不清"按规定不翻"与"卡死漏译"(实测 1.x 与 next 两引擎行为一致, 1.x 的
+    # pdf2zh/high_level.py 也把 "table" 列入不译类 vcls), 故判定上移全篇,
+    # 逐页零汉字降级为提示。定阈依据(蒙特卡洛 + 代价敏感)见 WHOLE_DOC_CJK_FAIL。
+    # ① 局部整页表格零汉字 → 全篇达标 → PASS, 只出提示
+    o = [feat(3, chars=1691, alnum=1691),
+         feat(4, chars=2000), feat(5, chars=2000)]
+    t = [feat(3, chars=1526, alnum=1526),          # 表格页, 与原文逐字相同
+         feat(4, chars=1900, cjk=1000, alnum=900),
+         feat(5, chars=1900, cjk=1000, alnum=900)]
+    fs, v = post_check.run_checks(o, t)
+    check("⑳ 局部表格页不再判 FAIL", v == "PASS", str(fs))
+    check("⑳ 零汉字页降级为提示",
+          any(f[0] == "提示" and "第3页" in f[1] for f in fs), str(fs))
+    check("⑳ 产出全篇读数",
+          any(f[0] == "通过" and "参与页合计汉字占比" in f[2] for f in fs),
+          str(fs))
+
+    # ② 整篇零翻译 → 全篇 FAIL（这是该断言真正的监视目标）
+    o = [feat(3, chars=2000), feat(4, chars=2000)]
+    t = [feat(3, chars=2000), feat(4, chars=2000)]
+    fs, v = post_check.run_checks(o, t)
+    check("⑳ 整篇零翻译判 FAIL", v == "FAIL", v)
+    check("⑳ 全篇结论含阈值与参与页数",
+          any(f[0] == "高" and "18%" in f[2] and "2 个参与页" in f[2]
+              for f in fs), str(fs))
+
+    # ③ 略高于阈值 → 仍 PASS（分界 0.18: 合计 400/2000 = 0.20）
+    o = [feat(3, chars=2000), feat(4, chars=2000)]
+    t = [feat(3, chars=2000, alnum=1000),
+         feat(4, chars=2000, cjk=400, alnum=600)]
+    fs, v = post_check.run_checks(o, t)
+    check("⑳ 略高于阈值判 PASS", v == "PASS", str(fs))
+    check("⑳ 同篇仍保留零汉字提示",
+          any(f[0] == "提示" and "第3页" in f[1] for f in fs), str(fs))
+
+    # ④ 无参与页 → 提示跳过, 不误判 FAIL（文献页/跳页独占的短文档）
+    o = [feat(3, chars=100, alnum=100)]
+    t = [feat(3, chars=100, alnum=100)]
+    fs, v = post_check.run_checks(o, t)
+    check("⑳ 无参与页不误判 FAIL", v == "PASS", v)
+    check("⑳ 报明跳过原因",
+          any("无参与汉化率断言的页" in f[2] for f in fs), str(fs))
 
     print(f"\npost_check 门禁单元测试: {passed} PASS / {failed} FAIL")
     return 1 if failed else 0

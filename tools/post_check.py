@@ -7,8 +7,16 @@ tools/post_check.py —— 翻译后质检门禁（零 API 成本，只读）
   把"翻车但没人发现"变成"翻车自动报警"。断言项（参照 BabelDOC
   ACL 2026 论文的 Untranslated Blocks 质检指标设计）：
 
-    1. 汉化率断言    原文有实质内容的页，译文中文字符占比过低
-                     → 该页翻译缺失/失败
+    1. 汉化率断言    全篇口径（v28.46 起）：参与页（原文有实质内容、非文献
+                     页、非跳页）的译文**合计**汉字占比低于 WHOLE_DOC_CJK_FAIL
+                     → 整篇翻译缺失/大段失败。逐页汉字占比过低不再直接判失败，
+                     而是作为"零汉字页"清单以**提示**级列出供人工核对。
+                     原因：PDF 文本层分不清"引擎按规定不翻的整页表格/公式页"
+                     与"卡死漏译页"（两者在译文中都表现为与原文逐字相同），
+                     故自动判定上移到全篇，逐页异常交人工 —— 这与原始参照的
+                     BabelDOC "Untranslated Blocks **Count**"（计数而非判定）
+                     以及 CAT 业界把 "Target same as Source" 默认关闭同源。
+                     定阈的蒙特卡洛依据见 WHOLE_DOC_CJK_FAIL 注释
     2. 引用完整性    原文与译文的 [n] 引用标号数量逐页对账，
                      偏差超限 → 版面错乱/文献混排（参考文献页事故
                      的典型特征就是标号丢失或重复）
@@ -25,7 +33,8 @@ tools/post_check.py —— 翻译后质检门禁（零 API 成本，只读）
 
   特别处理：参考文献条目按规定整条保持英文，所以"文献页译文汉字为零"
   是预期结果而非翻译失败——断言4 反向把关（条目里出现汉字才算事故），
-  断言1 对该类页面直接豁免。skipLastPages 跳过的末尾页同理豁免。
+  断言1 对该类页面直接豁免（且不参与全篇合计）。skipLastPages 跳过的
+  末尾页同理豁免。
 
   结论写入 server/translated/review/翻译后质检_*.md，并给出
   总体门禁判定：PASS（可交付）/ FAIL（存在高危问题需处理）。
@@ -62,7 +71,19 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------- 常量
 REVIEW_DIRNAME = "review"
 
-CJK_FAIL = 0.05          # 原文实质内容页译文汉字占比低于该值 → 翻译缺失
+CJK_FAIL = 0.05          # [自研补丁 2026-09-20] 降级为**逐页读数**阈值: 参与页
+                         # 译文汉字占比低于该值 → 该页记入"零汉字页"清单
+                         # (提示级), 不再直接判 FAIL —— 判定改用 WHOLE_DOC_CJK_FAIL
+# [自研补丁 2026-09-20] 第一断言改为**全篇口径**的阈值。
+# 读数依据 (D:\zotero-pdf2zh-eval\logs\pilot_tbl\threshold_opt.py, 蒙特卡洛 +
+# 代价敏感决策): H0 = 15 篇实测全篇读数 0.3644~0.8082 (min=Mandujano, 该篇 33 个
+# 参与页里 7 页整页表格零汉字, 全篇仍 0.3644); H1 = 故障模型两臂 (页级截断
+# "卡死/跳页" 与乘性完成度)。结论: 该统计量对"局部漏译"检出率≈0 —— τ 推到零
+# 误报上限 0.3644 时"翻一半卡死"的检出率也只有 10.9%, 要检出 50% 需 τ≈0.44 而
+# FPR 达 26.7% (分母被未翻页的大 alnum 主导, 故 whole 对"翻了多少页"不敏感)。
+# 因此本断言的语义是"整篇零翻译闸门", 局部异常一律降级为提示交人工。
+# 阈值取 H0 最小值的一半 = 2 倍样本外余量, 代价只比严格最优 (τ=0.35) 差 17%。
+WHOLE_DOC_CJK_FAIL = 0.18
 MIN_SUBSTANTIAL = 500    # 原文页可提取字符数超过该值才算"实质内容页"
 CITE_TOL_ABS = 5         # 引用标号数量对账的绝对容差
 CITE_TOL_REL = 0.2       # 引用标号数量对账的相对容差（20%）
@@ -341,7 +362,17 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
     # 该页译文"汉字为零"是预期结果, 不判翻译缺失 —— 反过来由第 4 断言
     # (文献区禁汉化)把关。EgoPhys 第10/11/12页曾因此误报; 作者-年份制
     # 文献页(Wang 第15页, 无行首 [n])同理, 见 is_ref_page。
-    fail_pages, kept_pages, ref_pages = [], [], []
+    # [自研补丁 2026-09-20] 判定上移"全篇", 逐页降级为提示。
+    # 事故/依据: Mandujano 2026 第3,9,10,11,12,13,14页是 Table 10.1/10.2
+    # (+continued) 整页大表格, 引擎按版面分类不翻表格文本 → 译文 7 页零汉字,
+    # 逐页口径判 FAIL。对照试点(2026-09-20)查明: ① 上游 --translate-table-text
+    # 在 BabelDOC 0.6.2 已退役(translation_config 收 table_model 即置 None,
+    # RapidOCRModel 变 no-op), 透传无效; ② 1.x 同样不翻表格(pdf2zh/high_level.py
+    # 的 vcls 含 "table"), 2026-09-13 的质检报告已逐页相同 → **不是换引擎的回退**;
+    # ③ PDF 文本层无法区分"按规定不翻"与"卡死漏译"(两者都表现为与原文逐字相同),
+    # 故原逐页判据的假阳性无法靠加豁免修掉。建模定阈见 WHOLE_DOC_CJK_FAIL。
+    zero_pages, kept_pages, ref_pages = [], [], []
+    w_cjk = w_alnum = used = 0
     for i in range(n):
         o, t = orig_feats[i], trans_feats[i]
         if o["error"] or t["error"]:
@@ -355,13 +386,34 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
         if skip_last > 0 and i >= n - skip_last and cjk_low:
             kept_pages.append(t["page"])   # 任务明确跳过的末尾页, 原文保留
             continue
+        used += 1
+        w_cjk += t["cjk"]
+        w_alnum += t["alnum"]
         if cjk_low:
-            fail_pages.append(t["page"])
-    if fail_pages:
+            zero_pages.append(t["page"])
+    whole = w_cjk / float(w_cjk + w_alnum or 1)
+    if used and whole < WHOLE_DOC_CJK_FAIL:
         findings.append((
-            "高", f"第{','.join(map(str, fail_pages))}页",
-            f"汉化率断言失败：原文有实质内容但译文汉字占比<{CJK_FAIL:.0%}，"
-            f"该页翻译缺失或失败（卡死/跳页错误的典型症状）"))
+            "高", "全文",
+            f"汉化率断言失败（全篇口径）：{used} 个参与页合计汉字占比 "
+            f"{whole:.1%} < {WHOLE_DOC_CJK_FAIL:.0%}，整篇翻译缺失或大段失败"
+            + (f"（其中第{','.join(map(str, zero_pages))}页汉字占比"
+               f"<{CJK_FAIL:.0%}）" if zero_pages else "")))
+    elif used:
+        findings.append((
+            "通过", "全文",
+            f"汉化率对账通过（全篇口径）：{used} 个参与页合计汉字占比 "
+            f"{whole:.1%}（阈值 {WHOLE_DOC_CJK_FAIL:.0%}）"))
+        if zero_pages:
+            findings.append((
+                "提示", f"第{','.join(map(str, zero_pages))}页",
+                f"译文汉字占比<{CJK_FAIL:.0%} 的页（{len(zero_pages)} 页）："
+                "可能是引擎按规定不翻的整页表格/公式页，也可能是漏译页 —— "
+                "PDF 文本层分不清，请对照原文人工确认"))
+    else:
+        findings.append((
+            "提示", "全局",
+            "无参与汉化率断言的页（原文无实质内容页，或全为文献/跳页），跳过"))
     if kept_pages:
         findings.append((
             "通过", f"第{','.join(map(str, kept_pages))}页",
@@ -468,7 +520,11 @@ def build_report(mono_path, orig_path, n_pages, findings, verdict, skip_last=0):
     for level, loc, desc in findings:
         lines.append(f"- {icon.get(level, '⚪')} **[{level}]** {loc}：{desc}")
     lines += ["", "## 断言项说明", "",
-              "1. **汉化率**：原文实质内容页的译文汉字占比（排除跳页与文献保留页）",
+              f"1. **汉化率（全篇口径）**：参与页（原文有实质内容、排除跳页与"
+              f"文献保留页）的译文**合计**汉字占比 < {WHOLE_DOC_CJK_FAIL:.0%}"
+              f"即失败（整篇翻译缺失或大段失败）；逐页汉字占比 < {CJK_FAIL:.0%}"
+              "的页只作**提示**列出 —— PDF 文本层无法区分'引擎按规定不翻的整页"
+              "表格/公式页'与'卡死漏译页'，须对照原文人工确认",
               "2. **引用完整性**：原文/译文 [n] 标号逐页对账，超容差=版面错乱",
               "3. **占位符残留**：{vN} 公式占位符未回填即失败",
               "4. **文献区禁汉化**：原文文献页（编号制行首 [n] 密度，或作者-年份"
