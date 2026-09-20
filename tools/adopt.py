@@ -120,6 +120,12 @@ NEED = {  # 阶段 -> 前置阶段
     "gate": ["render"],
 }
 SAFE_NAME = re.compile(r"^[A-Za-z0-9_\-. ]{1,80}$")
+# 产物行里的 mono 判定(render 台账/gate 验收对象都用它)。**两个引擎的命名不一样**:
+#   pdf2zh 1.x = `<stem>-mono.pdf`
+#   next       = `<stem>.no_watermark.zh-CN.mono.pdf`(中段随 watermark 模式与语言变)
+# 只认 `-mono.pdf` 会把 next 的 mono 判掉 -> 退回 prods[0], 而那多半是 dual(按名排序
+# dual 在前) -> gate 拿一份**中英对照**去做比例/文献区/引用完整性验收, 结论全错。
+MONO_RE = re.compile(r"[-.]mono\.pdf$", re.I)
 # 只在 mark(..., "failed") 时写的字段: 阶段转 ok 后必须剔除, 否则台账里会留下
 # "ok 却带着失败原因"的自相矛盾(见 mark() 注释)。
 _FAIL_ONLY = ("reason", "missing", "extra", "detail")
@@ -434,10 +440,62 @@ def sidecar_doc_fp(sc):
     return ""
 
 
+def stage_export_next(args, led):
+    """next 画像的导出: 段表 = translate_tracking.json, 没有侧车, 也没有可数的库命中。
+
+    与 1.x 的三处不同(都不是"忘了改", 是口径本来就没有对应物):
+      - 不解析侧车, 也就没有"侧车与库里不是同一篇"这道校验; 换来的校验是"段表能不能读、
+        所选页里有没有段"(seg_export 做)。给 --pdf 则跨页池的页码由它锚定。
+      - 不做 probe_db: next 的 LLM 通道缓存键是**整条 prompt**, 拿段落原文去数命中必然 0,
+        会被误判成"没翻过"而拒导。
+      - doc_fp 留空: 1.x 的文档指纹是"文档摘要作用域"的 cache key 参数; next 的键就是
+        prompt 本身, 没有这个自由参数(见 engine.py 节头)。inject/rollback 都用不到它
+        —— 它们的定位是"整条 prompt 精确匹配 + 批次下标"。
+    """
+    if (led["stages"].get("export") or {}).get("state") == "ok" and not args.force:
+        return die("本 run 已导出过; 重做请加 --force (会覆盖 inbox 同名件)")
+    tk = args.tracking or (ENGINE.tracking_json("") or "")
+    if not tk:
+        return die("拿不到 next 的段表 translate_tracking.json —— 上游只在 --debug(或显式 "
+                   "working_dir)时才落盘; 用 `--tracking` 指一份(工作根见 `engine.py --list`)")
+    if not os.path.exists(tk):
+        return die("段表不存在: %s" % tk)
+    print("[adopt] 段表: %s (%s)" % (tk, "显式指定" if args.tracking else "工作根下最新一份"))
+    argv = ["--pages", args.pages, "--name", args.name, "--tracking", tk]
+    if args.pdf:
+        argv += ["--pdf", args.pdf]
+    if args.doc:
+        argv += ["--doc", args.doc]
+    if args.terms:
+        argv += ["--terms", args.terms]
+    rc, _ = run_tool("seg_export.py", argv)
+    if rc != 0:
+        mark(led, "export", "failed", reason="seg_export 退出码 %d" % rc)
+        save_ledger(led)
+        return rc
+
+    man, man_p = read_manifest(args.name)
+    if man is None:
+        mark(led, "export", "failed", reason="manifest 未生成")
+        save_ledger(led)
+        return die("manifest 未生成: %s" % man_p)
+    mark(led, "export", "ok", pages=args.pages, tracking=sidecar_id(tk),
+         source="translate_tracking.json", doc_fp="", n_items=len(man["items"]),
+         txt=os.path.join(INBOX, args.name + ".txt"), manifest=man_p)
+    save_ledger(led)
+    n_cross = sum(1 for it in man["items"] if it.get("pool") == "cross_page")
+    print("[adopt] export OK (next): %d 段 (跨页池 %d) / 段表 %s" % (
+        len(man["items"]), n_cross, tk))
+    print("[adopt] 下一步: 把 inbox/%s.txt 交给豆包软件定稿, 再跑 deliver" % args.name)
+    return 0
+
+
 def stage_export(args):
     led = load_ledger(args.name)
     if not guard(led, "export", args.force):
         return 1
+    if ENGINE and ENGINE.seg_source == "tracking_json":
+        return stage_export_next(args, led)
     sc, sc_why = resolve_sidecar(args)
     if sc is None:
         return die(sc_why)
@@ -1002,11 +1060,35 @@ def stage_deliver(args):
 
 
 # ------------------------------------------------------------------ 阶段 3: import
+def stage_import_next(args, led, exp):
+    """next 画像的 import: 无侧车、无回锚, 只有守恒校验(seg_import 的 tracking 路线)。
+
+    与 1.x 的差别: 1.x 在这里要校验"侧车还是导出时那一份"(latest.jsonl 是全局单文件,
+    换论文会覆盖它); next 的段表落在 working/<stem>/ 下, 换篇互不覆盖, 但**下次渲染会
+    覆盖自己** —— 那道校验交给 inject(它拿段表与载荷逐段对账), import 这步只读
+    manifest 与交付稿, 碰不到段表。
+    """
+    man_p = exp["manifest"]
+    text = led["stages"]["deliver"]["file"]
+    rc, _ = run_tool("seg_import.py", ["--manifest", man_p, "--text", text])
+    if rc != 0:
+        mark(led, "import", "failed", reason="seg_import 退出码 %d" % rc)
+        save_ledger(led)
+        return rc
+    imported = os.path.join(OUTDIR, args.name + ".imported.json")
+    mark(led, "import", "ok", imported=imported, source=text)
+    save_ledger(led)
+    print("[adopt] import OK (next): %s" % imported)
+    return 0
+
+
 def stage_import(args):
     led = load_ledger(args.name)
     if not guard(led, "import", args.force):
         return 1
     exp = led["stages"]["export"]
+    if ENGINE and ENGINE.seg_source == "tracking_json":
+        return stage_import_next(args, led, exp)
     cur_sc = sidecar_id(exp["sidecar"]["path"])
     if cur_sc and cur_sc["sha1"] != exp["sidecar"]["sha1"] and not args.force:
         return die("侧车已被改写(%s -> %s)。latest.jsonl 是全局单文件, 换论文会覆盖它; "
@@ -1028,11 +1110,61 @@ def stage_import(args):
 
 
 # ------------------------------------------------------------------ 阶段 4: inject
+def stage_inject_next(args, led, exp):
+    """next 画像的 inject: 精确匹配整条 prompt, 改批次 JSON 里 id==mpi 那一条。
+
+    与 1.x 的差别(都不是漏改, 是口径本来就没有对应物):
+      - 不要文档指纹: next 的缓存键**就是**引擎发出的整条 prompt, 自带本篇上下文,
+        不存在"Introduction 这类短原文误伤别的文档"的问题;
+      - 不要 --shift: 断点移位是 1.x 合并段(⋮ 两侧)的坐标操作, next 载荷按 #S 编号;
+      - 段表指针取自台账 export 那一步 —— working 下的 translate_tracking.json 会被
+        下次渲染覆盖, 换篇/重渲之后要用 --tracking 指回**导出时**那一份(seg_inject
+        会拿它与载荷逐段对账, 对不上直接拒收)。
+    """
+    imported = led["stages"]["import"]["imported"]
+    tk = args.tracking or (exp.get("tracking") or {}).get("path") or ""
+    if not tk or not os.path.exists(tk):
+        return die("段表不可用: %s\n      working 下的 translate_tracking.json 会被下次渲染"
+                   "覆盖; 用 --tracking 指回导出这份载荷时的那一份" % tk)
+    if args.shift:
+        return die("--shift 是 1.x 合并段的断点移位口径; next 载荷按 #S 编号, 没有对应的"
+                   "段坐标可移")
+    if args.fp:
+        return die("--fp 是 1.x 的文档作用域指纹; next 的缓存键是整条 prompt, 不需要它")
+    base = ["--imported", imported, "--manifest", exp["manifest"], "--tracking", tk]
+
+    print("[adopt] 第 1 步: dry 演算 (段表 %s)" % tk)
+    rc, _ = run_tool("seg_inject.py", base + ["--dry"])
+    if rc != 0:
+        mark(led, "inject", "failed", reason="dry 演算 FAIL", tracking=tk)
+        save_ledger(led)
+        return die("dry 演算 FAIL —— 未写库")
+    if args.dry:
+        print("[adopt] --dry: 到此为止, 未写库")
+        return 0
+
+    print("[adopt] 第 2 步: 实写 (seg_inject 自己会先备份 cache.v1.db)")
+    rc, out = run_tool("seg_inject.py", base, capture=True)
+    if rc != 0:
+        mark(led, "inject", "failed", reason="实写退出码 %d" % rc)
+        save_ledger(led)
+        return rc
+    rows = sum(int(m) for m in re.findall(r"已更新 (\d+) 行", out))
+    bak = re.findall(r"备份: (\S+)", out)
+    mark(led, "inject", "ok", tracking=tk, rows=rows,
+         backup=bak[-1] if bak else None)
+    save_ledger(led)
+    print("[adopt] inject OK (next): 更新 %d 行" % rows)
+    return 0
+
+
 def stage_inject(args):
     led = load_ledger(args.name)
     if not guard(led, "inject", args.force):
         return 1
     exp = led["stages"]["export"]
+    if ENGINE and ENGINE.seg_source == "tracking_json":
+        return stage_inject_next(args, led, exp)
     imported = led["stages"]["import"]["imported"]
     fp = args.fp or exp.get("doc_fp")
     if not fp:
@@ -1069,6 +1201,56 @@ def stage_inject(args):
 
 
 # -------------------------------------------------------------- 阶段 7: rollback
+def stage_rollback_next(args, led, exp):
+    """next 画像的 rollback: 把**我们注入的那一条**逐段还原成引擎当时的译文。
+
+    与 1.x 的差别(不是漏改, 是损坏形态本来就不一样):
+      - 1.x 撤的是"骨架行"(`translation == original_text`), 因为暂停档第一趟会故意
+        落一批 raw→raw 占位行, 不撤就会整篇出英文;
+      - next 没有骨架行这一说, 撤的是 **inject 写进批次 JSON 里的那一条**。判据用
+        provenance: 现行值 == imported.json 里我们注入的那一版才动手, 还原成段表记下的
+        output; 值已被别的改动覆盖就**不碰只报告** —— 与 1.x 那条"只认骨架行"同精神。
+      - 作用域天然是"本篇载荷那几段"(借 manifest 的定位键 + 段表逐段对账), 不需要
+        --fp/--pdf 那套"没有作用域就退回全库"的兜底(见 seg_inject.rollback_next)。
+    """
+    imp = (led["stages"].get("import") or {}).get("imported") or ""
+    if not imp or not os.path.exists(imp):
+        return die("找不到 imported.json (%s) —— 撤销的判据是\"现行值 == 我们注入的那一版\","
+                   " 没有它就分不清\"我们改的\"与\"别人改的\"; 先跑 `adopt.py import`"
+                   % (imp or "台账未记录"))
+    tk = args.tracking or (exp.get("tracking") or {}).get("path") or ""
+    if not tk or not os.path.exists(tk):
+        return die("段表不可用: %s\n      撤销要把那一条还原成**引擎当时的译文**, 那个值只"
+                   "存在段表(translate_tracking.json)里; working 下的会被下次渲染覆盖, "
+                   "用 --tracking 指回导出这份载荷时的那一份" % tk)
+    manifest = exp.get("manifest") or ""
+    if not manifest or not os.path.exists(manifest):
+        return die("找不到 manifest (%s) —— 它登记的是\"撤哪几段\"; 由 export 阶段产出"
+                   % (manifest or "台账未记录"))
+    if args.fp:
+        return die("--fp 是 1.x 的文档作用域指纹; next 的撤销按段表逐段定位, 不需要它")
+    base = ["--rollback", "--imported", imp, "--manifest", manifest, "--tracking", tk]
+    if getattr(args, "pdf", ""):
+        print("[adopt] 提示: next 的撤销不需要 --pdf(作用域来自 manifest), 已忽略")
+
+    rc, out = run_tool("seg_inject.py", base + (["--dry"] if args.dry else []),
+                       capture=True)
+    if rc != 0:
+        mark(led, "rollback", "failed", reason="seg_inject 退出码 %d" % rc, tracking=tk)
+        save_ledger(led)
+        return rc
+    if args.dry:
+        print("[adopt] --dry: 到此为止, 未写库")
+        return 0
+    rows = sum(int(m) for m in re.findall(r"还原行数: (\d+)", out))
+    bak = re.findall(r"备份: (\S+)", out)
+    mark(led, "rollback", "ok", tracking=tk, rows=rows,
+         backup=bak[-1] if bak else None)
+    save_ledger(led)
+    print("[adopt] rollback OK (next): 还原 %d 行" % rows)
+    return 0
+
+
 def stage_rollback(args):
     """[v28.23] 撤销骨架行 —— 两趟回路半途失败时的**止损坏**步骤。
 
@@ -1081,6 +1263,11 @@ def stage_rollback(args):
     """
     led = load_ledger(args.name)
     exp = led["stages"].get("export") or {}
+    # [v28.43] next 的撤销是**另一种形态**(行级还原我们注入的那一条, 不是删骨架行),
+    # 在算 fp/sidecar 之前就分流 —— 下面那套"没有作用域就靠 --pdf 找回归档侧车"的
+    # 兜底在 next 上没有对应物(既没有侧车也没有文档指纹)。
+    if ENGINE and ENGINE.seg_source == "tracking_json":
+        return stage_rollback_next(args, led, exp)
     fp = args.fp or exp.get("doc_fp") or ""
     sidecar = (exp.get("sidecar") or {}).get("path") or ""
     manifest = exp.get("manifest") or ""
@@ -1148,9 +1335,18 @@ def stage_render(args):
                        "再重走 import -> inject")
         print("[adopt] 渲染前预检 PASS")
 
+    # next: 把导出时那份段表也带上 —— force_rerender 拿它做渲染前的缓存命中自检
+    # (命中 0 = 这次要整篇重译, 花钱; 段表路径是 working 下会被本次渲染覆盖的那一份)。
+    tk = ((led["stages"].get("export") or {}).get("tracking") or {}).get("path") if \
+        (ENGINE and ENGINE.seg_source == "tracking_json") else ""
+    # [v28.43] next: 引擎名(服务开关)是缓存键的一部分, 换服务 = 整篇重译。所以这里必须
+    # 能把它透传下去 —— 缺省(空)时 force_rerender 自己按 siliconflow 兜底, 与本参数
+    # 引入前逐字节一致; 1.x 路线不看它。
+    svc = ["--service", args.service] if args.service else []
     rc, out = run_tool("force_rerender.py",
-                       ["--pdf", pdf, "--timeout", str(render_timeout())]
-                       + (["--skip-last", str(args.skip_last)] if args.skip_last else []),
+                       ["--pdf", pdf, "--timeout", str(render_timeout())] + svc
+                       + (["--skip-last", str(args.skip_last)] if args.skip_last else [])
+                       + (["--tracking", tk] if tk else []),
                        capture=True)
     if rc != 0:
         mark(led, "render", "failed", reason="force_rerender 退出码 %d" % rc, pdf=pdf)
@@ -1160,10 +1356,10 @@ def stage_render(args):
     # (实测 "Wang 等 - 2026 - Differentially Private Consensus for Time-Delay
     # Multi-agent Systems.pdf"), 原来的 \S+ 只能吃到空格后的最后一段, 台账把
     # mono 记成 "Systems-mono.pdf" -> gate 阶段拿着个不存在的路径直接拒绝执行。
-    # 另外优先取 -mono.pdf: gate 的 verify_render/post_check 要的就是 mono 译文。
+    # 另外优先取 mono: gate 的 verify_render/post_check 要的就是 mono 译文(命名见 MONO_RE)。
     prods = [p.strip() for p in re.findall(r"(?m)^\s*产物:\s*(.+\.pdf)\s*$", out)]
     secs = re.findall(r"耗时 (\d+) 秒", out)
-    mono = [p for p in prods if p.lower().endswith("-mono.pdf")]
+    mono = [p for p in prods if MONO_RE.search(p)]
     prod = mono[-1] if mono else (prods[0] if prods else None)
     if prod is None:
         print("[adopt] 警告: 未从输出解析到产物路径; gate 阶段将回落到'最新 mono'")
@@ -1283,13 +1479,16 @@ def main():
         p.add_argument("--engine", default="",
                        help="引擎画像: pdf2zh(缺省) | next; 等价于 P2Z_ENGINE")
 
-    p = sub.add_parser("export", help="1 侧车 -> inbox payload")
+    p = sub.add_parser("export", help="1 段表 -> inbox payload (1.x 读侧车 / next 读 tracking json)")
     common(p)
     p.add_argument("--pages", required=True, help="如 2-4 或 1,21-22")
     p.add_argument("--sidecar", default=NOT_GIVEN,
                    help="缺省用当前引擎的全局侧车; 给了 --pdf 就按文档自动认领归档件")
     p.add_argument("--pdf", default="",
-                   help="原文 PDF 绝对路径; 按文档(md5)自动认领该篇侧车, 免得手工归档")
+                   help="原文 PDF 绝对路径; 1.x: 按文档(md5)自动认领该篇侧车; "
+                        "next: 跨页配对段靠它锚定页码")
+    p.add_argument("--tracking", default="",
+                   help="next: translate_tracking.json 路径; 缺省取工作根下最新一份(换论文会被覆盖)")
     p.add_argument("--doc", default="", help='文档抬头(写进 payload 首行), 如 "标题 (期刊, 年份)"')
     p.add_argument("--terms", default="", help="术语表 csv; 缺省用 seg_export 默认(server/glossary/terms.csv)")
     p.set_defaults(fn=stage_export)
@@ -1312,6 +1511,10 @@ def main():
     p.add_argument("--shift", default="", help='合并段断点移位, 如 "S4:1"')
     p.add_argument("--fp", default="", help="覆盖台账里的文档指纹(缺省用 export 探到的)")
     p.add_argument("--dry", action="store_true", help="只演算不写库")
+    # [v28.43] next 专用: 段表会被**下一次渲染**覆盖, 换篇/重渲之后要用它指回导出这份
+    # 载荷时的那一份(seg_inject 拿它与载荷逐段对账, 对不上直接拒收)。1.x 路线不看它。
+    p.add_argument("--tracking", default="",
+                   help="next: translate_tracking.json 路径; 缺省用台账 export 记下的那份")
     p.set_defaults(fn=stage_inject)
 
     p = sub.add_parser("rollback", help="7 [v28.23] 撤销骨架行(回路半途失败时止损坏)")
@@ -1320,11 +1523,20 @@ def main():
     p.add_argument("--pdf", default="",
                    help="原文 PDF; 台账里没有 export 条目(导出阶段就失败)时靠它定位"
                         "按文档归档的侧车, 避免退回全局 latest.jsonl 误伤别的论文")
+    # [v28.43] flags for the 'next' profile; the 1.x path ignores both.
+    p.add_argument("--tracking", default="",
+                   help="next: translate_tracking.json 路径; 缺省用台账 export 记下的那份")
+    p.add_argument("--dry", action="store_true", help="next: 只演算不写库")
     p.set_defaults(fn=stage_rollback)
 
     p = sub.add_parser("render", help="5 重渲染落产物")
     common(p)
     p.add_argument("--pdf", required=True, help="原文 PDF 绝对路径")
+    # [v28.43] next 专用: 服务开关(引擎名)。**必须与第一公里那次一致** —— next 的缓存键
+    # 含引擎名, 换服务 = 整篇重译(花钱)。缺省空 = force_rerender 自己的 siliconflow。
+    p.add_argument("--service", default="",
+                   help="next: 服务开关名(如 siliconflow / siliconflowfree); "
+                        "必须与上次渲染一致, 否则整篇缓存 miss")
     p.add_argument("--skip-last", type=int, default=0,
                    help="末尾保留页数(原样不译); 与 pre_check 推荐的 skipLastPages 同口径。"
                         "缺省 0=整篇翻。台账会记下它, gate 阶段缺省沿用")

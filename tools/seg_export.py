@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
-"""seg_export.py — 从侧车导出"编号段落包"给豆包翻译 (M1 工具)
+"""seg_export.py — 导出"编号段落包"给豆包翻译 (M1 工具)
 
-做什么:
+两条路线(由引擎画像决定, 见 engine.py):
+  pdf2zh 1.x  侧车 -> 载荷
   1. 读 C:\\Users\\<user>\\.cache\\pdf2zh\\segflow\\latest.jsonl
      (每行 = 一次 receive_layout 回调: page/pageid/segs/vars。**不是**"每行一页":
       图形对象也各占一行, 那行的 pageid 就是它所在的真实页)
@@ -10,6 +11,16 @@
   4. 检测跨页续接 (上段尾无句末标点 + 下段首小写) -> 合并为一条, 原断点插 ⋮
   5. 输出 payload 文件 (#S 编号行) + manifest.json (编号 -> 页/段映射;
      每条 part 同时记 page=侧车内部坐标 与 true_page=真实 PDF 页码)
+
+  next / BabelDOC  translate_tracking.json -> 载荷 (v28.40)
+  1. 段表 = <working_root>/<篇名>/translate_tracking.json (须跑 --debug), 用 --tracking 指
+  2. 正文取 `input` **原样**: {vN}/<style> 是引擎原生协议, 载荷带着它发出去, 收回来
+     的译文里它照样落回原公式/原字体 —— 所以**不回锚、不还原**, 与 1.x 正好相反
+     (把 pdf_unicode 那套"显示形态"发出去 = 豆腐块, 见 engine.py 节头)
+  3. 不注入 ⋮: 上游把跨页段落整段并成一次调用, 每段都是完整段
+  4. cross_page 池(上页末段+下页首段, 32 段那种)必须并进来, 用 --pdf 锚定页码后
+     插回阅读序; 锚不到只影响报告里的页码, 不影响正文
+  5. 输出同样格式的 payload 与 manifest, 另加 engine/source/pool/batch 字段
 
 用法 (--pages 是**真实 PDF 页码**, 与质检/体检报告同一口径; v28.10 起):
   python tools/seg_export.py --pages 2-4 --name payload_p2_p4 \
@@ -117,6 +128,21 @@ TERMS_LOOKUP = """   术语表里**没有**的专业术语不要凭直觉定名 
    答不出依据的，回原句重译。
 """
 
+# [自研补丁 2026-09-20] next 画像专用第 10 条: 占位符与标签原样保留。
+# 为什么只有 next 需要: 1.x 的载荷在导出时就把 {vN} 还原成真字形(豆包根本看不到占位符),
+# 而 next 的载荷**故意**带引擎原生形态发出去 —— {vN}/<style> 是引擎的替换协议, 少一个
+# 渲染时就少一个公式/少一段样式。这条属"载荷规则", 是开发者侧的杠杆(见摊派边界: 内容
+# 质量交给豆包, 但"怎么把引擎记号完好交回"得由我们把规则写进载荷)。
+# 单独成条第 10 条、**不动 1-9 的编号**: 那些编号被别处(术语子项、返工单)引用过。
+_PH_RULE = """10. 段里的花括号占位符与 <style> 标签一律**原样照抄**：
+    {v1}、{v2}… 这类占位符，以及 <style id='1'>…</style> 这类标签，个数、编号、
+    位置、尖括号与引号形状都不许改，不许删、不许自己添，也不许把它们展开成实际
+    内容或换个写法（如写成「公式」「v1」、全角花括号、去掉 id）。标签**里面**的
+    可读文字照常翻译，标签本身不动。
+    自查办法：把译文里的 {vN} 与 <style ...> 逐个抄出来与载荷逐字符比对；载荷里有
+    n 个占位符，译文里就得有同样 n 个、编号一一对应。
+"""
+
 
 def load_terms(path):
     """读术语表 csv (无表头, 'english,chinese') -> [(en, zh), ...]; 缺文件即空表"""
@@ -201,33 +227,122 @@ def restore(raw, vars_):
     return text
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--pages", required=True,
-                    help="真实 PDF 页码(与质检/体检报告同一口径), 如 2-4 或 2,3,4")
-    ap.add_argument("--name", required=True, help="payload 文件名(不含扩展名)")
-    ap.add_argument("--sidecar", default=SIDECAR, help="侧车路径; 新论文请先归档 latest.jsonl 再用")
-    ap.add_argument("--doc", default="", help='文档抬头, 如 "标题 (期刊, 年份)"; 缺省只写页码')
-    ap.add_argument("--terms", default=TERMS_CSV,
-                    help="术语表 csv (english,chinese 无表头); 缺省 %s; 传空串则不注入具体术语" % TERMS_CSV)
-    ap.add_argument("--force", action="store_true", help="续接检测失败也照常导出(逐段独立)")
-    args = ap.parse_args()
+def _emit(args, items, merged_log, warnings, pages_str, source=None):
+    """载荷 + manifest 落盘与报告 —— **两个引擎共用**(免得两边的编号/manifest 慢慢漂移)。
 
-    # 引擎接线门禁: next 画像的段表在 translate_tracking.json 里、不产侧车, 本工具在
-    # 该引擎上未接线 —— 拦在这里, 免得下游报一个看不懂的"侧车不存在: "。
-    _ok, _why = _PROF.stage_ok("export")
-    if not _ok:
-        print("FAIL: 引擎 %s 上未接线: %s" % (_PROF.key, _why))
-        return 2
+    items 每项: {"parts": [(页, 段序, 正文, 真实页)], "merged": bool}; next 路线另带
+    "pool"/"batch"/"src"。source 非空 = next 路线: manifest 记 engine/source/pool/batch/src/fp,
+    载荷末尾附第 10 条占位符规则。
+    """
+    for n, it in enumerate(items, 1):
+        it["key"] = "S%d" % n
 
-    # 页码解析: 支持 "2-4" / "2,3,4" / 混合 "1,21-22" (逗号分隔, 每项为单页或区间)
-    pages_want = set()
-    for tok in args.pages.split(","):
-        if "-" in tok:
-            a, b = (int(x) for x in tok.split("-"))
-            pages_want.update(range(a, b + 1))
-        else:
-            pages_want.add(int(tok))
+    doc = args.doc.strip()
+    if args.terms == TERMS_CSV and not os.path.exists(TERMS_CSV):
+        # 沙箱/换机时 P2Z_PROJ 一改, 默认术语表就跟着落空; 静默退化会让人以为术语生效了
+        warnings.append("默认术语表不存在: %s —— 本次只写通用术语要求, 用 --terms 指定" % TERMS_CSV)
+    lines = [RULES.format(doc=(doc + " ") if doc else "",
+                          pages=pages_str,
+                          terms=terms_line(args.terms))
+             + (_PH_RULE if source else "")]
+    for it in items:
+        lines.append("#%s" % it["key"])
+        body = ""
+        for j, (_pg, _idx, text, _tp) in enumerate(it["parts"]):
+            if j:
+                body += "⋮"
+            body += text
+        lines.append(body)
+    manifest = {"name": args.name, "pages": pages_str, "items": []}
+    if source:
+        # 下游(报告/回写)要能一眼看出这是 next 的载荷: 页号是**真实 PDF 页码**,
+        # 不是 1.x 那种"回调计数"坐标。
+        manifest["engine"] = _PROF.key
+        manifest["source"] = source
+    for it in items:
+        rec = {
+            "key": it["key"],
+            "merged": it["merged"],
+            # page 是**侧车内部坐标**(回调计数), imported.json / seg_inject 沿用它;
+            # true_page 是**真实 PDF 页码**(给人看、给报告用)。两者都留着, 是为了让
+            # 下游(seg_import 的报错与返工单)不必再自己重算一遍 pageid 口径。
+            # next 路线没有侧车坐标, 两者同值(见 manifest.source)。
+            "parts": [{"page": pg, "seg": idx, "true_page": tp}
+                      for pg, idx, _t, tp in it["parts"]],
+        }
+        if source:
+            rec["pool"] = it.get("pool", "page")
+            # 定位键 + 正文指纹: 回写侧拿它把 #S 对回段记录(见 engine.tracking_segment)。
+            # 不落它们的话, 回写只能"拿当前段表重推一遍再比坐标" —— 而重推依赖导出时的
+            # --pdf 锚定, 换一次参数就整列错位(真样本 129 段里 #S11 起全对不上)。
+            rec["src"] = list(it.get("src") or [])
+            rec["fp"] = _ENG.text_fp(it["parts"][-1][2])
+            if (it.get("batch") or (None,))[0] is not None:
+                rec["batch"] = list(it["batch"])
+        manifest["items"].append(rec)
+
+    os.makedirs(INBOX, exist_ok=True)
+    p_txt = os.path.join(INBOX, args.name + ".txt")
+    p_man = os.path.join(INBOX, args.name + ".manifest.json")
+    with open(p_txt, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    with open(p_man, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, ensure_ascii=False, indent=1)
+
+    # ---- 报告 ----
+    total = sum(len(p[2]) for it in items for p in it["parts"])
+    n_cross = sum(1 for it in items if it.get("pool") == "cross_page")
+    print("payload: %s (%d 段 / %d 原文字符%s)" % (
+        p_txt, len(items), total, ("; 其中跨页池 %d 段" % n_cross) if source else ""))
+    for m in merged_log:
+        print("  " + m)
+    for w in warnings:
+        print("  [警告] " + w)
+    for it in items:
+        loc = "+".join("p%d#%d" % (tp, idx) for _pg, idx, _t, tp in it["parts"])
+        t = it["parts"][-1][2] if not it["merged"] else it["parts"][-1][2][:25] + "…"
+        print("  %-5s %-12s %s %5dch  %s" % (
+            "#" + it["key"], loc,
+            {"cross_page": "跨页"}.get(it.get("pool"), "    "),
+            sum(len(p[2]) for p in it["parts"]),
+            ("[合并] 头: " + it["parts"][0][2][:20] + "… 尾: " + t) if it["merged"]
+            else "尾: …" + t[-25:]))
+    return 0
+
+
+def export_next(args, pages_want):
+    """next 画像: translate_tracking.json -> 载荷条目(阅读序) -> _emit。"""
+    tk = args.tracking or (_PROF.tracking_json("") or "")
+    if not tk:
+        print("FAIL: 拿不到 next 的段表 translate_tracking.json —— 上游只在 --debug(或显式 "
+              "working_dir)时才落盘; 用 --tracking 显式指一份")
+        return 1
+    if not os.path.exists(tk):
+        # 这是**业务错**不是接线错(rc=1 而非 2): 换篇论文后工作根下的旧段表会被覆盖,
+        # 报错必须告诉人怎么修 —— 不然拿到 rc=1 只会去怀疑引擎没接好。
+        print("FAIL: 段表不存在: %s\n      用 --tracking 显式指一份 translate_tracking.json "
+              "(上游只在 --debug / 显式 working_dir 时落盘)" % tk)
+        return 1
+    try:
+        items, warnings = _ENG.tracking_payload_items(tk, pdf=args.pdf,
+                                                      pages=pages_want or None)
+    except (IOError, ValueError) as e:
+        print("FAIL: %s" % e)
+        return 1
+    if not items:
+        print("FAIL: 段表 %s 里没有落在 --pages %s 的段" % (tk, args.pages))
+        return 1
+    print("段表: %s%s" % (tk, "" if args.pdf else "  (未给 --pdf: 跨页池页码按序猜)"))
+    for it in items:                      # 归一成 _emit 的 4 元组(页, 段序, 正文, 真实页)
+        it["parts"] = [(pg, idx, txt, pg) for pg, idx, txt in it["parts"]]
+    warnings.append("next 无侧车: 页号是**真实 PDF 页码**(不是 1.x 那种回调计数); 回写"
+                    "(seg_import/seg_inject)按 manifest 的定位键对回段表, 不重推页号")
+    return _emit(args, items, [], warnings, args.pages,
+                 source={"kind": "tracking_json", "path": tk})
+
+
+def export_sidecar(args, pages_want):
+    """1.x 画像: 侧车 -> 载荷条目(逐页 + 跨页续接合并) -> _emit。"""
     pages, missing = load_pages(pages_want, args.sidecar)
     if missing:
         print("侧车缺页: %s" % missing)
@@ -277,62 +392,35 @@ def main():
             continue
         i += 1
 
-    # ---- 编号 ----
-    for n, it in enumerate(items, 1):
-        it["key"] = "S%d" % n
+    return _emit(args, items, merged_log, warnings, args.pages)
 
-    # ---- 输出 payload ----
-    doc = args.doc.strip()
-    if args.terms == TERMS_CSV and not os.path.exists(TERMS_CSV):
-        # 沙箱/换机时 P2Z_PROJ 一改, 默认术语表就跟着落空; 静默退化会让人以为术语生效了
-        warnings.append("默认术语表不存在: %s —— 本次只写通用术语要求, 用 --terms 指定" % TERMS_CSV)
-    lines = [RULES.format(doc=(doc + " ") if doc else "",
-                          pages=args.pages,
-                          terms=terms_line(args.terms))]
-    for it in items:
-        lines.append("#%s" % it["key"])
-        body = ""
-        for j, (_pg, _idx, text, _tp) in enumerate(it["parts"]):
-            if j:
-                body += "⋮"
-            body += text
-        lines.append(body)
-    manifest = {"name": args.name, "pages": args.pages, "items": []}
-    for it in items:
-        manifest["items"].append({
-            "key": it["key"],
-            "merged": it["merged"],
-            # page 是**侧车内部坐标**(回调计数), imported.json / seg_inject 沿用它;
-            # true_page 是**真实 PDF 页码**(给人看、给报告用)。两者都留着, 是为了让
-            # 下游(seg_import 的报错与返工单)不必再自己重算一遍 pageid 口径。
-            "parts": [{"page": pg, "seg": idx, "true_page": tp}
-                      for pg, idx, _t, tp in it["parts"]],
-        })
 
-    os.makedirs(INBOX, exist_ok=True)
-    p_txt = os.path.join(INBOX, args.name + ".txt")
-    p_man = os.path.join(INBOX, args.name + ".manifest.json")
-    with open(p_txt, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
-    with open(p_man, "w", encoding="utf-8") as f:
-        json.dump(manifest, f, ensure_ascii=False, indent=1)
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--pages", required=True,
+                    help="真实 PDF 页码(与质检/体检报告同一口径), 如 2-4 或 2,3,4")
+    ap.add_argument("--name", required=True, help="payload 文件名(不含扩展名)")
+    ap.add_argument("--sidecar", default=SIDECAR, help="1.x: 侧车路径; 新论文请先归档 latest.jsonl 再用")
+    ap.add_argument("--tracking", default="",
+                    help="next: translate_tracking.json 路径; 缺省取工作根下最新一份(换论文会被覆盖)")
+    ap.add_argument("--pdf", default="",
+                    help="next: 原文 PDF 绝对路径; 跨页配对段靠它锚定页码(不给只影响报告的页码)")
+    ap.add_argument("--doc", default="", help='文档抬头, 如 "标题 (期刊, 年份)"; 缺省只写页码')
+    ap.add_argument("--terms", default=TERMS_CSV,
+                    help="术语表 csv (english,chinese 无表头); 缺省 %s; 传空串则不注入具体术语" % TERMS_CSV)
+    ap.add_argument("--force", action="store_true", help="续接检测失败也照常导出(逐段独立)")
+    args = ap.parse_args()
 
-    # ---- 报告 ----
-    total = sum(len(p[2]) for it in items for p in it["parts"])
-    print("payload: %s (%d 段 / %d 原文字符)" % (p_txt, len(items), total))
-    for m in merged_log:
-        print("  " + m)
-    for w in warnings:
-        print("  [警告] " + w)
-    for it in items:
-        loc = "+".join("p%d#%d" % (tp, idx) for _pg, idx, _t, tp in it["parts"])
-        t = it["parts"][-1][2] if not it["merged"] else it["parts"][-1][2][:25] + "…"
-        print("  %-5s %-12s %5dch  %s" % (
-            "#" + it["key"], loc,
-            sum(len(p[2]) for p in it["parts"]),
-            ("[合并] 头: " + it["parts"][0][2][:20] + "… 尾: " + t) if it["merged"]
-            else "尾: …" + t[-25:]))
-    return 0
+    # 引擎接线门禁: 未接线的引擎在这里拦下, 免得下游报一个看不懂的"侧车不存在: "。
+    _ok, _why = _PROF.stage_ok("export")
+    if not _ok:
+        print("FAIL: 引擎 %s 上未接线: %s" % (_PROF.key, _why))
+        return 2
+
+    pages_want = _ENG.parse_pages(args.pages)
+    if _PROF.seg_source == "tracking_json":
+        return export_next(args, pages_want)
+    return export_sidecar(args, pages_want)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """seg_import.py — 收豆包译文: 解析/对账/回锚 (M1 工具, 与 seg_export.py 配对)
 
-做什么:
+两条路线(由引擎画像决定, 见 engine.py):
+  pdf2zh 1.x  侧车路线
   1. 取译文: --clip 读剪贴板, 或 --text 指定文件 (豆包回复的全文)
   2. 解析: 按 #S编号 行切块 (容忍 markdown 加粗/代码围栏)
   3. 对账 manifest: 编号集合一致; 合并段 ⋮ 恰好 1 个且两侧非空; 普通段禁止 ⋮
@@ -9,9 +10,20 @@
      高价值字形 (含字母/数字) 找不到 -> FAIL; 纯标点找不到 -> 丢弃并记提示
      (定位口径: 标点半/全角等价 + 上标数字·OHM 号等 NFKC 同字写法 + 译文自己补的空格)
   5. 产出 out/<name>.imported.json: {(page,seg): 带{vN}的译文} + 校验报告
-  6. FAIL 时落一份**给豆包的返工单**到 inbox/<name>.rework.md(桥的 list_inbox /
-     get_payload 直接读得到): 每条写明 真实页码 + #S编号 + 缺的字符 + 原文上下文,
-     用户不必去理解控制台里的内部坐标; PASS 时把旧单子删掉, 免得读到过期结论。
+
+  next / BabelDOC  tracking 路线 (v28.41)
+  1. 取译文 / 解析 / 编号对账 —— 与上面同 (共用同一份实现)
+  2. **不回锚**: 载荷正文本来就是引擎原生形态({vN}/<style>), 收回来直接就能写回
+     缓存。1.x 那套"显示字形回锚成 {vN}"在这里没有对应物, 也不需要
+  3. 改判**守恒校验**: {vN} 与 <style> 标签的多重集逐段相等(上游自己的判据就是
+     full match), 译文里不许出现 ⋮
+  4. 产出 out/<name>.imported.json: {"S5": "译文"} (按 #S 编号; 段身份由 manifest
+     与段表共同确定, inject 侧再解析)
+
+  两条路线 FAIL 时都落一份**给豆包的返工单**到 inbox/<name>.rework.md(桥的
+  list_inbox / get_payload 直接读得到): 每条写明 真实页码 + #S编号 + 缺的字符 +
+  原文上下文, 用户不必去理解控制台里的内部坐标; PASS 时把旧单子删掉, 免得读到
+  过期结论。
 
 用法:
   python tools/seg_import.py --manifest inbox\\payload_p2_p4.manifest.json --clip
@@ -25,6 +37,7 @@ import re
 import subprocess
 import sys
 import unicodedata
+from collections import Counter
 
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 
@@ -517,6 +530,148 @@ def reanchor(seg_zh, raw, vars_):
     return "".join(res), fails, drops, notes
 
 
+def _ms(items):
+    """多重集 -> "a x2, b x1" 这种人读得懂的写法(返工单里要逐字点出缺了哪个)。"""
+    return ", ".join("%s x%d" % (k, n) for k, n in sorted(items.items()))
+
+
+def _ph_ms(s):
+    """`{vN}` 的多重集 —— **连花括号一起**(返工单要能逐字点出缺的是哪一个:
+    "少了 1 x1" 这种写法, 读的人还得自己回头想那是哪个占位符)。"""
+    return Counter(re.findall(r"\{v\d+\}", s or ""))
+
+
+def _fails_of(lack):
+    """不守恒的"缺"项 -> 返工单的 `fails` 字段 [(定位键, 显示值)]。
+
+    显示值 = 直接印给人看的东西(`{v1}` / `<style id='2'>`); 定位键给 glyph_context 用
+    —— 1.x 那边是字形号, 这里取 `{vN}` 的编号; 样式标签没有可查询的编号, 取标签本身,
+    查不到只是不打印"原文里它在哪"那一行, 不影响"缺的字符"。
+    """
+    out = []
+    for k in sorted(lack):
+        m = re.fullmatch(r"\{v(\d+)\}", k)
+        out.append((m.group(1) if m else k, k))
+    return out
+
+
+def _tag_ms(s):
+    """`<style id='n'>` / `</style>` 的多重集(连 id 一起比: id 变了就落到另一份样式上)。"""
+    return Counter(re.findall(r"</?style[^>]*>", s or ""))
+
+
+def import_next(args, man, blocks):
+    """next 路线: 收豆包译文 -> 守恒校验 -> out/<name>.imported.json (**无回锚**)。
+
+    与 1.x 的**本质差别**: 载荷正文本来就是引擎原生形态({vN}/<style>), 收回来直接
+    就能写回缓存 —— 不需要把"显示字形"回锚成 {vN}(那是 1.x 专有的: 它把还原过的
+    真字形喂给了译者, 收回来必须再还原回占位符)。
+
+    于是这里只剩**守恒校验**。判据与引擎同源, 不是我们自己发明的严格度:
+      1. 段号集合 = manifest(缺段/多段都 FAIL)
+      2. 每段 {vN} 的**多重集**守恒 —— 少一个 = 版面上少一处公式, 多一个 = 凭空多
+         出一处; 上游自己的判据就是 full match(段表里那个 `placeholder_full_match`)。
+         用集合而不是多重集就会漏掉"{v1} 出现两次却只写回一次"这类错, 所以按计数比。
+      3. `<style id='n'>`/`</style>` 多重集守恒 —— 标签丢了 = 那一小段的字体/样式
+         回落, 成品里表现为"某几个词突然换了字体"; id 也在比较范围内(id 变了就
+         落到了另一份样式上)。
+      4. 译文里不许出现 ⋮ —— next 的载荷不注入断点, 出现即译者自己加的, 会原样
+         印到纸上。
+    """
+    want = {it["key"]: it for it in man["items"]}
+    got = {int(k): v for k, v in blocks.items()}
+    report, detail, ok = [], [], True
+
+    # 源正文从**载荷本身**取 —— next 的 manifest 只落坐标不落正文(正文与载荷逐字相同,
+    # 再存一份只是重复), 而载荷正文就是 {vN}/<style> 原生形态, 与段表 input 同值。
+    # 拿载荷当判据还多一层好处: 豆包改的就是它, 两边是同一件东西。
+    pay = os.path.join(os.path.dirname(os.path.abspath(args.manifest)),
+                       (man.get("name") or "") + ".txt")
+    if not os.path.isfile(pay):
+        print("FAIL: 找不到载荷原文 %s —— 守恒校验要拿它当判据(manifest 只落坐标); "
+              "请与 manifest 一起保留 inbox/<name>.txt" % pay)
+        return 1
+    with open(pay, encoding="utf-8-sig") as f:
+        src_blocks = parse_blocks(f.read())
+
+    want_ids = {int(str(k).lstrip("S")) for k in want}
+    miss = sorted(want_ids - set(got))
+    extra = sorted(set(got) - want_ids)
+    if miss:
+        ok = False
+        report.append("FAIL 缺段: %s" % miss)
+    if extra:
+        ok = False
+        report.append("FAIL 多段: %s" % extra)
+
+    imported = {}
+    for key_s, it in sorted(want.items(), key=lambda kv: int(str(kv[0]).lstrip("S"))):
+        key = int(str(key_s).lstrip("S"))
+        zh = (got.get(key) or "").strip()
+        pg = (it.get("parts") or [{}])[0].get("page")
+        loc = "#S%d（第%d页%s）" % (key, pg, "·跨页" if it["pool"] == "cross_page" else "")
+        if not zh:
+            ok = False
+            report.append("FAIL %s 译文为空" % loc)
+            continue
+        if "\u22ee" in zh:
+            ok = False
+            report.append("FAIL %s 出现了 ⋮ —— 本路线不分页断点, 这是多写的, 会原样印到纸上" % loc)
+            zh = zh.replace("\u22ee", "")
+        src = src_blocks.get(key, "")
+        if not src:
+            ok = False
+            report.append("FAIL %s 载荷里没有这一段(编号对不上, 无法校验守恒)" % loc)
+            continue
+        for what, a, b in (("占位符", _ph_ms(src), _ph_ms(zh)),
+                           ("样式标签", _tag_ms(src), _tag_ms(zh))):
+            if a == b:
+                continue
+            ok = False
+            lack = {k: n for k, n in (a - b).items()}
+            more = {k: n for k, n in (b - a).items()}
+            why = []
+            if lack:
+                why.append("少了 %s" % _ms(lack))
+            if more:
+                why.append("多了 %s" % _ms(more))
+            line = ("FAIL %s %s不守恒: %s（载荷里 %s；译文里 %s）"
+                    % (loc, what, "; ".join(why), _ms(a), _ms(b)))
+            report.append(line)
+            if lack:
+                # 只把"缺的"编进返工单的"必须改"一节(与 1.x 回锚失败同一节 —— 那里能
+                # 指出原文位置)。"多了"没有原文位置可指, 原样留在「其他门禁失败」转述。
+                detail.append({"line": line, "key": key, "tp": pg,
+                               "fails": _fails_of(lack), "raw": src,
+                               "vv": {}, "moved": False})
+        imported[key_s] = zh
+
+    os.makedirs(OUTDIR, exist_ok=True)
+    out_json = os.path.join(
+        OUTDIR, os.path.basename(args.manifest).replace(".manifest.json", "") + ".imported.json")
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(imported, f, ensure_ascii=False, indent=1)
+
+    name = man.get("name") or os.path.basename(args.manifest).replace(".manifest.json", "")
+    note = os.path.join(INBOX, name + REWORK_SUFFIX)
+    if ok:
+        if os.path.exists(note):
+            os.remove(note)
+    else:
+        note = write_rework_note(man, args.manifest, report, detail) or note
+
+    print("--- 校验报告 ---")
+    for r in report:
+        print(r)
+    print("收下段数: %d" % len(imported))
+    print("产出: %s" % out_json)
+    if not ok:
+        print("返工单: %s" % note)
+        print("        (给豆包的: 让它 list_inbox / get_payload 读这个文件, 按上面点到的段改)")
+    print("结论: %s" % ("PASS" if ok else "FAIL"))
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--manifest", required=True)
@@ -547,6 +702,10 @@ def main():
     text = re.sub(r"^```[a-z]*\s*$", "", text, flags=re.M).strip()
     blocks = parse_blocks(text)
     print("来源: %s (%d 字符) -> 解析出 %d 段" % (src, len(text), len(blocks)))
+
+    # 两条路线(由引擎画像决定): next 的载荷本来就是原生形态 -> 只做守恒校验, 无回锚。
+    if _PROF.seg_source == "tracking_json":
+        return import_next(args, man, blocks)
 
     want = {it["key"]: it for it in man["items"]}
     got = {int(k): v for k, v in blocks.items()}

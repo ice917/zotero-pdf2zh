@@ -1,19 +1,30 @@
 # -*- coding: utf-8 -*-
 """seg_inject.py — 把豆包译文(imported.json)写回缓存库 (M1 最后一环)
 
-三道安全设计:
-  1. 重编号: 侧车 raw 用页级 {vN}, 缓存用段内 0 基 {vk} —— 按段内 token 顺序映射
-  2. 文档作用域: UPDATE 限定 translate_engine_params LIKE '%<doc_summary_fp>%'
-     (doc_summary_fp 是文档摘要的 md5, 跨文档唯一; 防止 'Introduction' 这类
-      短原文误伤其他文档的缓存行)
-  3. 前置断言: 更新前校验"缓存现译文 == 侧车 trans 重编号" (证明行集找对了);
-     占位符多重集 ⊆ 缓存 raw 的多重集 (渲染契约)
+两条路线(由引擎画像决定, 见 engine.py):
+  pdf2zh 1.x  侧车路线 —— 三道安全设计:
+    1. 重编号: 侧车 raw 用页级 {vN}, 缓存用段内 0 基 {vk} —— 按段内 token 顺序映射
+    2. 文档作用域: UPDATE 限定 translate_engine_params LIKE '%<doc_summary_fp>%'
+       (doc_summary_fp 是文档摘要的 md5, 跨文档唯一; 防止 'Introduction' 这类
+        短原文误伤其他文档的缓存行)
+    3. 前置断言: 更新前校验"缓存现译文 == 侧车 trans 重编号" (证明行集找对了);
+       占位符多重集 ⊆ 缓存 raw 的多重集 (渲染契约)
+
+  next / BabelDOC  tracking 路线 (v28.41, 见 inject_next):
+    没有侧车、没有页级 {vN}、没有文档指纹, 三道安全设计换成:
+    1. 段表与载荷**逐段对账**: 按 manifest 的定位键(src)落到段表那一条, 再用正文指纹
+       (fp)确认还是那一份 —— 不"重推段表再比坐标"(那要重放导出时的 --pdf 锚定, 参数
+       一变就整列错位); working 下的段表会被下次渲染覆盖, 真换了就拒收
+    2. 定位 = 对 original_text 精确匹配该段的**整条 prompt**(段表 llm_translate_trackers
+       [].input 里就有原文), 不需要作用域
+    3. 前置断言: 该行数组里 id==multi_paragraph_index 那一条的 output 必须等于段表
+       记下的 output(证明行找对了 + id 映射也对上了); 改完再复查该行
 
 用法:
   python tools/seg_inject.py --imported out\\payload_p2_p4.imported.json \\
-      --manifest inbox\\payload_p2_p4.manifest.json [--shift "S4:1"]
+      --manifest inbox\\payload_p2_p4.manifest.json [--shift "S4:1"] [--tracking <段表>]
   --shift: 合并段断点移位 "S4:1" = 把 part2 首字移到 part1 尾 (修豆包把
-           '可育' 拆到 ⋮ 两侧的情况)
+           '可育' 拆到 ⋮ 两侧的情况) —— **仅 1.x**; next 载荷按 #S 编号, 没有该坐标
 """
 import argparse
 import datetime
@@ -213,12 +224,285 @@ def raws_of_run(manifest_path, sidecar_path):
     return out
 
 
+def align_next(args):
+    """next 路线: 载荷 ↔ 段表**逐段对账** (inject 与 rollback **必须共用同一份口径**)。
+
+    撤销若用了不一样的定位口径, 就可能撤到别的段上去 —— 而两边都会"看起来对上了"。
+    返回 (items, mits, tk, err): err 非空即拒收(调用方 return 1)。
+    """
+    with open(args.manifest, encoding="utf-8") as f:
+        man = json.load(f)
+    if man.get("engine") != "next":
+        print("FAIL: 这份 manifest 的 engine=%r 不是 next —— 它是另一个引擎导出的载荷, "
+              "写进本画像的库只会静默无效" % man.get("engine"))
+        return None, None, "", "engine"
+    src = man.get("source") or {}
+    tk = args.tracking or (src.get("path") if src.get("kind") == "tracking_json" else "") or ""
+    if not tk or not os.path.exists(tk):
+        print("FAIL: 段表不存在: %s\n      用 --tracking 指回**导出这份载荷时**的那一份" % tk)
+        return None, None, tk, "tracking"
+
+    mits = man.get("items") or []
+    # 对账 = manifest 的定位键(src)逐条落回段表, 再用正文指纹(fp)确认还是那一份。
+    # **不重推段表再比坐标**: 载荷里的页号是导出时的锚定结果(给 --pdf 才锚, 不然按序
+    # 猜), 而 #S 编号的排序依赖页号 —— 重推时参数一变就整列错位, 会把一份好载荷判成
+    # "不是从当前段表导出的"(真样本 129 段里 #S11 起全错)。
+    try:
+        d = _ENG.load_tracking(tk)
+    except (IOError, ValueError) as e:
+        print("FAIL: 段表读不了: %s" % e)
+        return None, mits, tk, "load"
+    recs = []
+    for i, m in enumerate(mits, 1):
+        try:
+            rec, txt = _ENG.tracking_segment(d, m.get("src"))
+        except (TypeError, ValueError, KeyError, IndexError) as e:
+            print("FAIL: #S%d 在段表里定位不到(%s) —— working 下的 translate_tracking.json 会"
+                  "被**下一次渲染覆盖**, 这份载荷不是从当前段表导出的。用 --tracking 指回"
+                  "导出时那一份" % (i, e))
+            return None, mits, tk, "locate"
+        if _ENG.text_fp(txt) != (m.get("fp") or ""):
+            print("FAIL: #S%d 的正文与段表对不上 —— 段表里该位置现在是 %r(载荷导出时是另一"
+                  "份)。用 --tracking 指回导出这份载荷时的那一份" % (i, txt[:60]))
+            return None, mits, tk, "fp"
+        recs.append(rec)
+    items = [{"rec": r, "pool": m.get("pool") or "page"}
+             for r, m in zip(recs, mits)]
+    return items, mits, tk, ""
+
+
+def rollback_next(args):
+    """next 路线: 撤销 inject —— 把**我们写进去的那一条**改回引擎当时的译文。
+
+    为什么不直接拿 inject 前那份 `.bak` 整库还原: **缓存库是全机共用的**。`.bak` 是
+    "某一时刻的整库快照", 还原它会把快照之后**别的论文**合法落下的译文一并退掉 ——
+    一次撤销伤到无关的篇, 而且不报错。所以这里做**行级撤销**, 范围 = 本篇载荷那几段。
+
+    判据(与 1.x 的 `translation == original_text` 骨架行判据同精神): 只改"现行值 ==
+    imported.json 里我们注入的那一版"的那一条 —— 它证明这条改动确实出自我们这次注入。
+    值已经变了(别人又改过 / 引擎重译过) -> **不碰, 只报告**: 少了这条判据, 撤销就成了
+    "把引擎当时的译文强塞回去", 会覆盖别人的合法改动。
+
+    三个输入与 inject 完全一致(manifest + imported + 段表), 缺一不可 —— 它们分别是
+    "撤哪几段"(对账)、"撤的是不是我们那一版"(provenance)、"改回什么值 / 该批次的下标"。
+    """
+    if not args.imported or not os.path.exists(args.imported):
+        print("FAIL: 找不到 imported.json: %s" % (args.imported or "(未给)"))
+        return 1
+    with open(args.imported, encoding="utf-8") as f:
+        imported = json.load(f)
+    items, mits, tk, err = align_next(args)
+    if err:
+        return 1
+
+    con = sqlite3.connect(CACHE)
+    cur = con.cursor()
+    plan, gone = [], 0
+    for i, (it, m) in enumerate(zip(items, mits), 1):
+        key = "S%d" % i
+        if key not in imported:
+            continue
+        new = imported[key].strip()                 # 我们注入的那一版
+        old = it["rec"].get("output") or ""         # 引擎当时的译文 = 要还原成的值
+        # 页号只用于**报错时指路**, 取自 manifest(段表侧的锚定参数可能已不同)。
+        pg = (m.get("parts") or [{}])[0].get("page")
+        loc = "#S%d（第%s页%s）" % (
+            i, "?" if pg is None else pg,
+            "·跨页" if it["pool"] == "cross_page" else "")
+        prompts, mpi = _ENG.seg_cache_targets(it)
+        if not prompts or mpi is None or not old:
+            print("FAIL %s: 段表里缺 prompt / multi_paragraph_index / 当时的 output —— 还原"
+                  "不了(段表被换过或被截断), 绝不猜" % loc)
+            con.close()
+            return 1
+        for pr in prompts:
+            rows = cur.execute("SELECT id, translation FROM %s WHERE original_text=?"
+                               % _ENG.CACHE_TABLE, (pr,)).fetchall()
+            if not rows:
+                gone += 1
+                print("%s: 缓存里已无该批次的 prompt 行 -> 本次注入没有残留" % loc)
+                continue
+            for rid, raw in rows:
+                try:
+                    _lst, byid = _ENG.batch_entries(raw)
+                except Exception as exc:
+                    print("FAIL %s: 行 id=%s 的现行译文不是 JSON(%s) -> 拒收(不猜该改哪一条)"
+                          % (loc, rid, exc))
+                    con.close()
+                    return 1
+                now = byid.get(int(mpi))
+                if now == new:
+                    plan.append((loc, rid, int(mpi), old))
+                elif now == old:
+                    print("%s: 行 id=%s 已是引擎当时的译文(未注入或已还原), 不动" % (loc, rid))
+                else:
+                    print("%s: 行 id=%s 的 id=%d 现行值既不是我们注入的那版、也不是段表那版"
+                          " -> 已被别的改动覆盖, **不动**(怕抹掉别人的合法改动)"
+                          % (loc, rid, int(mpi)))
+    if not plan:
+        con.close()
+        print("还原行数: 0%s" % ("(prompt 行已不在, 无残留)" if gone else ""))
+        print("结论: PASS (无可撤)")
+        return 0
+
+    if not args.dry:
+        bak = CACHE + ".bak-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(CACHE, bak)
+        print("备份:", bak)
+    n = 0
+    for loc, rid, mpi, old in plan:
+        if args.dry:
+            print("%s: 行 id=%s 的 id=%d 将还原 (%d 字)" % (loc, rid, mpi, len(old)))
+            n += 1
+            continue
+        # 逐行**重读**再改: 同一行可能承载同批次的多段(plan 里就有多条落同一行)。
+        raw = cur.execute("SELECT translation FROM %s WHERE id=?" % _ENG.CACHE_TABLE,
+                          (rid,)).fetchone()
+        try:
+            lst, _byid = _ENG.batch_entries(raw[0] if raw else "")
+        except Exception:
+            print("  [FAIL 自检] 行 id=%s 在还原前读不回来了" % rid)
+            con.close()
+            return 1
+        for e in lst:
+            if int(e.get("id", -1)) == mpi:
+                e["output"] = old
+        cur.execute("UPDATE %s SET translation=? WHERE id=?" % _ENG.CACHE_TABLE,
+                    (json.dumps(lst, ensure_ascii=False, indent=4), rid))
+        print("  已还原 %d 行" % cur.rowcount)
+        n += 1
+    if not args.dry:
+        con.commit()
+    con.close()
+    print("还原行数: %d" % n)
+    print("结论: PASS%s" % (" (dry-run 未写库)" if args.dry else ""))
+    return 0
+
+
+def inject_next(args):
+    """next 路线: 把 imported.json({"S5": 译文}) 写回缓存库。
+
+    定位口径(与 1.x 的**根本差别**, 已实测: babeldoc/translator/translator.py:141-165):
+      next 的 LLM 通道键 = 引擎实际发出的**整条 prompt**(`llm_translate(final_input)`
+      -> `cache.get/set(final_input)`), 而这条 prompt 的原文就记在段表该段的
+      `llm_translate_trackers[].input` 里(上游 set_input 与 cache.set 用的是同一个字符串)。
+      于是:
+        * 定位 = 对 original_text 做**精确匹配**, 不需要 1.x 的 doc_summary_fp 作用域
+          —— 整条 prompt 自带文档上下文, 天然只属于本篇;
+        * 不需要 {vN} 重编号 —— 载荷正文就是原生形态;
+        * 要改的位置 = 该行 translation(上游原始回复, 一个 JSON 数组)里
+          `id == multi_paragraph_index` 的那一条(上游把批次各段按序塞进数组, id = 下标)。
+
+    前置断言(与 1.x 同精神, 专防"改错行/改错段"): 改之前, 该行数组里那一条的 output
+    必须**等于段表里记下的该段 output**(引擎当时写下的译文)。不等即拒收 —— 它同时
+    证明了两件事: 行找对了, id 映射也对上了。写完再复查一次该行是否真的变了。
+    """
+    with open(args.imported, encoding="utf-8") as f:
+        imported = json.load(f)
+    items, mits, _tk, err = align_next(args)
+    if err:
+        return 1
+
+    if not args.dry:
+        bak = CACHE + ".bak-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(CACHE, bak)
+        print("备份:", bak)
+
+    con = sqlite3.connect(CACHE)
+    cur = con.cursor()
+    ok, n_rows, n_segs = True, 0, 0
+    for i, (it, m) in enumerate(zip(items, mits), 1):
+        key = "S%d" % i
+        if key not in imported:
+            continue
+        new = imported[key].strip()
+        # 页号只用于**报错时指路**, 取自 manifest(段表侧的锚定参数可能已不同, 见上)。
+        pg = (m.get("parts") or [{}])[0].get("page")
+        loc = "#S%d（第%s页%s）" % (
+            i, "?" if pg is None else pg,
+            "·跨页" if it["pool"] == "cross_page" else "")
+        if not new:
+            ok = False
+            print("FAIL %s: imported.json 里是空译文" % loc)
+            continue
+        prompts, mpi = _ENG.seg_cache_targets(it)
+        cur_out = it["rec"].get("output") or ""
+        if not prompts:
+            ok = False
+            print("FAIL %s: 段表里这段没有 llm_translate_trackers —— 这篇不是走 LLM 通道"
+                  "跑的(或跑的时候没开缓存), 没有行可写" % loc)
+            continue
+        if mpi is None:
+            ok = False
+            print("FAIL %s: 段表里这段没有 multi_paragraph_index, 定不了它在批次 JSON 里的 "
+                  "id —— 绝不猜(猜错就是改到同批另一段的译文上)" % loc)
+            continue
+        if not cur_out:
+            ok = False
+            print("FAIL %s: 段表里没记下这段当时的译文, 无从做前置断言 -> 拒收" % loc)
+            continue
+        n_segs += 1
+        for pr in prompts:
+            rows = cur.execute("SELECT id, translation FROM %s WHERE original_text=?"
+                               % _ENG.CACHE_TABLE, (pr,)).fetchall()
+            if not rows:
+                ok = False
+                print("FAIL %s: 缓存里找不到该批次的 prompt 行 —— 这篇不是用 LLM 通道跑的, "
+                      "或缓存被清过(同一份 prompt 是精确键, 不存在近似命中)" % loc)
+                continue
+            for rid, raw in rows:
+                try:
+                    lst, byid = _ENG.batch_entries(raw)
+                except Exception as exc:
+                    ok = False
+                    print("FAIL %s: 行 id=%s 的现行译文不是 JSON(%s) -> 拒收" % (loc, rid, exc))
+                    continue
+                if byid.get(int(mpi)) != cur_out:
+                    ok = False
+                    print("FAIL %s: 前置断言不成立 —— 行 id=%s 里 id=%d 的现行译文与段表对不上;"
+                          "\n      段表: %r\n      缓存: %r\n      不做任何写入"
+                          % (loc, rid, int(mpi), cur_out[:80], str(byid.get(int(mpi)))[:80]))
+                    continue
+                for e in lst:
+                    if int(e.get("id", -1)) == int(mpi):
+                        e["output"] = new
+                txt = json.dumps(lst, ensure_ascii=False, indent=4)
+                if args.dry:
+                    print("%s: 行 id=%s 的 id=%d 将被改写 (%d 字 -> %d 字)"
+                          % (loc, rid, int(mpi), len(cur_out), len(new)))
+                    n_rows += 1
+                    continue
+                cur.execute("UPDATE %s SET translation=? WHERE id=?" % _ENG.CACHE_TABLE,
+                            (txt, rid))
+                print("  已更新 %d 行" % cur.rowcount)
+                n_rows += 1
+                # 自检: 复查该行现在真带着新译文(防写进了被遮蔽的世代)
+                now = cur.execute("SELECT translation FROM %s WHERE id=?" % _ENG.CACHE_TABLE,
+                                  (rid,)).fetchone()
+                try:
+                    _l2, b2 = _ENG.batch_entries(now[0] if now else "")
+                except Exception:
+                    b2 = {}
+                if b2.get(int(mpi)) != new:
+                    ok = False
+                    print("  [FAIL 自检] 行 id=%s 写后复查没读到新译文" % rid)
+    if not args.dry:
+        con.commit()
+    con.close()
+    print("涉及段数: %d / 命中行数: %d" % (n_segs, n_rows))
+    print("结论: %s%s" % ("PASS" if ok else "FAIL", " (dry-run 未写库)" if args.dry else ""))
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--imported", default="")
     ap.add_argument("--manifest", default="")
     ap.add_argument("--shift", default="", help='如 "S4:1,S9:2"')
     ap.add_argument("--sidecar", default=SIDECAR, help="侧车路径; 新论文先归档 latest.jsonl 再指向它")
+    ap.add_argument("--tracking", default="",
+                    help="next: translate_tracking.json 路径; 缺省用 manifest.source.path "
+                         "(working 下那份会被下次渲染覆盖, 换篇后要用 --tracking 指回导出时那一份)")
     ap.add_argument("--fp", default="",
                     help="文档指纹; 缺省自动探测(平票取最后写入的世代; 探测失败回落 Cactaceae 默认)")
     ap.add_argument("--dry", action="store_true", help="只演算不写库")
@@ -234,6 +518,19 @@ def main():
         return 2
 
     if args.rollback:
+        # [v28.43] next 的撤销必须**在**读侧车之前分流 —— next 没有侧车, 下面那段
+        # (按 页码#段号 从侧车取原文当作用域)在 next 上会当场 KeyError。
+        if _PROF.seg_source == "tracking_json":
+            if args.fp:
+                print("FAIL: --fp 是 1.x 的文档作用域指纹; next 的撤销按段表逐段定位, "
+                      "不需要它")
+                return 1
+            if not args.imported or not args.manifest:
+                print("FAIL: next 的 --rollback 需要 --imported 与 --manifest —— 它们分别是"
+                      "\"撤的是我们注入的那一版\"与\"撤哪几段\";\n"
+                      "      两个都由 import 阶段产出/登记, 台账里能查到路径")
+                return 1
+            return rollback_next(args)
         raws = []
         if os.path.exists(args.sidecar):
             try:
@@ -245,6 +542,17 @@ def main():
     if not args.imported or not args.manifest:
         print("FAIL: 非 --rollback 模式必须给 --imported 与 --manifest")
         return 1
+
+    # [v28.41] next 路线在此分流: 定位口径是"整条 prompt 精确匹配 + 改批次 JSON 里
+    # id==multi_paragraph_index 那一条", 与 1.x 的侧车/页级重编号/fp 作用域没有对应物。
+    # 必须**在**下面读侧车之前分流 —— next 没有侧车, 那段代码在 next 载荷上会当场炸
+    # KeyError(它按 页码#段号 取址, 而 next 载荷的坐标是 #S 阅读序)。
+    if _PROF.seg_source == "tracking_json":
+        if args.shift:
+            print("FAIL: --shift 是 1.x 合并段(⋮ 两侧)的断点移位口径; next 载荷按 #S 编号, "
+                  "没有对应的段坐标可移")
+            return 1
+        return inject_next(args)
 
     with open(args.imported, encoding="utf-8") as f:
         imported = json.load(f)
