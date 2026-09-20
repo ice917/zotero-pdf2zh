@@ -26,14 +26,18 @@ docs/
 zotero-pdf-2-zh-*.xpi
 
 # 开源红线二期: 含本机路径的工具/文档 (本地保留, 暂不开源)
+# [2026-09-20 v28.30] tools/tests/ 与 tools/sync_patches.ps1 已脱敏入库:
+#   本机路径一律改为 sys.prefix / PDF2ZH_PYTHON / PDF2ZH_VENV_SITE 派生(不含用户名),
+#   公开 clone 跑 tools/tests/run_all.py 应当全绿(被测对象缺失的套件自动 SKIP)。
+#   契约: 入库脚本里不得出现 C:\Users\<某人>(用户身份) 或焊死到某个 venv 的绝对路径。
+#   项目默认根 D:\zotero-pdf2zh 作兜底缺省是既有约定(有 P2Z_PROJ 覆盖), 不算违规。
 logs/
 UPGRADE_RUNBOOK.md
 server/md-translate/md2pdf.py
 tools/seam_review.py
 tools/seams_report.py
 tools/strategist.py
-tools/sync_patches.ps1
-tools/tests/
+tools/tests/test_strategist.py
 zotero-pdf-2-zh-*.xpi
 
 # 密钥红线: 含真实 key 的配置 (模板 *.example 不受影响)

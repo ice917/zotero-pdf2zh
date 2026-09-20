@@ -425,7 +425,7 @@ Cactaceae 实战修复全部落地。但军师层的实战同时暴露了天花�
 | 发现 | 处置 |
 |---|---|
 | `relink_pages.py` 的 `kept`、`converter.py` 里双指针方案的残留 `lo, hi` | 删（死变量不会自己消失，只会骗下一个读代码的人） |
-| `tools/tests/test_strategist.py` **被跟踪**，但它 import 的 `tools/strategist.py` 未开源 | `git rm --cached` 取消跟踪（本地文件保留）——**别人 clone 下来这个测试必然跑不动**，入库就是坏的 |
+| `tools/tests/test_strategist.py` **被跟踪**，但它 import 的 `tools/strategist.py` 未开源 | `git rm --cached` 取消跟踪（本地文件保留）——**别人 clone 下来这个测试必然跑不动**，入库就是坏的。(v28.30 收口：`tools/tests/` 曾**整体**一并不入库，比这一条更宽；本轮脱敏后整体入库，仅 `test_strategist.py` 仍排除，`run_all.py` 对它自动 SKIP。) |
 | `server/README-v4.0.1.pdf`（5.2 MB）与 v4.1.7 并存、全仓零引用 | 删旧留新 |
 | **上游死代码 18 处**（`io` / `datetime` / `needUpdate` / `source_mode` …） | **不动**：特征是在上游底座与我们的镜像里**成对出现** = 上游自身的死代码，改它等于往"最小可审计补丁集"里掺非自研改动 |
 | AST 函数级孤儿扫描（460 个 py/md/ps1） | `tools/` **0 命中**——我们的工具没有"定义了没人调用"的函数 |
@@ -437,3 +437,59 @@ Cactaceae 实战修复全部落地。但军师层的实战同时暴露了天花�
 
 > 一句话：**能让别人装 ≠ 已经验证别人装。** 这一章把"装不上"从"未知"变成"已知且已修"，
 > 但"别人装完能不能跑通"这句话，只有在干净目录里真跑一遍之后才配说。
+
+### v28.30 对外分发：工具链入库 + 只装插件时的等价校验
+
+上一章留下一个悬案：`tools/tests/` 整体不入库，于是公开分支里 `run_all.py` 必然跑不动 ——
+**自己的回归门禁对外是句空话**。本轮把这条收口。
+
+**为什么之前不入库、这次为什么可以。** 之前的理由只有一条：含本机路径。逐文件体检后，
+`tools/tests/` 21 个文件里**没有人名、没有密钥、没有论文原文**，只有 10 处「一行式」本机默认值：
+
+```python
+_VENV_SITE = os.environ.get("PDF2ZH_VENV_SITE", r"D:\Users\<user>\...\Lib\site-packages")
+```
+
+`run_all.py` 的解释器默认值、`sync_patches.ps1` 的 `$venvSite` 同类。这类默认值**不需要删掉，改成派生即可**：
+
+| 位置 | 改后 |
+|---|---|
+| 10 处 `_VENV_SITE` 默认值 | `os.path.join(sys.prefix, "Lib", "site-packages")` |
+| `run_all.py` 解释器默认值 | `sys.executable`（用哪个 python 跑 runner，就用哪个跑套件） |
+| `sync_patches.ps1` 的 `$venvSite` | `$env:PDF2ZH_VENV_SITE` → `$env:PDF2ZH_PYTHON` 同级推导 |
+
+本机行为逐字不变（用 venv python 跑，`sys.prefix` 就是那个 venv），换台电脑自动跟随。
+反过来说，**已入库**的 `adopt.py` / `doubao_bridge.py` / `post_check.py` 里本来就公开写着
+SILAGE / wang2026 / EgoPhys 这些论文名与事故背景 —— 所以 `tools/tests/` 入库**不引入任何新的泄露类别**。
+契约写进 `.gitignore`：**入库脚本里不得出现 `C:\Users\<某人>`（用户身份）或焊死到某个 venv 的绝对路径**；
+项目默认根 `D:\zotero-pdf2zh` 作兜底缺省是既有约定（有 `P2Z_PROJ` 覆盖），不算违规。
+
+**入库清单与 SKIP 契约。**
+
+- 入库 `tools/tests/`（20 套件 + `run_all.py`）与 `tools/sync_patches.ps1`；
+- 唯独 `tools/tests/test_strategist.py` 仍排除 —— 它的被测对象 `tools/strategist.py` 属"含本机路径、本地保留"；
+- 于是 `run_all.py` 新增 `OPTIONAL_SUBJECTS`：**套件文件缺、或缺被测对象 → SKIP 并单列，不算失败**。
+  不这么做，别人 clone 下来一片红，回归就从"门禁"退化成"噪音" —— 这正是上一章那条教训的正面做法；
+- 顺带给 `sync_patches.ps1` 补了 UTF-8 BOM：PS 5.1 在**无 BOM** 时按 ANSI 解码，中文字节错位会
+  吞掉后面的引号 → 报"字符串缺少终止符"（本轮真踩到，改完才发现）。
+
+| 验证 | 结果 |
+|---|---|
+| 本机全量回归 | 20 套件全绿、**0 SKIP** |
+| 模拟公开 clone（临时移走 `strategist.py`） | `SKIP 本机未部署: tools/strategist.py`，退出码 **0** |
+| `sync_patches.ps1` | 11/11 PASS，`patches/` 无改动（仍一致） |
+
+**只装插件/服务、没有开发工具链时的等价校验。** `run_all.py` 是**开发侧**门禁，普通用户不需要跑它。
+对应的运行期校验是现成的、**不依赖 `tools/tests/`**：
+
+| 关注点 | 开发侧套件 | 运行期等价做法 |
+|---|---|---|
+| 服务起得来 / 任务状态机 | `test_failure_brief` / `test_progress_log` | `GET /health`；`/api/history` 看任务状态 |
+| 译文没被漏译、文献区没被汉化 | `test_post_check` / `test_pre_check` | 翻译后**自动**落的 `server/translated/review/`：`翻译后质检_*.md`（门禁判定 PASS/FAIL）、`翻译前体检_*.md`（推荐 skipLastPages）——判据与这两个套件同源 |
+| 交件本身合格 | `test_adopt`（六道内容门禁） | `tools/adopt.py deliver` 的台账 `logs/adopt/<name>.json`；被拒时看 `review/门禁拒收_*.md`（逐段清单）；`--dry` 先演算不落库 |
+| 补丁与镜像一致 | `test_mirrors_sync` | `tools/sync_patches.ps1`（11 项 MD5，任一不一致退出码 1） |
+
+> 一句话：**开发侧的门禁是"改代码前后必须跑"，用户侧的门禁是"每次翻译自动跑"。**
+> 后者不依赖 `tools/tests/`，所以工具链此前不入库，也**没有**让用户侧失去保护 ——
+> 丢掉的只是"别人能自己复核这套判据"的能力，本轮补回。
+
