@@ -17,11 +17,18 @@
   2. 不含装配前缀【待译】/【任务】—— 防止把"发出去的 job 文本"当成回包(它编号也齐全)
   3. 过半单元含中日韩字符 —— 防止把英文原文当成译文
 
+**本脚本不设确认环节, 这是它的取舍**: 复制即执行, 零交互。
+代价是"复制不全"里有一类拦不住 —— 实测(2026-09-21): 把真实回包的**末行截断 3 字符**,
+`k115\t两种传粉者` 变成 `k115\t两种`, 编号齐全 / 占位符未丢 / 非空 -> **G1-G5 全过**,
+直接跑完出稿。门禁的锚点是编号与占位符, "末行被吃掉一截但还剩内容"两者都不触发,
+**判据够不到**。要拦住它只能把人放回回路里 —— 见 panel.py(检查/确认两段, 带核对表)。
+
 零依赖: 剪贴板走 ctypes 调 Win32 API, 不需要 pyperclip/win32clipboard。
 用法:
   python watch_clip.py          常驻监听(默认), 命中后自动对账+出附录, Ctrl+C 停止
   python watch_clip.py --once   只处理当前剪贴板一次就退出(自检用)
   python watch_clip.py --no-open  出稿后不自动打开 DOCX
+  python panel.py               有确认环节的面板(推荐入口)
 """
 import ctypes
 import hashlib
@@ -46,13 +53,14 @@ D = os.environ.get("P2Z_TABLE_DIR") or SD                # 工作目录(数据�
 PY = sys.executable
 DOCX = os.path.join(D, "appendix_tables_zh.docx")
 
-# 两类任务: 装配器 -> 回包文件 -> 对账器
+# 两类任务: 装配器 -> 待译文本 -> 回包文件 -> 对账器
+# panel.py 复用本表, 不要另起一份。
 JOBS = [
     dict(label="表格正文", pre="k", manifest="job_manifest.json",
-         resp="job_response.tsv",
+         job="job_doubao.txt", resp="job_response.tsv",
          cmd=lambda: [PY, os.path.join(SD, "check_job.py"), "job_response.tsv"]),
     dict(label="表注", pre="n", manifest="notes_manifest.json",
-         resp="job_notes_response.tsv",
+         job="job_notes_doubao.txt", resp="job_notes_response.tsv",
          cmd=lambda: [PY, os.path.join(SD, "mk_notes_job.py"), "check",
                       "job_notes_response.tsv"]),
 ]
@@ -75,11 +83,26 @@ k32.GlobalLock.argtypes = [wintypes.HGLOBAL]
 k32.GlobalLock.restype = ctypes.c_void_p
 k32.GlobalUnlock.argtypes = [wintypes.HGLOBAL]
 k32.GlobalUnlock.restype = wintypes.BOOL
+k32.GlobalAlloc.argtypes = [wintypes.UINT, ctypes.c_size_t]
+k32.GlobalAlloc.restype = wintypes.HGLOBAL
+k32.GlobalFree.argtypes = [wintypes.HGLOBAL]
+k32.GlobalFree.restype = wintypes.HGLOBAL
+u32.EmptyClipboard.argtypes = []
+u32.EmptyClipboard.restype = wintypes.BOOL
+u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
+u32.SetClipboardData.restype = wintypes.HANDLE
 
 
 def read_clip():
-    """读剪贴板纯文本; 剪贴板被别的进程占住时返回 None(下次轮询再试, 不当错误)"""
-    if not u32.OpenClipboard(None):
+    """读剪贴板纯文本; 剪贴板被别的进程占住时短重试(最多 ~0.6s), 仍占住才返回 None。
+
+    占住是常态而非异常: 浏览器/剪贴板管理器会瞬时持有锁(实测自动化浏览器点按钮时
+    一直占着), 单次 OpenClipboard 失败就放弃会把"稍等就好"误判成"没有文本"。"""
+    for _ in range(5):
+        if u32.OpenClipboard(None):
+            break
+        time.sleep(0.12)
+    else:
         return None
     try:
         if not u32.IsClipboardFormatAvailable(CF_UNICODETEXT):
@@ -98,64 +121,104 @@ def read_clip():
         u32.CloseClipboard()
 
 
+def write_clip(text):
+    """写剪贴板纯文本。panel.py(网页版)的「① 复制待译文本」走这里 —— 服务器进程
+    没有 tk 主循环, 直接调 Win32。占住/失败返回 False, 不抛。"""
+    data = text.encode("utf-16-le") + b"\x00\x00"
+    h = k32.GlobalAlloc(0x0042, len(data))          # GMEM_MOVEABLE | GMEM_ZEROINIT
+    if not h:
+        return False
+    p = k32.GlobalLock(h)
+    if not p:
+        k32.GlobalFree(h)
+        return False
+    ctypes.memmove(p, data, len(data))
+    k32.GlobalUnlock(h)
+    for _ in range(5):                          # 占住多为瞬时, 短重试同 read_clip
+        if u32.OpenClipboard(None):
+            break
+        time.sleep(0.12)
+    else:
+        k32.GlobalFree(h)
+        return False
+    try:
+        u32.EmptyClipboard()
+        if not u32.SetClipboardData(CF_UNICODETEXT, h):
+            k32.GlobalFree(h)
+            return False
+    finally:
+        u32.CloseClipboard()
+    return True
+
+
 # ---------------------------------------------------------------- 识别与对账
+
+def manifest_units(path):
+    with io.open(os.path.join(D, path), encoding="utf-8") as f:
+        return json.load(f)["units"]
+
 
 def manifest_ids(path):
     """按 manifest 里的顺序返回编号列表 —— 回包按此顺序落盘, 保证文件确定性"""
-    with io.open(os.path.join(D, path), encoding="utf-8") as f:
-        return [u["id"] for u in json.load(f)["units"]]
+    return [u["id"] for u in manifest_units(path)]
 
 
 def parse_units(text, ids, pre):
-    """从剪贴板文本里抽 编号<分隔>译文。网页渲染会把 TAB 转成空格, 两种都认。"""
+    """从剪贴板文本里抽 编号<分隔>译文。网页渲染会把 TAB 转成空格, 两种都认。
+
+    返回**读到多少算多少** —— 齐不齐由调用方判。panel.py 要拿"缺哪几条"的明细
+    给用户看, 所以这里不在这里截断。重复编号取首条(与 check_job.py 同口径)。
+    """
     got = {}
     rx = re.compile(r"^(%s\d{3})[\t ](.*)$" % pre)
     for ln in text.splitlines():
         m = rx.match(ln.rstrip("\r"))
-        if m:
+        if m and m.group(1) not in got:
             got[m.group(1)] = m.group(2).strip()
-    return got if all(i in got for i in ids) else None
+    return got
 
 
-def match_job(text):
-    """判断这段剪贴板是哪一个任务的回包。返回 (job, got) 或 None。"""
+def match_job(text, log=print):
+    """判断这段文本是哪一个任务的**完整**回包。返回 (job, ids, got) 或 None。"""
     if any(m in text for m in PREAMBLE_MARK):
         return None                       # 是发出去的 job 文本, 不是回包
     for job in JOBS:
         ids = manifest_ids(job["manifest"])
         got = parse_units(text, ids, job["pre"])
-        if not got:
+        if not got or not all(i in got for i in ids):
             continue
         n_cjk = sum(1 for v in got.values() if CJK.search(v))
         if n_cjk * 2 < len(got):
-            print("  疑似非译文(含中日韩字符的单元 %d/%d), 已跳过" % (n_cjk, len(got)))
+            log("  疑似非译文(含中日韩字符的单元 %d/%d), 已跳过" % (n_cjk, len(got)))
             return None
         return job, ids, got
     return None
 
 
-def run_job(job, ids, got):
+def run_job(job, ids, got, log=print):
     """落盘 -> 对账 -> 通过则出附录。返回 True 表示全链通过。"""
     resp = os.path.join(D, job["resp"])
     with io.open(resp, "w", encoding="utf-8") as f:
         for uid in ids:
             f.write("%s\t%s\n" % (uid, got[uid]))
-    print("  回包已落盘 -> %s (%d 单元)" % (job["resp"], len(got)))
+    log("  回包已落盘 -> %s (%d 单元)" % (job["resp"], len(got)))
 
     p = subprocess.run(job["cmd"](), cwd=D, capture_output=True, text=True,
                        encoding="utf-8", errors="replace")
-    print("\n".join("  " + ln for ln in (p.stdout or "").splitlines()))
+    for ln in (p.stdout or "").splitlines():
+        log("  " + ln)
     if p.returncode != 0:
-        print("  ✗ 门禁未过, 未出稿。修正后重新复制回复即可(本脚本会再抓一次)。")
+        log("  ✗ 门禁未过, 未出稿。修正后重新复制回复即可(本脚本会再抓一次)。")
         return False
 
     a = subprocess.run([PY, os.path.join(SD, "mk_appendix.py")], cwd=D,
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
-    print("\n".join("  " + ln for ln in (a.stdout or "").splitlines()))
+    for ln in (a.stdout or "").splitlines():
+        log("  " + ln)
     if a.returncode != 0:
-        print("  ✗ 排版失败:\n" + (a.stderr or "")[-800:])
+        log("  ✗ 排版失败:\n" + (a.stderr or "")[-800:])
         return False
-    print("  ✓ 附录已出 -> %s" % DOCX)
+    log("  ✓ 附录已出 -> %s" % DOCX)
     return True
 
 
@@ -169,19 +232,19 @@ def beep(ok=True):
 
 # ---------------------------------------------------------------- 主循环
 
-def handle(text, open_docx=True):
-    hit = match_job(text)
+def handle(text, open_docx=True, log=print):
+    hit = match_job(text, log=log)
     if not hit:
         return False
     job, ids, got = hit
-    print("\n[%s] 识别到「%s」回包: %d 单元" % (time.strftime("%H:%M:%S"), job["label"], len(got)))
-    ok = run_job(job, ids, got)
+    log("\n[%s] 识别到「%s」回包: %d 单元" % (time.strftime("%H:%M:%S"), job["label"], len(got)))
+    ok = run_job(job, ids, got, log=log)
     beep(ok)
     if ok and open_docx:
         try:
             os.startfile(DOCX)
         except Exception as e:
-            print("  (自动打开失败: %s)" % e)
+            log("  (自动打开失败: %s)" % e)
     return True
 
 
