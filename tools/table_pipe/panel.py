@@ -34,9 +34,15 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
 网页版特有的两条契约:
   退出: 页面关窗前 sendBeacon 打 /api/bye -> 进 15s 宽限期, 期内有新心跳(F5 刷新 /
         别的页面还活着)则告别作废, 否则退出; 兜底是心跳, 收过心跳后
-        IDLE_LIMIT(600s) 没再收到也算"窗口已关"。两条阈值都要按最坏用户行为定 ——
+        IDLE_LIMIT(1800s) 没再收到也算"窗口已关"。两条阈值都要按最坏用户行为定 ——
         30s 心跳会把"切去豆包翻页"误杀(实测); 立即退会把 F5 刷新和"验收浏览器先关"
         变成自杀(实测)。
+        1800s 只是**估**"窗口还在不在": 估宽的代价是窗口真死了还要霸着端口半小时
+        (下次启动只能回落随机端口, 而用户手里那扇旧窗连的是死服务器 —— 2026-09-21
+        实测踩过)。所以这条兜底做成**用户可控**: 面板头部显示倒计时, 一键暂停/继续
+        (idle_state / /api/idle)。暂停只停"心跳静默自灭"这条腿; 关窗的告别依然生效,
+        否则暂停就成了孤儿进程的制造机。暂停态**只在内存**(不落盘): 崩一次后还留着
+        "已暂停"的旧状态, 正是上面那个端口被占的坑。
   改动作废: /api/check 记下当时文本的 sha1, /api/commit 发现文本变了直接拒绝 ——
             "确认"不可能按在过期内容上(服务器端强制, 不只靠前端禁用按钮)。
 
@@ -380,6 +386,9 @@ header.glass{display:flex;align-items:center;gap:12px;padding:13px 18px}
 .ttl{display:flex;align-items:center;gap:9px;font-weight:700;font-size:16px;white-space:nowrap}
 .dot{width:10px;height:10px;border-radius:50%;background:linear-gradient(135deg,var(--primary),var(--primary-dark));box-shadow:0 0 10px var(--primary)}
 .wd{flex:1;color:var(--muted);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:right}
+/* 兜底退出倒计时: 距"心跳静默自灭"还剩多久 —— 数字等宽, 免得每秒跳字时整行左右抖 */
+.idle-time{font-variant-numeric:tabular-nums;white-space:nowrap}
+.idle-time.paused{color:var(--warn)}
 section.glass{padding:14px 18px}
 .row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
 .spread{justify-content:space-between;margin-bottom:10px}
@@ -482,6 +491,8 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
   <header class="glass">
     <div class="ttl"><span class="dot"></span>翻译中继</div>
     <div class="wd" id="workdir"></div>
+    <span class="muted idle-time" id="idleTxt">—</span>
+    <button class="btn small" id="idleBtn" type="button" title="窗口真关掉后服务器靠心跳静默自灭; 拿不准就暂停">暂停自动退出</button>
     <button class="btn small" id="themeBtn" type="button">切到浅色</button>
   </header>
 
@@ -825,7 +836,41 @@ function mkDropdown(el){
   return el;
 }
 var taskDD=mkDropdown($('taskSel'));
-function ping(){fetch('/api/ping').catch(function(){})}
+/* 兜底退出倒计时(用户可控)。剩余秒数一律以**服务器**给的为准(前端算会漂),
+   两次心跳之间才做本地递减 —— 否则每 5s 才跳一次数字, 看着像卡住。
+   暂停只停"心跳静默自灭"; 关窗的告别腿照走, 所以暂停后关窗仍会退出。 */
+function mmss(s){var m=Math.floor(s/60);return m+':'+('0'+(s%60)).slice(-2)}
+function renderIdle(d){
+  if(!d)return;
+  window.__idle=d;
+  window.__idleAt=Date.now();
+  var t=$('idleTxt');
+  t.className='muted idle-time'+(d.off?' paused':'');
+  if(d.off)t.textContent='自动退出已暂停';
+  else if(d.left===null)t.textContent='等待窗口心跳…';
+  else t.textContent='自动退出 '+mmss(d.left);
+  $('idleBtn').textContent=d.off?'继续倒计时':'暂停自动退出';
+}
+setInterval(function(){
+  var d=window.__idle;
+  if(!d||d.off||d.left===null)return;
+  var left=d.left-Math.floor((Date.now()-window.__idleAt)/1000);
+  $('idleTxt').textContent='自动退出 '+mmss(Math.max(0,left));
+},1000);
+$('idleBtn').addEventListener('click',function(){
+  var off=!(window.__idle&&window.__idle.off);
+  api('/api/idle',{off:off}).then(function(r){
+    if(r.error){log('✗ '+r.error);return}
+    renderIdle(r.idle);
+    log(off?('已暂停兜底退出: 服务器不会再因心跳静默自灭。收工时直接关窗即可'
+             +'(关窗的告别腿仍在), 或点「继续倒计时」放它自己退。')
+           :'已恢复兜底退出倒计时(时钟已归零, 从 '+mmss(window.__idle.limit)+' 重新开始)。');
+  });
+});
+function ping(){
+  fetch('/api/ping').then(function(r){return r.json()})
+    .then(function(s){if(s)renderIdle(s.idle)}).catch(function(){});
+}
 document.addEventListener('visibilitychange',function(){
   // 从豆包切回来立即心跳唤醒, 不等被浏览器节流的 setInterval —— 防"服务器已自杀"
   if(!document.hidden)ping();
@@ -835,6 +880,7 @@ api('/api/state').then(function(s){
   taskDD.setOptions(s.jobs||[]);
   $('workdir').textContent='工作目录 '+(s.workdir||'');
   theme=s.theme||theme;applyTheme();
+  renderIdle(s.idle);
   ping();setInterval(ping,5000);
 });
 </script>
@@ -847,8 +893,31 @@ api('/api/state').then(function(s){
 
 IDLE_LIMIT = 1800    # 心跳静默多少秒算"窗口已关"(30min: 用户切去豆包翻长文, 后台标签被浏览器节流/冻结)
 BYE_GRACE = 15       # 收到告别后的宽限秒数
-STATE = {"checked": None, "sha": None, "ping": None, "bye_at": None}
+STATE = {"checked": None, "sha": None, "ping": None, "bye_at": None, "idle_off": False}
 LOCK = threading.Lock()
+
+
+def idle_state():
+    """兜底退出的当前状态 -> {"off", "left", "limit"}。前端倒计时与暂停按钮的唯一数据源。
+
+    left = 距自灭还剩多少秒; None 表示**数不出来** —— 要么用户暂停了(off), 要么还没收到过
+    任何心跳(窗口可能还没开起来, 这时不该吓唬人说"马上要退")。前后端各自算一遍剩余秒数
+    没有意义(时钟漂移), 故 remaining 一律由服务器给, 前端只在两次心跳之间做本地递减。
+    """
+    with LOCK:
+        off, p = STATE["idle_off"], STATE["ping"]
+    left = None if (off or p is None) else max(0, int(IDLE_LIMIT - (time.time() - p)))
+    return {"off": off, "left": left, "limit": IDLE_LIMIT}
+
+
+def set_idle_off(off):
+    """暂停/继续兜底退出 -> 新状态。**继续时把心跳时钟归零** —— 暂停期间的心跳早已过期,
+    不归零就会在恢复的下一秒立刻自灭(用户点了"继续"却看到服务器当场死掉)。"""
+    with LOCK:
+        STATE["idle_off"] = bool(off)
+        if not off:
+            STATE["ping"] = time.time()
+    return idle_state()
 
 
 def _sha(text):
@@ -894,18 +963,24 @@ class H(BaseHTTPRequestHandler):
             # 正文任务排最前 -> 前端下拉默认选中正文(最新论文载荷), 而不是第一个表格任务
             jobs.sort(key=lambda s: 0 if s.startswith("正文") else 1)
             self._json({"jobs": jobs,
-                        "workdir": wc.D, "theme": _load_theme()})
+                        "workdir": wc.D, "theme": _load_theme(),
+                        "idle": idle_state()})    # 页面一开就显示倒计时, 不等第一次心跳
         elif path == "/api/ping":
             with LOCK:
                 STATE["ping"] = time.time()
-            self._json({"ok": True})
+            # 心跳顺带把倒计时捎回去: 前端每 5s 已经在打这个接口, 不必另开一条轮询
+            self._json({"ok": True, "idle": idle_state()})
         else:
             self._json({"error": "not found"}, 404)
 
     def do_POST(self):
         path = self.path.split("?", 1)[0]
         b = self._body()
-        if path == "/api/send":
+        if path == "/api/idle":
+            # 用户自己控兜底退出: {"off": true} 暂停(服务器不再因心跳静默自灭),
+            # false 继续。只动这条腿 —— 关窗告别的宽限期照走(见模块头"退出"契约)。
+            self._json({"ok": True, "idle": set_idle_off(b.get("off"))})
+        elif path == "/api/send":
             self._send(b)
         elif path == "/api/build":
             self._build()
@@ -1072,11 +1147,14 @@ def _watchdog(srv):
     阈值必须够宽: 用户去豆包翻一轮要几分钟, 期间面板窗口失焦, 浏览器会把
     setInterval 节流甚至暂停 —— 30s 那种激进阈值会把"正在用"误判成"已关"
     (2026-09-21 实测: 用户切去豆包再回来, 服务器已经自杀了, 前端还把连接失败
-    谎报成"剪贴板里没有文本")。从没收到过心跳就不杀 —— 窗口可能还没开起来。"""
+    谎报成"剪贴板里没有文本")。从没收到过心跳就不杀 —— 窗口可能还没开起来。
+    用户可在面板上**暂停**这条兜底(/api/idle): 它只是个估计, 拿不准时把决定权
+    交回用户。暂停不影响上面那条告别腿 —— 关窗仍然 15s 后退出。"""
     while True:
         time.sleep(5)
         with LOCK:
             p, bye_at = STATE["ping"], STATE["bye_at"]
+            idle_off = STATE["idle_off"]
         now = time.time()
         if bye_at is not None:
             if p is not None and p > bye_at:
@@ -1085,7 +1163,7 @@ def _watchdog(srv):
             elif now - bye_at > BYE_GRACE:   # 宽限期内毫无心跳 -> 真关窗了
                 srv.shutdown()
                 return
-        if p is not None and now - p > IDLE_LIMIT:
+        if p is not None and not idle_off and now - p > IDLE_LIMIT:
             srv.shutdown()
             return
 
@@ -1133,7 +1211,7 @@ def main():
     url = "http://127.0.0.1:%d/" % port
     threading.Thread(target=_watchdog, args=(srv,), daemon=True).start()
     print("翻译中继面板 v3  %s" % url)
-    print("关窗即退出; 心跳兜底 %d 分钟。也可 Ctrl+C。" % (IDLE_LIMIT // 60))
+    print("关窗即退出; 心跳兜底 %d 分钟(面板上可暂停)。也可 Ctrl+C。" % (IDLE_LIMIT // 60))
     if not os.environ.get("P2Z_PANEL_NO_OPEN"):  # 冒烟测试时关掉自动开窗
         open_app(url)
     try:
