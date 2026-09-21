@@ -76,13 +76,70 @@ def body_payload():
     return os.path.join(INBOX, BODY_NAME + ".txt")
 
 
-def body_sidecar():
-    """正文任务的侧车: 优先按原文 PDF 内容散列认领归档件(与 seg_export --pdf 同一口径),
-    拿不到才回落全局 latest.jsonl —— 后者会被下一篇解析覆盖, 认错篇 = 回锚错位。
+def _payload_samples(txt_path, n=8):
+    """从载荷 txt 采几行较长的段落原文(跳过 #S 编号行/[]【】规则行),
+    用于把载荷**按内容**锚定到侧车 —— 页码覆盖度会打平(2026-09-21 实测:
+    Lee 侧车 11 页对 Li manifest 1-7 页覆盖=7, 与 Li 自己的侧车 7=7 平局,
+    max 拿错文档, seg_import 回锚全错), 只有内容身份分得出。"""
+    samples = []
+    try:
+        with io.open(txt_path, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if len(ln) > 25 and not ln.startswith(("#", "[", "【")):
+                    samples.append(ln[:120])
+                    if len(samples) >= n:
+                        break
+    except Exception:
+        pass
+    return samples
 
-    认领后按 manifest 的页码集合校验覆盖度: 归档件可能是**不完整**的解析(实测 Lee 2026
-    归档件只有 3 页而 manifest 引用 1-11 页, 回锚一碰第 7 页就 KeyError 崩)。两个候选
-    都覆盖不了 -> 退回第一个(归档件), 让门禁报清晰的缺页错误, 而不是静默错锚。
+
+def _sidecar_identity(path, samples):
+    """载荷采样行在侧车里的命中数(0=肯定不是这篇)。"""
+    if not samples or not path or not os.path.exists(path):
+        return 0
+    try:
+        with io.open(path, encoding="utf-8") as f:
+            blob = f.read()
+    except Exception:
+        return 0
+    return sum(1 for s in samples if s in blob)
+
+
+def _pdf_for_sidecar(sidecar_path):
+    """由归档侧车(pdf-<md5[:16]>.jsonl)反查原文 PDF: 扫 server/translated 下的
+    PDF 算内容散列对文件名。对不上返回 None(调用方自行回落)。"""
+    base = os.path.basename(sidecar_path or "")
+    m = re.match(r"^pdf-([0-9a-f]{16})\.jsonl$", base)
+    if not m:
+        return None
+    want = m.group(1)
+    tdir = os.path.join(PROJ, "server", "translated")
+    try:
+        names = [f for f in os.listdir(tdir) if f.lower().endswith(".pdf")
+                 and not f.endswith(("-mono.pdf", "-dual.pdf", "-cut.pdf", "-compare.pdf"))]
+    except OSError:
+        return None
+    for f in names:
+        p = os.path.join(tdir, f)
+        try:
+            h = hashlib.md5()
+            with open(p, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            if h.hexdigest()[:16] == want:
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def body_sidecar():
+    """正文任务的侧车: 在**全部**候选(归档件们 + latest.jsonl)里按
+    (内容身份, 页码覆盖度) 选 —— 身份优先: 侧车必须真的含有本载荷的段落原文,
+    否则 Lee 侧车会在覆盖度平局下冒充 Li(2026-09-21 实测, 门禁回锚全错)。
+    latest.jsonl 会被下一篇解析覆盖, 认错篇 = 回锚错位, 故它只是兜底候选。
     """
     segflow = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "segflow")
     want = set()
@@ -112,17 +169,19 @@ def body_sidecar():
 
     cands = []
     try:
-        h = hashlib.md5()
-        with open(BODY_PDF, "rb") as f:
-            for chunk in iter(lambda: f.read(1 << 20), b""):
-                h.update(chunk)
-        cands.append(os.path.join(segflow, "pdf-%s.jsonl" % h.hexdigest()[:16]))
-    except Exception:
+        for f in os.listdir(segflow):
+            if f.startswith("pdf-") and f.endswith(".jsonl"):
+                cands.append(os.path.join(segflow, f))
+    except OSError:
         pass
     cands.append(os.path.join(segflow, "latest.jsonl"))
-    if want:
-        return max(cands, key=lambda p: len(pages_of(p) & want))
-    return cands[0] if os.path.exists(cands[0]) else cands[1]
+
+    samples = _payload_samples(body_payload())
+
+    def score(p):
+        return (_sidecar_identity(p, samples), len(pages_of(p) & want))
+
+    return max(cands, key=score)
 
 
 def body_imported():
@@ -169,6 +228,108 @@ JOBS = [
          ],
          out=lambda: body_out()),
 ]
+
+# ---------------------------------------------------------- 正文任务自动切换
+# 换论文时不用改 env: 最新 payload(inbox 里 mtime 最新) + 服务器最近处理的原文 PDF
+# (history 最新任务的 fileName) 自动接管 BODY_NAME/BODY_PDF。显式设了 env 则不覆盖。
+
+def _latest_payload():
+    """inbox 里最新的载荷 txt(有配套 manifest 才算) -> (name, txt, manifest, pdf|None)。
+    两种名字都认: 手动 seg_export 的 payload_<名>, 服务器两趟回路自动导出的 <原文stem>。"""
+    best = None
+    if os.path.isdir(INBOX):
+        for f in os.listdir(INBOX):
+            if not f.endswith(".txt"):
+                continue
+            man = os.path.join(INBOX, f[:-4] + ".manifest.json")
+            if not os.path.exists(man):
+                continue
+            p = os.path.join(INBOX, f)
+            try:
+                t = os.path.getmtime(p)
+            except OSError:
+                continue
+            if best is None or t > best[0]:
+                best = (t, f[:-4], p, man)
+    if not best:
+        return None
+    _, name, txt, man = best
+    pdf = None
+    try:
+        with io.open(man, encoding="utf-8") as fh:
+            pdf = json.load(fh).get("pdf") or None
+    except Exception:
+        pdf = None
+    return name, txt, man, pdf
+
+
+def _latest_pdf():
+    """服务器 /api/history 最近任务的原文 PDF; 读不到返回 None。"""
+    try:
+        import urllib.request
+        with urllib.request.urlopen("http://127.0.0.1:8890/api/history", timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        hs = data.get("history") or []
+        if not hs:
+            return None
+        latest = max(hs, key=lambda h: h.get("startTime", ""))
+        fn = latest.get("fileName") or ""
+        if fn.lower().endswith(".pdf"):
+            p = os.path.join(PROJ, "server", "translated", fn)
+            if os.path.exists(p):
+                return p
+    except Exception:
+        pass
+    return None
+
+
+def refresh_body():
+    """重探最新论文并重建 JOBS 第三条; 无变化时零开销(面板 state 轮询频繁)。
+
+    顺序讲究: 必须先更新 BODY_NAME 再调 body_sidecar()/body_manifest() —— 它们
+    都读全局 BODY_NAME; 且侧车反查 PDF(md5 扫描)只在换篇时做一次, 否则每 5s
+    轮询会反复散列 server/translated 下所有 PDF。"""
+    global BODY_NAME, BODY_PDF
+    lp = None
+    if not os.environ.get("P2Z_BODY_NAME"):
+        try:
+            lp = _latest_payload()
+        except Exception:
+            lp = None
+    changed = bool(lp) and lp[0] != BODY_NAME
+    if changed:
+        BODY_NAME = lp[0]
+    if not os.environ.get("P2Z_BODY_PDF") and lp and changed:
+        if lp[3]:
+            new_pdf = lp[3]                 # manifest 自带 pdf(v28.53): 同篇强一致
+        else:
+            # manifest 没带 pdf: 按载荷内容锚定侧车, 再由侧车反查原文 PDF ——
+            # history 推断在服务器重启/有待译任务时会指错篇(2026-09-21 实测指到 Lee)。
+            try:
+                new_pdf = _pdf_for_sidecar(body_sidecar()) or _latest_pdf()
+            except Exception:
+                new_pdf = None
+        if new_pdf:
+            BODY_PDF = new_pdf
+    if not changed:
+        return
+    JOBS[2] = dict(label="正文 " + BODY_NAME, pre="S", blocks=True,
+                   manifest=body_manifest(), payload=body_payload(),
+                   sidecar=body_sidecar(), pdf=BODY_PDF,
+                   job=body_payload(), resp=BODY_NAME + "_response.tsv",
+                   cmd=lambda: [PY, os.path.join(TOOLS, "seg_import.py"),
+                                "--manifest", body_manifest(),
+                                "--text", BODY_NAME + "_response.tsv",
+                                "--sidecar", body_sidecar()],
+                   after=lambda: [
+                       [PY, os.path.join(TOOLS, "seg_inject.py"),
+                        "--imported", body_imported(),
+                        "--manifest", body_manifest(),
+                        "--sidecar", body_sidecar()],
+                       [PY, os.path.join(TOOLS, "force_rerender.py"),
+                        "--pdf", BODY_PDF, "--timeout", "1800"],
+                   ],
+                   out=lambda: body_out())
 
 CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 PREAMBLE_MARK = ("【待译】", "【任务】")
@@ -328,6 +489,7 @@ def manifest_ids(job):
 
 def available_jobs():
     """manifest 在位的任务 —— 面板的任务下拉/监听器的识别只在这些任务里找。"""
+    refresh_body()
     return [j for j in JOBS if os.path.exists(manifest_path(j))]
 
 
@@ -411,7 +573,9 @@ def run_job(job, ids, got, log=print):
         log("  ✗ 门禁未过, 未出稿。修正后重新粘贴即可。")
         return None
 
-    for i, argv in enumerate(job.get("after") or []):
+    after = job.get("after")               # 工序表也是 lambda(惰性求路径), 先调再遍历
+    after = after() if callable(after) else (after or [])
+    for i, argv in enumerate(after):
         a = subprocess.run(argv, cwd=D, capture_output=True, text=True,
                            encoding="utf-8", errors="replace")
         for ln in (a.stdout or "").splitlines():

@@ -256,6 +256,10 @@ def _emit(args, items, merged_log, warnings, pages_str, source=None):
             body += text
         lines.append(body)
     manifest = {"name": args.name, "pages": pages_str, "items": []}
+    if args.pdf:
+        # [v28.53] 载荷锚定原文: 面板据此把"最新 payload"自动对到它自己的原文 PDF
+        # (换论文不用再手设 P2Z_BODY_PDF)。旧载荷没这字段时面板回落服务器 history。
+        manifest["pdf"] = os.path.abspath(args.pdf)
     if source:
         # 下游(报告/回写)要能一眼看出这是 next 的载荷: 页号是**真实 PDF 页码**,
         # 不是 1.x 那种"回调计数"坐标。

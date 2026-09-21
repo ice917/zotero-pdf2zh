@@ -53,10 +53,13 @@ _VALUE_ERROR_RE = re.compile(r'(?m)^ValueError:\s*(?P<msg>.+)$')
 # 界面不卡, 任务卡片显示「待译」。这就是需求里的"停下来, 豆包搞完再继续"。
 #
 # 开关走**环境变量**(env 优先): 插件推送配置时会按 example 无条件回填, 只有 env
-# 不会被覆写(POLISH 被插件置 null 的那次事故即此因)。默认关 → 别的用户路径不变。
+# 不会被覆写(POLISH 被插件置 null 的那次事故即此因)。[v28.53] 默认**开**(不设 env
+# 即走提字零 LLM), 显式设 PAUSE_TRANSLATE=0/false/off/no 才关回官方直接翻译。
 # ================================================================================
 def _two_pass_enabled():
-    return str(os.environ.get("PAUSE_TRANSLATE", "")).strip().lower() in ("1", "true", "on", "yes")
+    # [v28.53] 默认开: 所有翻译先"只提取文字"(两趟回路第一趟, 零 LLM), 不再默认
+    # 走官方 LLM。可显式设 PAUSE_TRANSLATE=0/false/off/no 关回旧行为。
+    return str(os.environ.get("PAUSE_TRANSLATE", "1")).strip().lower() in ("1", "true", "on", "yes")
 
 
 class TwoPassGateRejected(RuntimeError):
@@ -1161,7 +1164,7 @@ class PDFTranslator:
             def _guarded_worker():
                 # [自研补丁] 任务结束(成功/失败/异常)一定释放在途登记
                 try:
-                    return self._execute_translate_job(task_id, input_path, config, engine)
+                    return self._execute_translate_job(task_id, input_path, config, engine, _force)
                 finally:
                     self._release_inflight(inflight_name, task_id)
 
@@ -1394,7 +1397,7 @@ class PDFTranslator:
         print("🔍 [两趟] 第二趟·重渲染")
         return self.translate_pdf(input_path, config, task_id)
 
-    def _execute_translate_job(self, task_id, input_path, config, engine):
+    def _execute_translate_job(self, task_id, input_path, config, engine, force=False):
         def addFileList(fileList, filePath):
             if os.path.exists(filePath):
                 fileList.append(filePath)
@@ -1402,8 +1405,9 @@ class PDFTranslator:
         if engine == pdf2zh:
             print("🔍 [Zotero PDF2zh Server] PDF2zh 开始翻译文件...")
             # [v28.23] 两趟采纳回路: 开着开关才走「提字 → 待译 → 重渲染」;
-            # 关着时行为与过去完全一致(默认关, 别的用户路径不变)。
-            if _two_pass_enabled():
+            # [v28.53] 默认开(零 LLM 提字), force 请求旁路 —— force_rerender 提交的
+            # 是"译文已回灌"的重渲染, 直接走渲染, 不能被卷进"提字 → 等交件"。
+            if _two_pass_enabled() and not force:
                 fileList = self._two_pass_adopt(task_id, input_path, config, engine)
             else:
                 fileList = self.translate_pdf(input_path, config, task_id)

@@ -578,6 +578,10 @@ function mkDropdown(el){
 }
 var taskDD=mkDropdown($('taskSel'));
 function ping(){fetch('/api/ping').catch(function(){})}
+document.addEventListener('visibilitychange',function(){
+  // 从豆包切回来立即心跳唤醒, 不等被浏览器节流的 setInterval —— 防"服务器已自杀"
+  if(!document.hidden)ping();
+});
 window.addEventListener('pagehide',function(){navigator.sendBeacon('/api/bye')});
 api('/api/state').then(function(s){
   taskDD.setOptions(s.jobs||[]);
@@ -593,7 +597,7 @@ api('/api/state').then(function(s){
 
 # ---------------------------------------------------------------------- 本机服务器(零依赖 stdlib)
 
-IDLE_LIMIT = 600     # 心跳静默多少秒算"窗口已关"
+IDLE_LIMIT = 1800    # 心跳静默多少秒算"窗口已关"(30min: 用户切去豆包翻长文, 后台标签被浏览器节流/冻结)
 BYE_GRACE = 15       # 收到告别后的宽限秒数
 STATE = {"checked": None, "sha": None, "ping": None, "bye_at": None}
 LOCK = threading.Lock()
@@ -638,7 +642,10 @@ class H(BaseHTTPRequestHandler):
             self._w(PAGE.replace("__THEME__", _load_theme()).encode("utf-8"),
                     "text/html; charset=utf-8")
         elif path == "/api/state":
-            self._json({"jobs": [j["label"] for j in wc.available_jobs()],
+            jobs = [j["label"] for j in wc.available_jobs()]
+            # 正文任务排最前 -> 前端下拉默认选中正文(最新论文载荷), 而不是第一个表格任务
+            jobs.sort(key=lambda s: 0 if s.startswith("正文") else 1)
+            self._json({"jobs": jobs,
                         "workdir": wc.D, "theme": _load_theme()})
         elif path == "/api/ping":
             with LOCK:
@@ -694,7 +701,10 @@ class H(BaseHTTPRequestHandler):
         if not jobs:
             self._json({"error": "没有任何任务 manifest, 无法复制。先装配或设环境变量(P2Z_TABLE_DIR/P2Z_PROJ)。"})
             return
-        job = next((j for j in jobs if j["label"] == b.get("task")), jobs[0])
+        job = next((j for j in jobs if j["label"] == b.get("task")), None)
+        if job is None:
+            # 没传/没选中时默认取「正文」任务(最新论文载荷), 而不是第一个表格任务
+            job = next((j for j in jobs if j["label"].startswith("正文")), jobs[0])
         path = job["job"] if os.path.isabs(job["job"]) else os.path.join(wc.D, job["job"])
         if not os.path.exists(path):
             self._json({"error": "找不到 %s —— 先跑 mk_job.py 装配待译文本。" % path})
@@ -837,8 +847,11 @@ def main():
         return selftest(os.path.join(wc.D, f))
     if not wc.check_workdir():
         return 2
-    sock = socket.socket()                       # 让系统挑一个空闲端口, 不占固定口
-    sock.bind(("127.0.0.1", 0))
+    sock = socket.socket()
+    try:
+        sock.bind(("127.0.0.1", 60642))     # 固定端口: 用户/自检都记这个地址
+    except OSError:
+        sock.bind(("127.0.0.1", 0))         # 被占(上次实例没退干净)则回落随机
     port = sock.getsockname()[1]
     sock.close()
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
