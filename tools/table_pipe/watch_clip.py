@@ -493,6 +493,50 @@ def available_jobs():
     return [j for j in JOBS if os.path.exists(manifest_path(j))]
 
 
+# ---------------- 回包"包装"清洗(v28.62): 剪贴板这条路本来就不绑豆包 ----------------
+# 契约只有两条(编号守恒 + 占位符原位), 任何网页 AI 都能接; 但**别家的包装不一样** ——
+# 豆包网页版习惯裸文本, 而 ChatGPT/Claude/Kimi 这类爱套代码围栏、爱加首尾客套、爱把编号
+# 列成 Markdown 清单。下面三条只动**包装**, 不碰译文一个字:
+#   ① 代码围栏行(``` / ```markdown)整行跳过。整篇被围起来时内容是**围栏中间的行**,
+#      所以只丢围栏本身 —— 否则 ``` 会当成译文混进末段(实测这类脏东西门禁抓不到)。
+#   ② 译文**末尾**的客套行丢弃。判据刻意收紧两档: 必须(起首即客套词) **且**(不超
+#      _SMALLTALK_MAX 字) **且**(与译文之间隔着空行) —— 宁可漏洗不可误吃: 末段真正文
+#      被吃掉的损失远大于多留一句"希望对你有所帮助"。
+#   ③ 编号行容忍行首包装(清单符 `- * •` / `1. 2) (3)` / 引用符 `>` / 粗体 `**`)。有的 AI
+#      把编号回成清单; 不认就会**一条都读不到**(③ 只会说"编号不齐", 用户完全看不出
+#      问题在"它给我加了个 1. ")。
+# 首部客套**不用管**: 编号行之前没有当前段, 那些行本来就落不到任何一段上。
+_FENCE = re.compile(r"^\s*```[A-Za-z0-9_+#.-]*\s*$")
+_SMALLTALK_MAX = 40
+# 客套词表刻意写得"窄": 光有"以上是…"不算客套 —— 必须接译文/翻译/全文这类**元词**, 否则
+# 末段真句子会被吃掉("以上是结果分析。" 是正文, "以上是全文译文" 才是收尾话)。
+_SMALLTALK = re.compile(
+    r"^[\s>*_`\-—–]*(?:"
+    r"以上(?:就)?是(?:全文|全部|本篇|本段)?(?:的)?(?:译文|翻译)|"
+    r"以下是(?:译文|翻译)|如下是(?:译文|翻译)|下面是(?:译文|翻译)|"
+    r"(?:译文|翻译)(?:如下|如上|结束|到此|完成)|全文(?:译文)?(?:如上|结束|到此)|"
+    r"好的|收到|明白|没问题|我已|我将|我会|"
+    r"请(?:核对|检查|确认|告知|告诉我)|如需|如果(?:需要|有)|希望|祝|感谢|谢谢"
+    r")")
+_LEADER = r"(?:[-*•>]|\(?\d{1,3}[.)、])?"
+
+
+def _trim_tail(buf):
+    """丢掉译文末尾的客套行(见上面 ② 的三道判据)。返回截断后的行表。"""
+    rows = list(buf)
+    while rows and not rows[-1].strip():
+        rows.pop()                                  # 尾随空行: 纯包装, 无条件丢
+    while len(rows) >= 2 and not rows[-2].strip():  # 与译文隔着空行的客套: 才判客套
+        cand = rows[-1].strip()
+        if len(cand) > _SMALLTALK_MAX or not _SMALLTALK.match(cand):
+            break
+        rows.pop()
+        rows.pop()                                  # 客套行 + 它前面的空行一起去掉
+        while rows and not rows[-1].strip():
+            rows.pop()
+    return rows
+
+
 def parse_units(text, ids, pre):
     """从剪贴板文本里抽 编号<分隔>译文。网页渲染会把 TAB 转成空格, 两种都认。
     两种形态都支持(与各任务的门禁契约一致):
@@ -502,16 +546,18 @@ def parse_units(text, ids, pre):
     给用户看, 所以不在这里截断。重复编号取首条(与 check_job.py 同口径)。
     """
     got = {}
-    rx = re.compile(r"^(%s\d+)[\t ](.*)$" % pre)
-    key = re.compile(r"^\s*#?\**\s*(%s\d+)\s*\**\s*$" % pre)
+    rx = re.compile(r"^\s*%s\s*\**\s*(%s\d+)\**\s*[\t ](.*)$" % (_LEADER, pre))
+    key = re.compile(r"^\s*%s\s*\**\s*#?\**\s*(%s\d+)\**\s*$" % (_LEADER, pre))
     cur, buf = None, []
 
-    def flush():
+    def flush(final=False):
         if cur is not None and cur not in got:
-            got[cur] = "\n".join(buf).strip()
+            got[cur] = "\n".join(_trim_tail(buf) if final else buf).strip()
 
     for ln in text.splitlines():
         ln = ln.rstrip("\r")
+        if _FENCE.match(ln):
+            continue                                # 围栏行只是包装, 不是译文
         m = rx.match(ln)
         if m:
             flush()
@@ -525,7 +571,7 @@ def parse_units(text, ids, pre):
             continue
         if cur is not None:
             buf.append(ln)
-    flush()
+    flush(final=True)                               # 末段: 收尾客套在这里清
     return got
 
 

@@ -99,6 +99,42 @@ def config():
             "base": (base or BASE_DEFAULT).rstrip("/")}
 
 
+# ---- 同源守卫(v28.62): 翻译方换了, 审核方就得跟着查一遍 -------------------------------
+# relay_spec §4.5「校验权不外放」的落点: **被翻译方不得自校**。剪贴板这条路既然能换家
+# (豆包/ChatGPT/Claude/Kimi/…), 就存在"翻译方与审核者是同一家模型"的组合 —— 那时审核
+# 只是自我确认, 必须拒审。判据刻意粗糙(按模型名认族), 因为宁可多拦一次(换个翻译方或
+# 换个审核者就能继续), 也不能放过"自己给自己打分"。
+_FAMILY_KEYS = (
+    ("deepseek", ("deepseek", "深度求索")),
+    ("doubao", ("doubao", "豆包", "seed-", "skylark")),
+    ("chatgpt", ("gpt-", "chatgpt", "o1-", "o3-", "o4-")),
+    ("claude", ("claude",)),
+    ("kimi", ("moonshot", "kimi")),
+    ("qwen", ("qwen", "通义")),
+)
+
+
+def family_of(name):
+    """按模型名/厂商名认族(小写包含即认; 中文名也认)。认不出返回 ""。"""
+    s = (name or "").lower()
+    for fam, keys in _FAMILY_KEYS:
+        if any(k in s for k in keys):
+            return fam
+    return ""
+
+
+def conflicts(vendor_family, cfg=None):
+    """翻译方族名与当前审核者族名是否**同源** -> 同源返回族名, 否则 ""。
+
+    认不出族名(空)不算冲突 —— 不确定就不拦, 但审核报告里写明审核者模型, 用户能自己看出
+    是不是"自己打自己"。
+    """
+    fam = (vendor_family or "").strip().lower()
+    if not fam:
+        return ""
+    return fam if fam == family_of((cfg or config())["model"]) else ""
+
+
 def load_terms(path=None):
     """术语表 -> [(en, zh)]。注释行不可见(与 seg_export.load_terms 同口径:
     `#` 开头跳过; 字段数 < 2 跳过 —— 故注释里不能带逗号)。表不在或读不动返回 []。"""
@@ -278,10 +314,15 @@ def audit(pairs, doc="", terms=None, cfg=None, workers=WORKERS, log=None):
 
 
 def report_md(r, doc="", stem=""):
-    """存疑清单落盘文本(与体检/质检报告同目录, 便于事后翻查)。"""
+    """存疑清单落盘文本(与体检/质检报告同目录, 便于事后翻查)。
+
+    审核者与**翻译方**都写进抬头: 换家之后同一篇会有多份报告, 不写清"谁译的、谁审的",
+    事后翻出来分不出是哪一版(r["vendor"] 由面板给, 单跑本模块时为空)。
+    """
     head = ["# 语义审核 (硅基流动 %s)" % r["model"], "",
             "- 时间: %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
             "- 任务: %s" % (stem or "(未标注)"),
+            "- 翻译方: %s" % (r.get("vendor") or "(未标注)"),
             "- 范围: %d 段 / %d 块%s%s"
             % (r["n_units"], r["n_chunks"],
                ("(%d 块未完成)" % r["n_failed"]) if r["n_failed"] else "",
