@@ -115,24 +115,50 @@ def sandbox_gates(job, ids, got):
         p = subprocess.run(job["cmd"](), cwd=tmp, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env)
         out = (p.stdout or "").splitlines()
+        note = ""
         if p.returncode != 0:
-            out = _persist_rework(tmp, out)
-        return p.returncode == 0, out
+            out, note = _persist_rework(tmp, out)
+        return p.returncode == 0, out, note
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 _REWORK_LINE = re.compile(r"返工单:\s*(\S.*?)\s*$")
 
+# 归谁的责任: 命中这些的失败**不是豆包的错** —— 环境/工具侧(引擎没接线、载荷或附件
+# 读不到、门禁脚本自己崩了)。把它们误报成"豆包的错"会让用户拿着返工单去问豆包,
+# 白跑一轮还在原地。其余带 FAIL 行的译者侧失败(字形丢失、段数不符、⋮ 错位)才是豆包的。
+_TOOL_FAIL_MARK = ("未接线", "找不到载荷原文", "读不到", "Traceback", "退出码",
+                   "manifest", "sidecar", "无法校验")
+
+
+def blame_of(gate_out, ok):
+    """失败归谁: "豆包" / "工具" / ""(没失败)。
+
+    判据顺序要紧: 先看有没有**译者侧的 FAIL 行**(译者侧 = 带 FAIL 前缀、且行内不含
+    工具标记), 有就是豆包的; 再看工具标记。反过来先扫全局工具标记会误判 ——
+    正常的 PASS 路径日志里也常出现 "读 manifest 完成" 这种行, 一旦和 FAIL 行同时
+    出现, 全局扫描会把豆包的错报成工具故障(实测这条误判过), 用户就被误导去查环境。
+    """
+    if ok:
+        return ""
+    lines = [ln.strip() for ln in (gate_out or [])]
+    for ln in lines:
+        if ln.startswith("FAIL") and not any(m in ln for m in _TOOL_FAIL_MARK):
+            return "豆包"
+    return "工具"                      # 工具标记命中, 或无 FAIL 行的非零退出(脚本自己出错)
+
 
 def _persist_rework(tmp, lines):
-    """把沙箱里的返工单搬到**真实 inbox**, 并把日志里那行路径改写成持久位置。
+    """把沙箱里的返工单搬到**真实 inbox**, 返回 (改写后的日志行, 单子正文)。
 
     返工单是**给用户/豆包看的产物**, 不是门禁痕迹 —— 但检查阶段整个 tmp 目录
     随即被删, 单子上印的路径就成了死链(实测: 面板提示
     `返工单: ...\\Temp\\p2z_panel_xxx\\inbox\\<名>.rework.md`, 用户按它去读时
     文件已不存在)。其余门禁产物(zh TSV / check_report)照旧只落 tmp、随目录删除,
     只有这份单子必须活过这次检查。
+    正文一并返回: 面板要把它显示出来、并让用户**一键复制**给豆包(免费版没有桥,
+    读不到 inbox 里的文件, 只能粘贴文本)。
     """
     notes = []
     for root, _dirs, files in os.walk(tmp):
@@ -140,18 +166,20 @@ def _persist_rework(tmp, lines):
             if f.endswith(".rework.md"):
                 notes.append(os.path.join(root, f))
     if not notes:
-        return lines
-    mapping = {}
+        return lines, ""
+    mapping, body = {}, ""
     try:
         os.makedirs(wc.INBOX, exist_ok=True)
         for src in notes:
             dst = os.path.join(wc.INBOX, os.path.basename(src))
             shutil.copyfile(src, dst)
             mapping[src] = dst
+            if not body:
+                body = io.open(src, encoding="utf-8").read()
     except OSError:
-        return lines
+        return lines, ""
     if not mapping:
-        return lines
+        return lines, ""
     out = []
     for ln in lines:
         m = _REWORK_LINE.search(ln)
@@ -159,9 +187,9 @@ def _persist_rework(tmp, lines):
             out.append("返工单(已保留): %s" % mapping[m.group(1)])
         else:
             out.append(ln)
-    out.append("提示: 返工单只列「必须改」的段与缺失字形 —— 把它交给豆包让它只改那些段, "
-               "或按上面 FAIL 行手工把字形原样写回; 其余段务必照抄不要重译。")
-    return out
+    out.append("提示: 返工单只列「必须改」的段与缺失字形 —— 上面「⑤ 报错明细」里可一键"
+               "复制给豆包, 让它只改那些段, 其余段务必照抄不要重译。")
+    return out, body
 
 
 def analyse(text):
@@ -192,7 +220,7 @@ def analyse(text):
 
     job, ids, got = hit
     orig = {u["id"]: u["orig"] for u in wc.manifest_units(job)}
-    ok, out = sandbox_gates(job, ids, got)
+    ok, out, note = sandbox_gates(job, ids, got)
 
     rows = [(_ratio(orig[i], got[i]), i, orig[i], got[i]) for i in ids]
     rows.sort(key=lambda r: (r[0], r[1]))
@@ -232,7 +260,8 @@ def analyse(text):
     items.sort(key=lambda x: 0 if x[0] == "高" else 1)     # 稳定排序: 高在前, 组内保原序
     return {"ok": ok, "job": job, "ids": ids, "got": got, "rows": rows, "median": med,
             "items": items, "n_dup": len(dup), "n_incons": len(incons),
-            "last_ratio": last_r, "gate_out": out,
+            "last_ratio": last_r, "gate_out": out, "rework": note,
+            "blame": blame_of(out, ok),
             "last": (last_id, orig[last_id], got[last_id])}
 
 
@@ -351,6 +380,16 @@ section.glass{padding:14px 18px}
 .banner.busy{color:var(--text)}
 .banner.ok{color:var(--ok)}
 .banner.err{color:var(--danger)}
+/* ⑤ 报错明细: 只在门禁 FAIL 时出现 —— 说到「哪段、缺哪个字形」, 并可一键复制给豆包。
+   免费版豆包没有桥、读不到 inbox 里的返工单文件, 只能靠粘贴, 故正文直接摊在面板上。 */
+.rw-badge{display:inline-flex;align-items:center;padding:2px 10px;border-radius:999px;
+  font-size:12px;font-weight:600;vertical-align:middle}
+.rw-badge.bao{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
+.rw-badge.tool{background:color-mix(in srgb,var(--danger) 20%,transparent);color:var(--danger)}
+.rw-note{white-space:pre-wrap;word-break:break-word;
+  font:12.5px/1.7 Consolas,"Cascadia Mono",monospace;
+  background:var(--input-bg);border:1px solid var(--glass-border);border-radius:14px;
+  padding:11px 13px;max-height:280px;overflow:auto;margin-top:9px}
 textarea{
   width:100%;min-height:140px;max-height:340px;resize:vertical;
   font:12.5px/1.65 Consolas,"Cascadia Mono",monospace;
@@ -413,6 +452,15 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
   </section>
 
   <div class="glass banner idle" id="banner">尚未检查。</div>
+
+  <section class="glass" id="rwCard" hidden>
+    <div class="row spread">
+      <span class="sec-ttl">⑤ 报错明细 <span class="rw-badge" id="rwBadge"></span></span>
+      <button class="btn small" id="rwCopyBtn" type="button">复制给豆包</button>
+    </div>
+    <div class="muted" id="rwWhy"></div>
+    <div class="rw-note" id="rwNote"></div>
+  </section>
 
   <section class="glass">
     <div class="row spread">
@@ -503,7 +551,30 @@ function segBtn(tab,n){
 function clearViews(){
   $('lookList').innerHTML='';$('tbody').innerHTML='';
   $('emptyLook').hidden=true;segBtn('look',0);segBtn('all',0);
+  $('rwCard').hidden=true;window.__rw='';
 }
+/* 门禁 FAIL 时把「具体报错」摊开: 哪几段、缺哪个字形、责任归谁。
+   归豆包 -> 可一键复制给豆包返工; 归工具 -> 明说找开发者, 免得用户拿着单子白问豆包。 */
+function showRework(r){
+  var card=$('rwCard');
+  if(r.ok||!r.rework){card.hidden=true;window.__rw='';return}
+  card.hidden=false;window.__rw=r.rework;
+  var bao=r.blame==='豆包';
+  var b=$('rwBadge');
+  b.className='rw-badge '+(bao?'bao':'tool');
+  b.textContent=bao?'豆包的问题':'工具/环境问题';
+  $('rwWhy').textContent=bao
+    ?'判据: 译者侧失败(字形丢失/段数不符/断点错位) —— 把下面这段复制给豆包, 让它只改点到的段。'
+    :'判据: 工具/环境侧失败(引擎未接线、载荷或侧车读不到、门禁脚本自己报错) —— 交给豆包没用, 找开发者。';
+  $('rwNote').textContent=r.rework;
+}
+$('rwCopyBtn').addEventListener('click',function(){
+  if(!window.__rw)return;
+  api('/api/copy',{text:window.__rw}).then(function(r){
+    if(r.error){log('✗ '+r.error);return}
+    log('已把报错明细复制到剪贴板('+r.n_chars+' 字符); 粘给豆包, 明确要求「只改点到的段, 其余照抄」。');
+  });
+});
 function showTab(tab){
   document.querySelectorAll('#seg button').forEach(function(b){b.classList.toggle('on',b.getAttribute('data-tab')===tab)});
   $('paneLook').hidden=tab!=='look';$('paneAll').hidden=tab!=='all';
@@ -516,6 +587,7 @@ function render(r){
     (r.ok?'✓ ':'✗ ')+r.job+' '+r.n+'/'+r.n+' · 门禁'+(r.ok?'全过':'未过')
     +' · 重复原文 '+r.n_dup+' 组/不一致 '+r.n_incons+' · '+r.items.length+' 条待你核');
   log((r.ok?'✓ ':'✗ ')+'「'+r.job+'」回包 '+r.n+' 单元; 门禁'+(r.ok?'全过':'未过'));
+  showRework(r);
   (r.gate_out||[]).forEach(function(l){log('   '+l)});
   log('   末条 '+r.last.id+'  原文 '+JSON.stringify(r.last.orig)+'  ->  译文 '+JSON.stringify(r.last.zh));
   log('   一致性: 重复原文 '+r.n_dup+' 组, 其中译法不一致 '+r.n_incons+' 组');
@@ -714,6 +786,16 @@ class H(BaseHTTPRequestHandler):
             self._check(b)
         elif path == "/api/commit":
             self._commit(b)
+        elif path == "/api/copy":
+            # 把面板上显示的返工提示词写进剪贴板 —— 走服务器端 Win32(与 ① 同一条路),
+            # 免费版豆包读不到 inbox 文件, 只能靠粘贴。空文本不覆盖剪贴板。
+            t = b.get("text") or ""
+            if not t.strip():
+                self._json({"error": "没有可复制的内容。"})
+            elif wc.write_clip(t):
+                self._json({"ok": True, "n_chars": len(t)})
+            else:
+                self._json({"error": "剪贴板被别的程序占住, 稍后再试。"})
         elif path == "/api/theme":
             if b.get("theme") in ("dark", "light"):
                 _save_theme(b["theme"])
@@ -776,6 +858,7 @@ class H(BaseHTTPRequestHandler):
             "ok": r["ok"], "job": r["job"]["label"], "n": len(r["ids"]),
             "median": round(r["median"], 3), "n_dup": r["n_dup"], "n_incons": r["n_incons"],
             "last": {"id": lid, "orig": lo, "zh": lz}, "gate_out": r["gate_out"],
+            "rework": r.get("rework", ""), "blame": r.get("blame", ""),
             "items": [{"lv": lv, "kind": k, "msg": m, "ids": u}
                       for lv, k, m, u in r["items"]],
             "rows": [{"ratio": round(rt, 3), "id": uid, "orig": o, "zh": z}
