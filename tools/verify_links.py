@@ -11,8 +11,17 @@ resolve_links 只保证"目标页+坐标写死"; 但坐标写错(如原点方向
 "年份" 与 "作者"(任一), 二者皆中才算命中。失配时额外试探镜像位置
 (h - y): 若镜像中, 即坐标系方向反了。
 
+**第二条判据(落点页一致性, 需 --original)**: 只靠"作者+年份"会**空洞通过** ——
+锚文本是交叉引用(Fig. 3 / Sec. 4.4 / 参考文献里的 page.N 页锚)时一条都验不了。
+实测 GeoTLM 篇 145 条链接被整批跳过, 打印"失配 0"其实等于没验。给出 --original
+后加一道与锚文本内容无关的判据: 成品与原版页数成整倍(mono 1:1 / dual 2:1)时,
+原版里每个命名目标解析出的页码, 就是成品同名链接**必须**落到的页码(dual 落
+2p 或 2p+1)。配对用"矩形就近"而不是"按序" —— relink 把矩形挪了 1pt, 同 y 的两条
+在 get_links() 里就换了序, 按序配会假报失配。
+
 用法:
-  python tools/verify_links.py --target <成品.pdf> [--tol 45] [--report <报告>]
+  python tools/verify_links.py --target <成品.pdf> [--original <原版.pdf>] \
+      [--tol 45] [--report <报告>]
 """
 import argparse, io, re, sys, unicodedata, collections
 
@@ -20,6 +29,61 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 import pymupdf
 
 norm = lambda s: re.sub(r"\s+", "", s or "")
+
+
+def page_consistency(doc, orig, bad, stat):
+    """落点页一致性 (见模块头"第二条判据")。返回一句结论供打印。"""
+    names = orig.resolve_names()
+    if not names:
+        return "原版无命名目标, 本判据不适用"
+    ratio = len(doc) // len(orig)
+    if ratio < 1 or len(orig) * ratio != len(doc):
+        return "页数比不整(原版%d:成品%d), 本判据不适用" % (len(orig), len(doc))
+    unpairable = 0
+    for i in range(len(orig)):
+        tgt_pages = []
+        for l in orig[i].get_links():
+            if l["kind"] != pymupdf.LINK_NAMED:
+                continue
+            tgt = names.get(l.get("nameddest"), {}).get("page")
+            if tgt is None:
+                continue
+            tgt_pages.append((pymupdf.Rect(l["from"]), tgt, l.get("nameddest")))
+        if not tgt_pages:
+            continue
+        tp = ratio * i
+        if tp >= len(doc):
+            continue
+        tl = [l for l in doc[tp].get_links() if l["kind"] == pymupdf.LINK_GOTO]
+        if len(tl) != len(tgt_pages):
+            # 条数不等就没法一一配对: 这本身是异常(成品缺链接/多链接), 记账不静默
+            unpairable += 1
+            bad.append((tp + 1, "条数不等", -1,
+                        "原版命名链接 %d 条, 成品 GOTO %d 条" % (len(tgt_pages), len(tl))))
+            continue
+        used = set()
+        for l in tl:
+            r = l["from"]
+            c = ((r.x0 + r.x1) / 2, (r.y0 + r.y1) / 2)
+            best, bd = None, None
+            for j, (ro, _t, _n) in enumerate(tgt_pages):
+                if j in used:
+                    continue
+                co = ((ro.x0 + ro.x1) / 2, (ro.y0 + ro.y1) / 2)
+                d = (co[0] - c[0]) ** 2 + (co[1] - c[1]) ** 2
+                if bd is None or d < bd:
+                    bd, best = d, j
+            used.add(best)
+            _ro, tgt, nm = tgt_pages[best]
+            stat["pg_checked"] += 1
+            if tgt * ratio <= l["page"] < tgt * ratio + ratio:
+                stat["pg_hit"] += 1
+            else:
+                stat["pg_miss"] += 1
+                bad.append((tp + 1, "%s(锚距%.1fpt)" % (nm or "?", bd ** 0.5), l["page"] + 1,
+                            "原版目标 p%d" % (tgt + 1)))
+    return ("可校验 %d | 命中 %d | 失配 %d | 条数不等跳过 %d 页"
+            % (stat["pg_checked"], stat["pg_hit"], stat["pg_miss"], unpairable))
 
 
 def fold(s):
@@ -60,9 +124,27 @@ def near_text(page, y, tol):
     return page.get_text(clip=r)
 
 
+def cite_number_anchor(page, r, n_digits=4):
+    """锚是"引文号"而不是"年份"么? —— '2020' 也可能是 '[20]' 被叠绘成的。
+
+    实测陷阱: 原文引文号 [20] 的链接矩形只盖住数字不盖括号, style_links 原位叠绘
+    蓝色后文本层成了两份 '20', norm() 去空白一拼就是 '2020', 看着像年份。判据用
+    **矩形宽度**: 4 位数字按该处实际字号(数字宽约 0.5em)至少要占 18pt(10pt 字),
+    而只装得下两位数字的矩形不可能真的是四位年份 —— 那就是拼接出来的。
+    """
+    size = 0.0
+    for b in page.get_text("dict", clip=r)["blocks"]:
+        for l in b.get("lines", []):
+            for s in l["spans"]:
+                size = max(size, s["size"])
+    return bool(size) and r.width < n_digits * size * 0.5 * 0.9
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
+    ap.add_argument("--original", default="",
+                    help="原版 PDF: 给出则加一道「落点页一致性」判据(与锚文本内容无关)")
     ap.add_argument("--tol", type=float, default=45)
     ap.add_argument("--report", default="")
     args = ap.parse_args()
@@ -90,6 +172,9 @@ def main():
             rest = anchor.replace(ym.group(1), "") if ym else anchor
             if not ym or (rest and not re.fullmatch(r"(?:1[6-9]\d\d|20\d\d)+", rest)):
                 stat["skip_symbol"] += 1
+                continue
+            if cite_number_anchor(page, l["from"]):
+                stat["skip_citenum"] += 1
                 continue
             year = ym.group(1)
             author = left_author(page, l["from"])
@@ -121,12 +206,22 @@ def main():
                                           "缺作者" if author and not hit_auth else "",
                                           " | 镜像处命中" if m_hit else "")))
 
-    doc.close()
     n = stat["checked"] or 1
-    print("链接 %d | 页内 %d | 语义可校验 %d | 命中 %d | 失配 %d(其中镜像命中 %d) | 非年份锚跳过 %d"
+    print("链接 %d | 页内 %d | 语义可校验 %d | 命中 %d | 失配 %d(其中镜像命中 %d) | 非年份锚跳过 %d | 疑似引文号锚跳过 %d"
           % (stat["links"], stat["in_page"], stat["checked"], stat["hit"],
-             stat["miss"], stat["mirror"], stat["skip_symbol"]))
+             stat["miss"], stat["mirror"], stat["skip_symbol"], stat["skip_citenum"]))
     print("语义命中率: %.1f%%" % (100.0 * stat["hit"] / n))
+    if stat["in_page"] and not stat["checked"]:
+        # 一条都没验却打印"失配 0"是最危险的一种绿: 必须自己说破。
+        print("NOTICE 本判据一条都没验(锚文本无年份), 不可当作「链接正确」 —— "
+              "请用 --original 走落点页一致性")
+    if args.original:
+        orig = pymupdf.open(args.original)
+        print("落点页一致性: %s" % page_consistency(doc, orig, bad, stat))
+        orig.close()
+    elif stat["in_page"] and not stat["checked"]:
+        print("落点页一致性: 未执行(缺 --original)")
+    doc.close()
     for b in bad[:25]:
         print("  失配 p%d %r -> p%d %s" % b)
     if args.report:
