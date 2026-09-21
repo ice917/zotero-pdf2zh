@@ -26,11 +26,11 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
 ("Subfamily"->"亚科"被判成"丢了拉丁串"), 字面上分不开"该保留的学名"与"该翻译的英文词"。
 
 网页版特有的两条契约:
-  退出: 页面关窗前 sendBeacon 打 /api/bye -> 立即退出, 不留孤儿; 兜底是心跳,
-        收过心跳后 IDLE_LIMIT(600s) 没再收到才算"窗口已关"。阈值必须够宽 ——
-        用户去豆包翻一轮要几分钟, 期间面板窗口失焦, 浏览器会把 setInterval
-        节流甚至暂停, 30s 那种激进阈值会把"正在用"误判成"已关"(2026-09-21
-        实测踩过: 用户切去豆包再回来, 服务器已经自杀了)。
+  退出: 页面关窗前 sendBeacon 打 /api/bye -> 进 15s 宽限期, 期内有新心跳(F5 刷新 /
+        别的页面还活着)则告别作废, 否则退出; 兜底是心跳, 收过心跳后
+        IDLE_LIMIT(600s) 没再收到也算"窗口已关"。两条阈值都要按最坏用户行为定 ——
+        30s 心跳会把"切去豆包翻页"误杀(实测); 立即退会把 F5 刷新和"验收浏览器先关"
+        变成自杀(实测)。
   改动作废: /api/check 记下当时文本的 sha1, /api/commit 发现文本变了直接拒绝 ——
             "确认"不可能按在过期内容上(服务器端强制, 不只靠前端禁用按钮)。
 
@@ -208,6 +208,7 @@ PAGE = r"""<!DOCTYPE html>
   --spec:rgba(14,165,233,.10); --radius:22px;
   --ok:#059669; --warn:#b45309; --danger:#dc2626;
   --input-bg:rgba(255,255,255,.6); --hover:rgba(14,165,233,.10);
+  --dd-bg:rgba(248,250,252,.94);
 }
 [data-theme="dark"]{
   color-scheme:dark;
@@ -220,6 +221,7 @@ PAGE = r"""<!DOCTYPE html>
   --spec:rgba(255,255,255,.12);
   --ok:#34d399; --warn:#fbbf24; --danger:#f87171;
   --input-bg:rgba(15,23,42,.55); --hover:rgba(56,189,248,.12);
+  --dd-bg:rgba(22,32,47,.94);
 }
 *{margin:0;padding:0;box-sizing:border-box}
 html,body{min-height:100%}
@@ -271,11 +273,30 @@ section.glass{padding:14px 18px}
 }
 .btn.primary:hover{box-shadow:0 8px 26px -6px var(--primary)}
 .btn.small{padding:5px 13px;font-size:12.5px}
-select{
-  font:inherit;color:var(--text);background:var(--card-bg);cursor:pointer;outline:none;
-  border:1px solid var(--glass-border);border-radius:999px;padding:7px 12px;
+/* 自定义下拉: 原生 <select> 的弹层是操作系统画的, 圆角/毛玻璃都改不了(颜色也仅部分
+   可控, 实测 Edge/Win 不跟 color-scheme) —— 要"我们的圆角风格"只能自绘。 */
+.dd{position:relative}
+/* 下拉列表会被后面的玻璃卡片盖住: backdrop-filter 让每张卡片自成层叠上下文,
+   后绘制的卡片压过先绘制卡片里的绝对定位子元素 —— 把本行整体抬一层。 */
+.sendrow{z-index:20}
+.dd-btn{
+  display:flex;align-items:center;gap:8px;font:inherit;color:var(--text);
+  background:var(--card-bg);cursor:pointer;outline:none;
+  border:1px solid var(--glass-border);border-radius:999px;padding:7px 14px;
   -webkit-backdrop-filter:blur(8px);backdrop-filter:blur(8px);
 }
+.dd-btn .dd-arrow{color:var(--muted);font-size:11px;transition:transform .15s ease}
+.dd.open .dd-arrow{transform:rotate(180deg)}
+.dd-list{
+  position:absolute;top:calc(100% + 6px);left:0;min-width:100%;z-index:50;
+  background:var(--dd-bg);  /* 雾面: 高不透明, 不透出底下卡片的字; 边缘仍带模糊 */
+  -webkit-backdrop-filter:blur(20px) saturate(160%);backdrop-filter:blur(20px) saturate(160%);
+  border:1px solid var(--glass-border);border-radius:14px;box-shadow:var(--shadow);
+  padding:5px;
+}
+.dd-item{padding:7px 12px;border-radius:9px;cursor:pointer;white-space:nowrap;font-size:13.5px}
+.dd-item:hover{background:var(--hover)}
+.dd-item.sel{color:var(--primary);font-weight:600}
 .banner{padding:13px 20px;font-weight:700;font-size:15px}
 .banner.idle{color:var(--muted)}
 .banner.busy{color:var(--text)}
@@ -325,11 +346,16 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
     <button class="btn small" id="themeBtn" type="button">切到浅色</button>
   </header>
 
-  <section class="glass row">
-    <label for="taskSel">任务</label>
-    <select id="taskSel"></select>
+  <section class="glass row sendrow">
+    <label>任务</label>
+    <div class="dd" id="taskSel">
+      <button class="dd-btn" type="button" aria-haspopup="listbox" aria-expanded="false"><span class="dd-val">—</span><span class="dd-arrow">▾</span></button>
+      <div class="dd-list" role="listbox" hidden></div>
+    </div>
     <button class="btn" id="sendBtn" type="button">① 复制待译文本到剪贴板</button>
     <span class="muted" id="sendStat">—</span>
+    <span style="flex:1"></span>
+    <button class="btn small" id="buildBtn" type="button">重新装配</button>
   </section>
 
   <section class="glass row">
@@ -343,7 +369,6 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
     <div class="row spread">
       <span class="sec-ttl">② 把豆包的回复粘到这里</span>
       <span>
-        <button class="btn small" id="pullBtn" type="button">从剪贴板读入</button>
         <button class="btn small" id="clearBtn" type="button">清空</button>
       </span>
     </div>
@@ -400,14 +425,17 @@ $('sendBtn').addEventListener('click',function(){
     log('已把「'+r.label+'」待译文本复制到剪贴板('+r.n_units+' 单元 / '+r.n_chars+' 字符); 粘进豆包即可。');
   });
 });
-$('pullBtn').addEventListener('click',function(){
-  api('/api/clip').then(function(r){
-    if(r.net){log('✗ '+r.error+' —— 面板可能已退出(窗口被关或心跳超时), 重新运行 panel.py 再试。');return}
-    if(!r.text){log('✗ 读不到剪贴板: '+(r.why||'内容为空')+'。');return}
-    ta.value=r.text;edited();log('已从剪贴板读入 '+r.text.length+' 字符。');
+$('clearBtn').addEventListener('click',function(){ta.value='';edited()});
+$('buildBtn').addEventListener('click',function(){
+  $('buildBtn').disabled=true;$('buildBtn').textContent='装配中…';
+  api('/api/build').then(function(r){
+    $('buildBtn').disabled=false;$('buildBtn').textContent='重新装配';
+    if(r.error){log('✗ 装配失败: '+r.error);setBanner('err','✗ 装配失败: '+r.error);return}
+    log('已重新装配: '+r.summary);
+    (r.out||[]).forEach(function(l){if(l)log('   '+l)});
+    setBanner('idle','已重新装配 —— ① 里将是新任务文本。');
   });
 });
-$('clearBtn').addEventListener('click',function(){ta.value='';edited()});
 $('checkBtn').addEventListener('click',function(){
   commitBtn.disabled=true;commitBtn.textContent='④ 确认写入并出稿';
   setBanner('busy','检查中…(在临时沙箱里跑真门禁)');
@@ -518,12 +546,37 @@ document.addEventListener('pointermove',function(e){
     });
   });
 });
+function mkDropdown(el){
+  var btn=el.querySelector('.dd-btn'),val=el.querySelector('.dd-val'),list=el.querySelector('.dd-list');
+  el.value='';
+  function close(){el.classList.remove('open');list.hidden=true;btn.setAttribute('aria-expanded','false')}
+  btn.addEventListener('click',function(e){
+    e.stopPropagation();
+    var was=list.hidden;close();
+    if(was){list.hidden=false;el.classList.add('open');btn.setAttribute('aria-expanded','true')}
+  });
+  document.addEventListener('click',function(e){if(!el.contains(e.target))close()});
+  el.setOptions=function(opts){
+    list.innerHTML='';
+    opts.forEach(function(o,i){
+      var it=document.createElement('div');
+      it.className='dd-item';it.textContent=o;it.setAttribute('role','option');
+      it.addEventListener('click',function(){
+        el.value=o;val.textContent=o;
+        list.querySelectorAll('.dd-item').forEach(function(x){x.classList.remove('sel')});
+        it.classList.add('sel');close();
+      });
+      list.appendChild(it);
+      if(i===0){el.value=o;val.textContent=o;it.classList.add('sel')}
+    });
+  };
+  return el;
+}
+var taskDD=mkDropdown($('taskSel'));
 function ping(){fetch('/api/ping').catch(function(){})}
 window.addEventListener('pagehide',function(){navigator.sendBeacon('/api/bye')});
 api('/api/state').then(function(s){
-  (s.jobs||[]).forEach(function(j){
-    $('taskSel').insertAdjacentHTML('beforeend','<option>'+esc(j)+'</option>');
-  });
+  taskDD.setOptions(s.jobs||[]);
   $('workdir').textContent='工作目录 '+(s.workdir||'');
   theme=s.theme||theme;applyTheme();
   ping();setInterval(ping,5000);
@@ -537,7 +590,8 @@ api('/api/state').then(function(s){
 # ---------------------------------------------------------------------- 本机服务器(零依赖 stdlib)
 
 IDLE_LIMIT = 600     # 心跳静默多少秒算"窗口已关"
-STATE = {"checked": None, "sha": None, "ping": None, "bye": False}
+BYE_GRACE = 15       # 收到告别后的宽限秒数
+STATE = {"checked": None, "sha": None, "ping": None, "bye_at": None}
 LOCK = threading.Lock()
 
 
@@ -594,12 +648,11 @@ class H(BaseHTTPRequestHandler):
         b = self._body()
         if path == "/api/send":
             self._send(b)
-        elif path == "/api/clip":
-            t = wc.read_clip()
-            self._json({"text": t or "", "why": wc.LAST_ERR or ""})
+        elif path == "/api/build":
+            self._build()
         elif path == "/api/bye":
-            with LOCK:                       # 页面关窗前主动告别(sendBeacon), 立即退出
-                STATE["bye"] = True
+            with LOCK:                       # 页面关窗前告别(sendBeacon) -> 进宽限期,
+                STATE["bye_at"] = time.time()  # 不是立即退(F5 刷新/别的页面关闭也会发)
             self._json({"ok": True})
         elif path == "/api/check":
             self._check(b)
@@ -613,6 +666,25 @@ class H(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
 
     # -------------------------------------------------------------- 动作
+    def _build(self):
+        """重新装配: 在**工作目录**里子进程跑 mk_job.py(它模块层无条件 main()),
+        更新 job_doubao.txt / job_manifest.json / job_audit.txt。装错/失败不落盘由
+        mk_job 自己保证(它先全读后一次性写)。"""
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mk_job.py")
+        p = subprocess.run([sys.executable, script], cwd=wc.D, capture_output=True,
+                           text=True, encoding="utf-8", errors="replace",
+                           env=dict(os.environ, P2Z_TABLE_DIR=wc.D))
+        out = (p.stdout or "").splitlines()
+        if p.returncode != 0:
+            self._json({"error": "mk_job.py 退出码 %d\n%s" % (p.returncode,
+                        (p.stderr or "").strip()[:500])})
+            return
+        # 装配产物变了 -> 任务标签不变但内容已更新; 把已检查状态清掉(旧 sha 已失效)
+        with LOCK:
+            STATE["checked"] = None
+            STATE["sha"] = None
+        self._json({"ok": True, "out": out, "summary": out[0] if out else "ok"})
+
     def _send(self, b):
         job = next((j for j in wc.JOBS if j["label"] == b.get("task")), wc.JOBS[0])
         path = os.path.join(wc.D, job["job"])
@@ -699,7 +771,11 @@ def open_app(url):
 
 def _watchdog(srv):
     """退出契约(两条腿):
-    主动 —— 页面关窗前 sendBeacon 打 /api/bye, 立即退出, 不留孤儿;
+    主动 —— 页面关窗前 sendBeacon 打 /api/bye, 进 BYE_GRACE 秒宽限期。宽限内若收到
+            新心跳(F5 刷新后新页面起来 / 还有别的页面活着), 告别作废; 否则退出。
+            不能收到告别就立即退: F5 刷新会发 pagehide, 别的标签页(比如验收用的
+            自动化浏览器)关闭也会发 —— 立即退会把还活着的窗口晾成死页面
+            (2026-09-21 实测踩过)。
     兜底 —— 收过心跳后 IDLE_LIMIT 秒没再收到 = 窗口已关或进程崩了, 也退出。
     阈值必须够宽: 用户去豆包翻一轮要几分钟, 期间面板窗口失焦, 浏览器会把
     setInterval 节流甚至暂停 —— 30s 那种激进阈值会把"正在用"误判成"已关"
@@ -708,8 +784,16 @@ def _watchdog(srv):
     while True:
         time.sleep(5)
         with LOCK:
-            p, bye = STATE["ping"], STATE["bye"]
-        if bye or (p is not None and time.time() - p > IDLE_LIMIT):
+            p, bye_at = STATE["ping"], STATE["bye_at"]
+        now = time.time()
+        if bye_at is not None:
+            if p is not None and p > bye_at:
+                with LOCK:                   # 告别后仍有心跳 -> 有活页面, 告别作废
+                    STATE["bye_at"] = None
+            elif now - bye_at > BYE_GRACE:   # 宽限期内毫无心跳 -> 真关窗了
+                srv.shutdown()
+                return
+        if p is not None and now - p > IDLE_LIMIT:
             srv.shutdown()
             return
 
