@@ -57,7 +57,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import watch_clip as wc          # 复用识别/落盘/门禁/剪贴板全链, 不重复实现
 
-PH = re.compile(r"\{S\d{3}\}")
+PH = re.compile(r"\{S\d{3}\}|\{v\d+\}")   # 表格/正文两种占位符都剥掉再比长度
 SUSPECT_K = 0.5      # 长度比低于"全批中位数"的此倍 -> 列入待看(读数, 不判定)
 
 # 主题选择落在**工作目录**(数据侧, 不进仓库); 具体配色在前端 CSS 变量里。
@@ -99,17 +99,21 @@ def sandbox_gates(job, ids, got):
 
     检查阶段不落任何文件: manifest 与回包都拷进 tmp, 子进程的 P2Z_TABLE_DIR 指向 tmp,
     于是它回填的 zh TSV / check_report.txt / notes_zh.json 全落在 tmp 里, 随后整目录删掉。
-    落盘只发生在"确认"那一步。
+    落盘只发生在"确认"那一步。正文任务的门禁(seg_import)会写 out/ 与返工单, 额外把
+    P2Z_PROJ 也指向 tmp 隔离(见 watch_clip.body_imported 的约定); 它的 manifest 是 inbox
+    里的绝对路径, 只读不拷。
     """
     tmp = tempfile.mkdtemp(prefix="p2z_panel_")
     try:
-        shutil.copy(os.path.join(wc.D, job["manifest"]), tmp)
-        with io.open(os.path.join(tmp, job["resp"]), "w", encoding="utf-8") as f:
-            for uid in ids:
-                f.write("%s\t%s\n" % (uid, got[uid]))
+        man = wc.manifest_path(job)
+        if man and not os.path.isabs(job.get("manifest", "")):
+            shutil.copy(man, tmp)
+        wc.write_resp(os.path.join(tmp, job["resp"]), job, ids, got)
+        env = dict(os.environ, P2Z_TABLE_DIR=tmp)
+        if job.get("sidecar"):
+            env["P2Z_PROJ"] = tmp
         p = subprocess.run(job["cmd"](), cwd=tmp, capture_output=True, text=True,
-                           encoding="utf-8", errors="replace",
-                           env=dict(os.environ, P2Z_TABLE_DIR=tmp))
+                           encoding="utf-8", errors="replace", env=env)
         return p.returncode == 0, (p.stdout or "").splitlines()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
@@ -130,8 +134,8 @@ def analyse(text):
     hit = wc.match_job(text, log=lambda *a: None)
     if not hit:
         diag = []
-        for job in wc.JOBS:
-            ids = wc.manifest_ids(job["manifest"])
+        for job in wc.available_jobs():
+            ids = wc.manifest_ids(job)
             got = wc.parse_units(text, ids, job["pre"])
             miss = [i for i in ids if i not in got]
             extra = sorted(i for i in got if i not in ids)
@@ -142,7 +146,7 @@ def analyse(text):
         return {"error": "没有识别到完整回包(编号不齐)。", "diag": diag}
 
     job, ids, got = hit
-    orig = {u["id"]: u["orig"] for u in wc.manifest_units(job["manifest"])}
+    orig = {u["id"]: u["orig"] for u in wc.manifest_units(job)}
     ok, out = sandbox_gates(job, ids, got)
 
     rows = [(_ratio(orig[i], got[i]), i, orig[i], got[i]) for i in ids]
@@ -195,7 +199,7 @@ PAGE = r"""<!DOCTYPE html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link rel="icon" href="data:,">
-<title>表格翻译中继</title>
+<title>翻译中继</title>
 <style>
 :root{
   color-scheme:light;
@@ -341,7 +345,7 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
 <div class="orb orb1"></div><div class="orb orb2"></div><div class="orb orb3"></div>
 <main>
   <header class="glass">
-    <div class="ttl"><span class="dot"></span>表格翻译中继</div>
+    <div class="ttl"><span class="dot"></span>翻译中继</div>
     <div class="wd" id="workdir"></div>
     <button class="btn small" id="themeBtn" type="button">切到浅色</button>
   </header>
@@ -519,8 +523,8 @@ commitBtn.addEventListener('click',function(){
       if(!r.stale)commitBtn.disabled=false;
       return;
     }
-    setBanner('ok','✓ 已出稿: '+r.docx);
-    log('✓ 出稿: '+r.docx);
+    setBanner('ok','✓ 已出稿: '+r.out);
+    log('✓ 出稿: '+r.out);
   });
 });
 $('themeBtn').addEventListener('click',function(){
@@ -634,7 +638,7 @@ class H(BaseHTTPRequestHandler):
             self._w(PAGE.replace("__THEME__", _load_theme()).encode("utf-8"),
                     "text/html; charset=utf-8")
         elif path == "/api/state":
-            self._json({"jobs": [j["label"] for j in wc.JOBS],
+            self._json({"jobs": [j["label"] for j in wc.available_jobs()],
                         "workdir": wc.D, "theme": _load_theme()})
         elif path == "/api/ping":
             with LOCK:
@@ -686,14 +690,17 @@ class H(BaseHTTPRequestHandler):
         self._json({"ok": True, "out": out, "summary": out[0] if out else "ok"})
 
     def _send(self, b):
-        job = next((j for j in wc.JOBS if j["label"] == b.get("task")), wc.JOBS[0])
-        path = os.path.join(wc.D, job["job"])
+        jobs = wc.available_jobs()
+        if not jobs:
+            self._json({"error": "没有任何任务 manifest, 无法复制。先装配或设环境变量(P2Z_TABLE_DIR/P2Z_PROJ)。"})
+            return
+        job = next((j for j in jobs if j["label"] == b.get("task")), jobs[0])
+        path = job["job"] if os.path.isabs(job["job"]) else os.path.join(wc.D, job["job"])
         if not os.path.exists(path):
             self._json({"error": "找不到 %s —— 先跑 mk_job.py 装配待译文本。" % path})
             return
         text = io.open(path, encoding="utf-8").read()
-        rx = re.compile(r"^%s\d{3}[\t ]" % job["pre"])
-        n = sum(1 for ln in text.splitlines() if rx.match(ln))
+        n = len(wc.manifest_ids(job))
         if not wc.write_clip(text):
             self._json({"error": "剪贴板被别的程序占住, 稍后再试。"})
             return
@@ -731,18 +738,18 @@ class H(BaseHTTPRequestHandler):
             return
         job, ids, got = checked
         logs = []
-        ok = wc.run_job(job, ids, got, log=logs.append)
-        wc.beep(ok)
-        if not ok:
+        out = wc.run_job(job, ids, got, log=logs.append)
+        wc.beep(bool(out))
+        if not out:
             self._json({"ok": False, "log": logs, "error": "未出稿(门禁未过或排版失败)。"})
             return
         with LOCK:                            # 已落盘, 防双击重复出稿
             STATE["checked"] = None
         try:
-            os.startfile(wc.DOCX)
+            os.startfile(out)
         except Exception as e:
             logs.append("(自动打开失败: %r)" % e)
-        self._json({"ok": True, "log": logs, "docx": wc.DOCX})
+        self._json({"ok": True, "log": logs, "out": out})
 
 
 def open_app(url):
@@ -828,10 +835,7 @@ def main():
         i = sys.argv.index("--selftest")
         f = sys.argv[i + 1] if len(sys.argv) > i + 1 else "job_response.tsv"
         return selftest(os.path.join(wc.D, f))
-    if not os.path.exists(os.path.join(wc.D, "job_manifest.json")):
-        print("✗ 工作目录里没有 job_manifest.json:\n\n  工作目录 = %s\n  脚本目录 = %s\n\n"
-              "数据在别处时先设环境变量再启动:\n  $env:P2Z_TABLE_DIR=\"<数据目录>\"\n"
-              "  python panel.py" % (wc.D, wc.SD))
+    if not wc.check_workdir():
         return 2
     sock = socket.socket()                       # 让系统挑一个空闲端口, 不占固定口
     sock.bind(("127.0.0.1", 0))
