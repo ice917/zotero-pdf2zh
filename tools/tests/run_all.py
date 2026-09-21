@@ -45,6 +45,8 @@
                                  拒审(拦在联网之前)/溯源台账与 ⑤ 归因/前端接线
    25. test_heal_render.py      v28.63 渲染残渣治伤: 干跑即体检(有伤退出码 1/治后幂等 0)/
                                  擦哪儿盖哪儿(逐像素 0.00)/redact 吞链接必须补回/dual 页映射
+  26. test_dual_links.py       v28.64 dual 双侧链接: 落点映射 2d+1 不跨侧/原版侧 NAMED->GOTO
+                                 且 y 不镜像/译文页原有 URI 活下来/同源与页数两道门禁
 
 设计约定:
     - 全部 stdlib + venv 内 pdf2zh, 不需要 pytest
@@ -84,6 +86,7 @@ SUITES = [
     "test_panel_idle.py",         # v28.60 面板兜底退出可暂停(倒计时/暂停/时钟归零)
     "test_webai.py",              # v28.62 翻译方可换: 回包包装清洗/同源拒审/溯源台账
     "test_heal_render.py",        # v28.63 渲染残渣治伤: 干跑体检/擦盖同框/链接补回/dual 映射
+    "test_dual_links.py",         # v28.64 dual 双侧链接: 落点映射/两侧门禁/URI 活下来
 ]
 
 # 套件 → 它的"被测对象"(相对项目根)。**只在对象不随包分发时才需要登记** ——

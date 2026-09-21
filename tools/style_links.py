@@ -16,7 +16,13 @@
 层里锚文本会重复一次(复制该年份会得到 '19901990')。不用 redaction 替换, 是因为
 apply_redactions 会清掉该页全部链接(实测 18 -> 0), 而本工具跑在挂链接之后。
 
-用法: python tools/style_links.py --target <成品.pdf> [--sidecar <侧车>]
+--dual(双语版): dual 每对页 = [原版页, 译文页], 原版页**本来就是蓝字** —— 对它
+再叠绘一次既无收益, 又白白污染文本层(原版页的文本层原本是干净的), 故 --dual 时
+只处理译文侧(0 基奇数页)。跑在 dual_links.py 之后。
+--sidecar 的页码是 **mono 坐标**(1 基), --dual 时按 2(p-1)+2 换算成 dual 里同一页的
+译文侧编号 —— 不换算就会去跳 mono 那一页在 dual 的编号, 回填页(自带蓝字)照样被叠绘。
+
+用法: python tools/style_links.py --target <成品.pdf> [--sidecar <侧车>] [--dual]
 """
 import io, os, re, sys, tempfile
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
@@ -40,6 +46,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
     ap.add_argument("--sidecar", default="")
+    ap.add_argument("--dual", action="store_true",
+                    help="成品是双语版(每对页=[原版页,译文页]): 只重绘译文侧(0基奇数页)")
     args = ap.parse_args()
 
     skip = set()
@@ -54,6 +62,11 @@ def main():
                        and re.search(r"[A-Za-z0-9]", s["raw"]) for s in o["segs"]):
                 skip.add(o["page"])
 
+    if args.dual and skip:
+        # 侧车页码是 mono 坐标(1 基), dual 里同一页的**译文侧**是 2(p-1)+2(1 基) ——
+        # 不换算就会去跳 mono 那一页在 dual 的编号, 回填页(自带蓝字)照样被叠绘一遍。
+        skip = {2 * (p - 1) + 2 for p in skip}
+
     doc = pymupdf.open(args.target)
     tmpf = []
     fcache = {}          # (xref) -> (临时字体路径, 注册名)
@@ -63,6 +76,8 @@ def main():
 
     for pno in range(len(doc)):
         if pno + 1 in skip:
+            continue
+        if args.dual and pno % 2 == 0:      # dual 原版侧本来就是蓝字, 不许再叠
             continue
         page = doc[pno]
         links = page.get_links()
@@ -114,8 +129,9 @@ def main():
             os.remove(p)
         except OSError:
             pass
-    print("链接锚重绘为蓝色: %d 段/%d 字 | 跳过 %d (跳过回填页 %s)"
-          % (n_span, n_char, skipped, sorted(skip) or "无"))
+    print("链接锚重绘为蓝色: %d 段/%d 字 | 跳过 %d (跳过回填页 %s)%s"
+          % (n_span, n_char, skipped, sorted(skip) or "无",
+             " | dual: 已跳过原版侧" if args.dual else ""))
 
 
 if __name__ == "__main__":

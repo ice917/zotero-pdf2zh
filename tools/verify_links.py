@@ -19,6 +19,11 @@ resolve_links 只保证"目标页+坐标写死"; 但坐标写错(如原点方向
 2p 或 2p+1)。配对用"矩形就近"而不是"按序" —— relink 把矩形挪了 1pt, 同 y 的两条
 在 get_links() 里就换了序, 按序配会假报失配。
 
+**第三条判据(落点不跨侧, dual 专用)**: dual 每对页 = [原版页, 译文页], 两侧各自
+成对(译文页点引用跳译文侧, 原版页跳原版侧)。"串侧"的表现是"点中文页跳到英文页",
+而页码本身完全合法 —— 只有这条能抓。同时做两侧条数对账, 并在原版侧还残留 NAMED
+(dual_links 没跑/没跑完)时点名。
+
 用法:
   python tools/verify_links.py --target <成品.pdf> [--original <原版.pdf>] \
       [--tol 45] [--report <报告>]
@@ -84,6 +89,42 @@ def page_consistency(doc, orig, bad, stat):
                             "原版目标 p%d" % (tgt + 1)))
     return ("可校验 %d | 命中 %d | 失配 %d | 条数不等跳过 %d 页"
             % (stat["pg_checked"], stat["pg_hit"], stat["pg_miss"], unpairable))
+
+
+def side_consistency(doc, orig, bad, stat):
+    """落点不跨侧 + 两侧条数对账 (见模块头"第三条判据")。返回一句结论。
+
+    只在成品页数是原版整数倍(dual ratio=2)时有意义 —— ratio=1 时"同侧"是废话。
+    判据一: 第 p 页的 GOTO 落点页必须与 p 同侧(p % ratio == 落点页 % ratio)。
+    判据二: 同一对页的两侧承载同一份内容, 引用链接条数应相等(原版侧 = NAMED+GOTO,
+            译文侧 = GOTO); 原版侧还残留 NAMED 时一并点名(dual_links 没跑)。
+    """
+    ratio = len(doc) // len(orig)
+    cross = named_left = unpair = 0
+    for pno in range(len(doc)):
+        for l in doc[pno].get_links():
+            if l["kind"] == pymupdf.LINK_NAMED:
+                named_left += 1
+                continue
+            if l["kind"] != pymupdf.LINK_GOTO:
+                continue
+            if (l["page"] % ratio) != (pno % ratio):
+                cross += 1
+                bad.append((pno + 1, "跨侧落点", l["page"] + 1,
+                            "%s侧页跳到%s侧页" % ("译" if pno % ratio else "原",
+                                                "译" if l["page"] % ratio else "原")))
+    for k in range(len(orig)):
+        a = len([l for l in doc[ratio * k].get_links()
+                 if l["kind"] in (pymupdf.LINK_NAMED, pymupdf.LINK_GOTO)])
+        b = len([l for l in doc[ratio * k + 1].get_links() if l["kind"] == pymupdf.LINK_GOTO])
+        if a != b:
+            unpair += 1
+            bad.append((ratio * k + 1, "两侧条数不等", -1,
+                        "原版侧 %d 条, 译文侧 GOTO %d 条" % (a, b)))
+    if named_left:
+        bad.append((-1, "原版侧残留 NAMED", -1,
+                    "%d 条未转 GOTO(Edge 等简易阅读器点不动) -> 先跑 dual_links.py" % named_left))
+    return "跨侧 %d | 残留 NAMED %d | 两侧条数不等 %d 页" % (cross, named_left, unpair)
 
 
 def fold(s):
@@ -218,12 +259,14 @@ def main():
     if args.original:
         orig = pymupdf.open(args.original)
         print("落点页一致性: %s" % page_consistency(doc, orig, bad, stat))
+        if len(doc) != len(orig):
+            print("落点侧不串: %s" % side_consistency(doc, orig, bad, stat))
         orig.close()
     elif stat["in_page"] and not stat["checked"]:
         print("落点页一致性: 未执行(缺 --original)")
     doc.close()
     for b in bad[:25]:
-        print("  失配 p%d %r -> p%d %s" % b)
+        print("  %s p%d %r -> p%d %s" % ("失配" if b[0] > 0 else "异常", b[0], b[1], b[2], b[3]))
     if args.report:
         with open(args.report, "w", encoding="utf-8") as f:
             for b in bad:
