@@ -93,28 +93,41 @@ u32.SetClipboardData.argtypes = [wintypes.UINT, wintypes.HANDLE]
 u32.SetClipboardData.restype = wintypes.HANDLE
 
 
-def read_clip():
-    """读剪贴板纯文本; 剪贴板被别的进程占住时短重试(最多 ~0.6s), 仍占住才返回 None。
+LAST_ERR = None      # read_clip 最近一次失败的原因; 面板如实转述给用户, 不吞真因
 
-    占住是常态而非异常: 浏览器/剪贴板管理器会瞬时持有锁(实测自动化浏览器点按钮时
-    一直占着), 单次 OpenClipboard 失败就放弃会把"稍等就好"误判成"没有文本"。"""
+
+def read_clip():
+    """读剪贴板纯文本; 失败返回 None, 原因写进 LAST_ERR(别让调用方只能猜)。
+
+    占住多为瞬时(浏览器/剪贴板管理器会短时持锁), 故 OpenClipboard 短重试 5×120ms。
+    但"读不到"有五种成因, 必须分开说 —— 混成一句"没有文本或被占住"会把
+    "服务器其实已经死了"这类真因盖掉(2026-09-21 实测踩过)。"""
+    global LAST_ERR
+    LAST_ERR = None
     for _ in range(5):
         if u32.OpenClipboard(None):
             break
         time.sleep(0.12)
     else:
+        LAST_ERR = "剪贴板被别的程序占住(OpenClipboard 重试 5 次均失败)"
         return None
     try:
         if not u32.IsClipboardFormatAvailable(CF_UNICODETEXT):
+            LAST_ERR = "剪贴板里没有纯文本格式(可能是图片或文件)"
             return None
         h = u32.GetClipboardData(CF_UNICODETEXT)
         if not h:
+            LAST_ERR = "GetClipboardData 返回空句柄"
             return None
         p = k32.GlobalLock(h)
         if not p:
+            LAST_ERR = "GlobalLock 失败"
             return None
         try:
-            return ctypes.c_wchar_p(p).value
+            v = ctypes.c_wchar_p(p).value
+            if not v:
+                LAST_ERR = "剪贴板里是空文本"
+            return v
         finally:
             k32.GlobalUnlock(h)
     finally:

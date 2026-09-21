@@ -26,8 +26,11 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
 ("Subfamily"->"亚科"被判成"丢了拉丁串"), 字面上分不开"该保留的学名"与"该翻译的英文词"。
 
 网页版特有的两条契约:
-  心跳退出: 页面每 5s 打一次 /api/ping, 服务器收过心跳后 30s 没再收到 = 窗口已关,
-            自动退出, 不留孤儿进程。
+  退出: 页面关窗前 sendBeacon 打 /api/bye -> 立即退出, 不留孤儿; 兜底是心跳,
+        收过心跳后 IDLE_LIMIT(600s) 没再收到才算"窗口已关"。阈值必须够宽 ——
+        用户去豆包翻一轮要几分钟, 期间面板窗口失焦, 浏览器会把 setInterval
+        节流甚至暂停, 30s 那种激进阈值会把"正在用"误判成"已关"(2026-09-21
+        实测踩过: 用户切去豆包再回来, 服务器已经自杀了)。
   改动作废: /api/check 记下当时文本的 sha1, /api/commit 发现文本变了直接拒绝 ——
             "确认"不可能按在过期内容上(服务器端强制, 不只靠前端禁用按钮)。
 
@@ -296,6 +299,7 @@ textarea:focus{border-color:var(--primary);box-shadow:0 0 0 3px color-mix(in srg
 .lmsg{word-break:break-all}
 .lids{color:var(--muted);font-family:Consolas,monospace;font-size:12px;margin-top:3px}
 .empty{color:var(--ok);padding:16px 6px;font-size:13.5px;white-space:pre-line}
+.emptyhint{color:var(--muted);padding:16px 6px;font-size:13.5px}
 .tblwrap{max-height:320px;overflow:auto;border-radius:14px;border:1px solid var(--glass-border)}
 table{width:100%;border-collapse:collapse;font-size:12.5px}
 th,td{padding:7px 10px;text-align:left;border-bottom:1px solid var(--glass-border);vertical-align:top;word-break:break-all}
@@ -352,10 +356,7 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
       <button data-tab="all" type="button">全表 (0)</button>
     </div>
     <div id="paneLook">
-      <div class="empty" id="emptyLook">✓ 没有需要你核对的项目。
-
-机器能判的(编号/占位符/数字/符号/代码缩写/一致性)都过了 —— 可以直接确认。
-这里只会出现机器判不了的项, 正常回包为空。</div>
+      <div class="emptyhint" id="emptyLook">尚未检查 —— 把豆包的回复粘到上面, 然后点 ③ 检查。</div>
       <div id="lookList"></div>
     </div>
     <div id="paneAll" hidden>
@@ -378,7 +379,8 @@ var theme=document.documentElement.getAttribute('data-theme')||'dark';
 function esc(s){return String(s).replace(/[&<>"']/g,function(c){return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]})}
 function api(path,body){
   var opt=body===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)};
-  return fetch(path,opt).then(function(r){return r.json()}).catch(function(){return {error:'服务器无响应'}});
+  return fetch(path,opt).then(function(r){return r.json()})
+    .catch(function(){return {net:true,error:'连不上本机服务器'}});
 }
 function log(msg){
   var t=new Date().toTimeString().slice(0,8);
@@ -400,7 +402,8 @@ $('sendBtn').addEventListener('click',function(){
 });
 $('pullBtn').addEventListener('click',function(){
   api('/api/clip').then(function(r){
-    if(!r.text){log('剪贴板里没有文本(或被别的程序占住), 稍后再试。');return}
+    if(r.net){log('✗ '+r.error+' —— 面板可能已退出(窗口被关或心跳超时), 重新运行 panel.py 再试。');return}
+    if(!r.text){log('✗ 读不到剪贴板: '+(r.why||'内容为空')+'。');return}
     ta.value=r.text;edited();log('已从剪贴板读入 '+r.text.length+' 字符。');
   });
 });
@@ -422,7 +425,7 @@ function segBtn(tab,n){
 }
 function clearViews(){
   $('lookList').innerHTML='';$('tbody').innerHTML='';
-  $('emptyLook').hidden=false;segBtn('look',0);segBtn('all',0);
+  $('emptyLook').hidden=true;segBtn('look',0);segBtn('all',0);
 }
 function showTab(tab){
   document.querySelectorAll('#seg button').forEach(function(b){b.classList.toggle('on',b.getAttribute('data-tab')===tab)});
@@ -440,7 +443,12 @@ function render(r){
   log('   末条 '+r.last.id+'  原文 '+JSON.stringify(r.last.orig)+'  ->  译文 '+JSON.stringify(r.last.zh));
   log('   一致性: 重复原文 '+r.n_dup+' 组, 其中译法不一致 '+r.n_incons+' 组');
   var list=$('lookList');list.innerHTML='';
-  $('emptyLook').hidden=r.items.length>0;
+  var el=$('emptyLook');
+  el.hidden=r.items.length>0;
+  el.className='empty';
+  el.textContent='✓ 没有需要你核对的项目。\n\n'
+    +'机器能判的(编号/占位符/数字/符号/代码缩写/一致性)都过了 —— 可以直接确认。\n'
+    +'这里只会出现机器判不了的项, 正常回包为空。';
   var bad={};
   r.items.forEach(function(it){
     it.ids.split(/\s+/).forEach(function(u){bad[u]=1});
@@ -511,6 +519,7 @@ document.addEventListener('pointermove',function(e){
   });
 });
 function ping(){fetch('/api/ping').catch(function(){})}
+window.addEventListener('pagehide',function(){navigator.sendBeacon('/api/bye')});
 api('/api/state').then(function(s){
   (s.jobs||[]).forEach(function(j){
     $('taskSel').insertAdjacentHTML('beforeend','<option>'+esc(j)+'</option>');
@@ -527,7 +536,8 @@ api('/api/state').then(function(s){
 
 # ---------------------------------------------------------------------- 本机服务器(零依赖 stdlib)
 
-STATE = {"checked": None, "sha": None, "ping": None}
+IDLE_LIMIT = 600     # 心跳静默多少秒算"窗口已关"
+STATE = {"checked": None, "sha": None, "ping": None, "bye": False}
 LOCK = threading.Lock()
 
 
@@ -585,7 +595,12 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/send":
             self._send(b)
         elif path == "/api/clip":
-            self._json({"text": wc.read_clip() or ""})
+            t = wc.read_clip()
+            self._json({"text": t or "", "why": wc.LAST_ERR or ""})
+        elif path == "/api/bye":
+            with LOCK:                       # 页面关窗前主动告别(sendBeacon), 立即退出
+                STATE["bye"] = True
+            self._json({"ok": True})
         elif path == "/api/check":
             self._check(b)
         elif path == "/api/commit":
@@ -683,13 +698,18 @@ def open_app(url):
 
 
 def _watchdog(srv):
-    """心跳退出契约: 收过心跳后 30s 没再收到 = 窗口已关, 自动退出(不留孤儿进程)。
-    从没收到过心跳就不杀 —— 窗口可能还没开起来。"""
+    """退出契约(两条腿):
+    主动 —— 页面关窗前 sendBeacon 打 /api/bye, 立即退出, 不留孤儿;
+    兜底 —— 收过心跳后 IDLE_LIMIT 秒没再收到 = 窗口已关或进程崩了, 也退出。
+    阈值必须够宽: 用户去豆包翻一轮要几分钟, 期间面板窗口失焦, 浏览器会把
+    setInterval 节流甚至暂停 —— 30s 那种激进阈值会把"正在用"误判成"已关"
+    (2026-09-21 实测: 用户切去豆包再回来, 服务器已经自杀了, 前端还把连接失败
+    谎报成"剪贴板里没有文本")。从没收到过心跳就不杀 —— 窗口可能还没开起来。"""
     while True:
         time.sleep(5)
         with LOCK:
-            p = STATE["ping"]
-        if p is not None and time.time() - p > 30:
+            p, bye = STATE["ping"], STATE["bye"]
+        if bye or (p is not None and time.time() - p > IDLE_LIMIT):
             srv.shutdown()
             return
 
@@ -737,7 +757,7 @@ def main():
     url = "http://127.0.0.1:%d/" % port
     threading.Thread(target=_watchdog, args=(srv,), daemon=True).start()
     print("翻译中继面板 v3  %s" % url)
-    print("关窗后 30s 自动退出; 也可 Ctrl+C。")
+    print("关窗即退出; 心跳兜底 %d 分钟。也可 Ctrl+C。" % (IDLE_LIMIT // 60))
     if not os.environ.get("P2Z_PANEL_NO_OPEN"):  # 冒烟测试时关掉自动开窗
         open_app(url)
     try:
