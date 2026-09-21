@@ -114,9 +114,54 @@ def sandbox_gates(job, ids, got):
             env["P2Z_PROJ"] = tmp
         p = subprocess.run(job["cmd"](), cwd=tmp, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env)
-        return p.returncode == 0, (p.stdout or "").splitlines()
+        out = (p.stdout or "").splitlines()
+        if p.returncode != 0:
+            out = _persist_rework(tmp, out)
+        return p.returncode == 0, out
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+_REWORK_LINE = re.compile(r"返工单:\s*(\S.*?)\s*$")
+
+
+def _persist_rework(tmp, lines):
+    """把沙箱里的返工单搬到**真实 inbox**, 并把日志里那行路径改写成持久位置。
+
+    返工单是**给用户/豆包看的产物**, 不是门禁痕迹 —— 但检查阶段整个 tmp 目录
+    随即被删, 单子上印的路径就成了死链(实测: 面板提示
+    `返工单: ...\\Temp\\p2z_panel_xxx\\inbox\\<名>.rework.md`, 用户按它去读时
+    文件已不存在)。其余门禁产物(zh TSV / check_report)照旧只落 tmp、随目录删除,
+    只有这份单子必须活过这次检查。
+    """
+    notes = []
+    for root, _dirs, files in os.walk(tmp):
+        for f in files:
+            if f.endswith(".rework.md"):
+                notes.append(os.path.join(root, f))
+    if not notes:
+        return lines
+    mapping = {}
+    try:
+        os.makedirs(wc.INBOX, exist_ok=True)
+        for src in notes:
+            dst = os.path.join(wc.INBOX, os.path.basename(src))
+            shutil.copyfile(src, dst)
+            mapping[src] = dst
+    except OSError:
+        return lines
+    if not mapping:
+        return lines
+    out = []
+    for ln in lines:
+        m = _REWORK_LINE.search(ln)
+        if m and m.group(1) in mapping:
+            out.append("返工单(已保留): %s" % mapping[m.group(1)])
+        else:
+            out.append(ln)
+    out.append("提示: 返工单只列「必须改」的段与缺失字形 —— 把它交给豆包让它只改那些段, "
+               "或按上面 FAIL 行手工把字形原样写回; 其余段务必照抄不要重译。")
+    return out
 
 
 def analyse(text):
