@@ -213,6 +213,20 @@ def write_rework_note(man, src, report, detail):
     path = os.path.join(INBOX, name + REWORK_SUFFIX)
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(L))
+
+    # [v28.58] 把这次踩的坑记进教训台账 -> 下一篇导出的提示词自动带上(见 lessons.py)。
+    # 只记**该原样出现的字形串**(门禁的 ground truth), 不记豆包写成的样子 —— 见模块头。
+    try:
+        import lessons as _LES
+        for d in detail:
+            for vn, val in d["fails"][:3]:
+                _LES.record("GLYPH", val, glyph_context(d["raw"], d["vv"], vn))
+            if d.get("moved"):
+                _LES.record("MOVE", "⋮ 两侧译文互换")
+        for r in other_fails[:3]:
+            _LES.record("OTHER", r)
+    except Exception:
+        pass                      # 台账是辅助, 记不上不能反过来卡住门禁
     return path
 
 

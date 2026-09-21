@@ -1,0 +1,13 @@
+# 豆包实测教训台账 —— 门禁 FAIL 时自动追加, 导出载荷时自动注入提示词。
+# 格式: 类型<TAB>证据<TAB>上下文<TAB>日期
+# 类型: GLYPH=字形整块 / MOVE=断点两侧错位 / OTHER=编号与空段类
+# 删掉某行即不再注入; 清空本文件即回到纯静态规则。
+GLYPH	C∈{2,4}	with Wcls∈R768×C and C∈{2,4} for rotation and sliding. Additive fusion…	2026-09-21
+GLYPH	(0.69/0.63	…slightly above it. GeoTLM keeps the two directions balanced (0.69/0.6…	2026-09-21
+OTHER	FAIL 缺段: [2]		2026-09-21
+OTHER	FAIL #S2 译文为空		2026-09-21
+GLYPH	3	Exciting 3D work - done.	2026-09-21
+OTHER	FAIL 缺段: [26]		2026-09-21
+OTHER	FAIL #S26 译文为空		2026-09-21
+GLYPH	{v1}	Tail of page one {v1} closes it.	2026-09-21
+OTHER	FAIL #S3（第1页·跨页） 占位符不守恒: 多了 {v1} x1（载荷里 {v1} x1；译文里 {v1} x2）		2026-09-21

@@ -53,6 +53,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 # [v28.39] 引擎画像: 侧车路径随 P2Z_ENGINE 走(adopt 会把该变量传给子进程); 缺省画像
 # pdf2zh 1.x —— 与引入本层之前逐字节一致。next 画像不产侧车, 此时为 ""(下面 main 会拦)。
 import engine as _ENG                                     # noqa: E402
+import lessons as _LES                                    # noqa: E402
 _PROF = _ENG.active()
 SIDECAR = _PROF.sidecar or ""
 PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
@@ -249,10 +250,15 @@ def _emit(args, items, merged_log, warnings, pages_str, source=None):
     if args.terms == TERMS_CSV and not os.path.exists(TERMS_CSV):
         # 沙箱/换机时 P2Z_PROJ 一改, 默认术语表就跟着落空; 静默退化会让人以为术语生效了
         warnings.append("默认术语表不存在: %s —— 本次只写通用术语要求, 用 --terms 指定" % TERMS_CSV)
+    # [v28.58] 实测反例回流: 门禁踩过的坑(lessons 台账)逐条注进提示词, 抽象规则变成
+    # 具体反例。台账为空则为 ""(与引入本层之前逐字节一致)。注入条数受 lessons.MAX_INJECT
+    # 与 MAX_BLOCK_CHARS 限流, 不会把前面的规则挤掉。
+    lessons_block = _LES.block()
     lines = [RULES.format(doc=(doc + " ") if doc else "",
                           pages=pages_str,
                           terms=terms_line(args.terms))
-             + (_PH_RULE if source else "")]
+             + (_PH_RULE if source else "")
+             + (("\n" + lessons_block) if lessons_block else "")]
     for it in items:
         lines.append("#%s" % it["key"])
         body = ""
@@ -310,6 +316,10 @@ def _emit(args, items, merged_log, warnings, pages_str, source=None):
         print("  " + m)
     for w in warnings:
         print("  [警告] " + w)
+    n_les = sum(1 for ln in lessons_block.splitlines() if ln.startswith("- "))
+    if n_les:
+        # 让"提示词其实被改过"可见: 否则换台机器/换了台账, 载荷差异无从解释
+        print("  [教训库] 提示词已附带 %d 条实测反例(台账 tools/lessons.tsv, 可人工删改)" % n_les)
     for it in items:
         loc = "+".join("p%d#%d" % (tp, idx) for _pg, idx, _t, tp in it["parts"])
         t = it["parts"][-1][2] if not it["merged"] else it["parts"][-1][2][:25] + "…"
