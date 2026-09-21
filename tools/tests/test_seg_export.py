@@ -210,7 +210,12 @@ def main():
         side = write_sidecar(root)
         rc, out, err = run(root, ["--pages", "2-3", "--name", "p", "--sidecar", side])
         txt = read_payload(root, "p") if rc == 0 else ""
-        check("⑦ S1/S2 编号守恒", "#S1" in txt and "#S2" in txt and "#S3" not in txt)
+        # 编号守恒只看**段表**区(首个 #S1 起) —— v28.58 起抬头会注入 tools/lessons.tsv 的
+        # 实测反例, 那些反例照抄门禁原文, 句子里就带 "#S3"(占位符不守恒那条);
+        # 拿整份载荷判"没有 #S3"会把它算成多导出一段。
+        segarea = txt[txt.index("#S1"):] if "#S1" in txt else txt
+        check("⑦ S1/S2 编号守恒",
+              "#S1" in segarea and "#S2" in segarea and "#S3" not in segarea, segarea[-200:])
         check("⑦ 跨页合并保留 ⋮", "The breeding system of⋮plants is complex." in txt, txt)
         check("⑦ 字形已还原", "{v0}" not in txt and "breeding" in txt)
         with open(os.path.join(root, "inbox", "p.manifest.json"), encoding="utf-8") as f:

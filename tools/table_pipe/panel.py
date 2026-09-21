@@ -22,6 +22,12 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
   第二层  只给人看机器判不了的 -> **待看清单**(正常回包为**空**)
   第三层  剩下的用"外行也能判"的读数兜底(一致性: 同一原文必须同一译文 —— 零阈值纯机械)
 
+  [v28.59] 补上门禁够不到的最后一层: **⑥ 语义审核**(手动点按钮, 硅基流动
+  DeepSeek-V3.2, 只审不改) —— 漏译/错译/数字/术语/指代/表达, 逐段「原文↔译文」核对,
+  结论进存疑清单, 可一键复制给豆包返工。三条边界: 审核者必须是**与豆包无关的第三方**
+  (relay_spec 第 4 条: 被翻译方不得自校); 它**只报不改**(生成式改写不可信, 见润色钩子
+  的墓志铭); 它**不参与放行**(门禁是硬门, 存疑清单只给人裁决)。后端见 reviewer.py。
+
 **试过但否掉的读数**(别重新起头): 拉丁碎片保真 —— 实测误报 105/115
 ("Subfamily"->"亚科"被判成"丢了拉丁串"), 字面上分不开"该保留的学名"与"该翻译的英文词"。
 
@@ -56,6 +62,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import watch_clip as wc          # 复用识别/落盘/门禁/剪贴板全链, 不重复实现
+import reviewer as rv            # ⑥ 语义审核(硅基流动): 只审不改, 与豆包无关的第三方
 
 PH = re.compile(r"\{S\d{3}\}|\{v\d+\}")   # 表格/正文两种占位符都剥掉再比长度
 SUSPECT_K = 0.5      # 长度比低于"全批中位数"的此倍 -> 列入待看(读数, 不判定)
@@ -265,6 +272,48 @@ def analyse(text):
             "last": (last_id, orig[last_id], got[last_id])}
 
 
+def _doc_of(job):
+    """载荷抬头的 [文档] 行 —— 给审核者一点篇名/学科先验, 术语判断更准。取不到返回 ""。"""
+    p = job.get("payload") or job.get("job") or ""
+    p = p if os.path.isabs(p) else os.path.join(wc.D, p)
+    try:
+        with io.open(p, encoding="utf-8") as f:
+            first = f.readline().strip()
+        return first if first.startswith("[文档]") else ""
+    except OSError:
+        return ""
+
+
+def review(text):
+    """纯逻辑(便于 --selftest/单测): 回包 -> (原文, 译文) 对照 -> 交 ⑥ 语义审核。
+
+    与 analyse 的区别: **不跑门禁** —— 审核不需要、也不该等沙箱; 只要求编号齐全,
+    因为编号不齐连段都对不上, 审出来的条目落不到任何一段上。
+
+    审核者是**与豆包无关的第三方**(硅基流动), 只报不改: 返回的存疑清单给用户裁决,
+    不参与"能不能出稿"的判定 —— 放行权仍在本机门禁(relay_spec 第 4 条红线)。
+    """
+    if not text.strip():
+        return {"error": "粘贴区是空的。"}
+    hit = wc.match_job(text, log=lambda *a: None)
+    if not hit:
+        return {"error": "没有识别到完整回包(编号不齐) —— 先点 ③ 检查, 看缺哪些编号。"}
+    job, ids, got = hit
+    orig = {u["id"]: u["orig"] for u in wc.manifest_units(job)}
+    pairs = [(i, orig[i], got[i]) for i in ids]
+    if not any(o for _, o, _ in pairs):
+        return {"error": "manifest/payload 里取不到原文 —— 没有对照就没有审核, "
+                         "只能靠门禁与读数核对。"}
+    doc = _doc_of(job)
+    r = rv.audit(pairs, doc=doc, terms=rv.load_terms())
+    if not r.get("ok"):
+        return {"error": r.get("err") or "审核未完成。"}
+    r["job"] = job["label"]
+    r["report"] = rv.write_report(rv.report_md(r, doc=doc, stem=job["label"]),
+                                  stem=job["label"])
+    return r
+
+
 # ---------------------------------------------------------------------- 前端页面(内嵌单页, __THEME__ 由服务器替换)
 
 PAGE = r"""<!DOCTYPE html>
@@ -386,6 +435,8 @@ section.glass{padding:14px 18px}
   font-size:12px;font-weight:600;vertical-align:middle}
 .rw-badge.bao{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
 .rw-badge.tool{background:color-mix(in srgb,var(--danger) 20%,transparent);color:var(--danger)}
+.rw-badge.warn{background:color-mix(in srgb,var(--warn) 22%,transparent);color:var(--warn)}
+.rw-badge.ok{background:color-mix(in srgb,var(--ok) 20%,transparent);color:var(--ok)}
 .rw-note{white-space:pre-wrap;word-break:break-word;
   font:12.5px/1.7 Consolas,"Cascadia Mono",monospace;
   background:var(--input-bg);border:1px solid var(--glass-border);border-radius:14px;
@@ -448,6 +499,7 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
 
   <section class="glass row">
     <button class="btn" id="checkBtn" type="button">③ 检查(只读预览)</button>
+    <button class="btn" id="reviewBtn" type="button">⑥ 语义审核</button>
     <button class="btn primary" id="commitBtn" type="button" disabled>④ 确认写入并出稿</button>
   </section>
 
@@ -460,6 +512,16 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
     </div>
     <div class="muted" id="rwWhy"></div>
     <div class="rw-note" id="rwNote"></div>
+  </section>
+
+  <section class="glass" id="rvCard" hidden>
+    <div class="row spread">
+      <span class="sec-ttl">⑥ 语义审核(硅基流动) <span class="rw-badge" id="rvBadge"></span></span>
+      <button class="btn small" id="rvCopyBtn" type="button">复制给豆包</button>
+    </div>
+    <div class="muted" id="rvWhy"></div>
+    <div id="rvList"></div>
+    <div class="lids" id="rvPath"></div>
   </section>
 
   <section class="glass">
@@ -512,6 +574,7 @@ function log(msg){
 function setBanner(kind,text){banner.className='glass banner '+kind;banner.textContent=text}
 function edited(){
   commitBtn.disabled=true;commitBtn.textContent='④ 确认写入并出稿';
+  $('rvCard').hidden=true;window.__rv='';       /* ⑥ 的结论是针对旧文本的, 一改即作废 */
   setBanner('idle','内容已改 —— 请重新点 ③ 检查。');
 }
 ta.addEventListener('input',edited);
@@ -552,6 +615,7 @@ function clearViews(){
   $('lookList').innerHTML='';$('tbody').innerHTML='';
   $('emptyLook').hidden=true;segBtn('look',0);segBtn('all',0);
   $('rwCard').hidden=true;window.__rw='';
+  $('rvCard').hidden=true;window.__rv='';
 }
 /* 门禁 FAIL 时把「具体报错」摊开: 哪几段、缺哪个字形、责任归谁。
    归豆包 -> 可一键复制给豆包返工; 归工具 -> 明说找开发者, 免得用户拿着单子白问豆包。 */
@@ -573,6 +637,73 @@ $('rwCopyBtn').addEventListener('click',function(){
   api('/api/copy',{text:window.__rw}).then(function(r){
     if(r.error){log('✗ '+r.error);return}
     log('已把报错明细复制到剪贴板('+r.n_chars+' 字符); 粘给豆包, 明确要求「只改点到的段, 其余照抄」。');
+  });
+});
+/* ⑥ 语义审核: 门禁之外的那一层 —— 漏译/错译/数字/术语/指代/表达。审核者是**与豆包无关**
+   的第三方(硅基流动), 只报不改: 结论进存疑清单给用户裁决, 不参与放行。手动触发, 付费调用。 */
+$('reviewBtn').addEventListener('click',function(){
+  if(!ta.value.trim()){log('✗ 粘贴区是空的 —— 先把豆包的回包粘到 ②。');return}
+  var b=$('reviewBtn'),txt=b.textContent;
+  b.disabled=true;b.textContent='审核中…';
+  log('▶ 提交 ⑥ 语义审核: 整篇「原文↔译文」发给硅基流动(付费, 只审不改), 通常几十秒到几分钟。');
+  api('/api/review',{text:ta.value}).then(function(r){
+    b.disabled=false;b.textContent=txt;
+    if(r.error){
+      setBanner('err','✗ 语义审核未完成: '+r.error);log('✗ '+r.error);return;
+    }
+    renderReview(r);
+  });
+});
+function rvText(r){
+  var s=['【审核存疑清单】请只核对下面点到的段 —— 改完按原格式把**整段回复**重发一遍;'
+         +'其余段逐字符照抄上一版, 不要重译、不要改动别的段、不要调整顺序。'];
+  r.items.forEach(function(it){
+    s.push('- #'+it.id+' ['+it.kind+'·'+it.level+'] '+it.note
+           +(it.quote?('   原文片段: '+it.quote):''));
+  });
+  return s.join('\n');
+}
+function renderReview(r){
+  var n=r.items.length;
+  $('rvCard').hidden=false;
+  var b=$('rvBadge');
+  b.className='rw-badge '+(n?'warn':'ok');
+  b.textContent=n?(n+' 条存疑'):'未发现问题';
+  $('rvWhy').textContent='独立审核者 '+r.model+': 逐段核对「原文↔译文」的漏译/错译/数字/术语/'
+    +'指代/表达。编号、字形占位符、⋮ 断点、标点属机械门禁的判据, 已排除不报。'
+    +'只审不改 —— 是否返工由你裁决。'
+    +(r.n_failed?(' 注意: '+r.n_failed+'/'+r.n_chunks+' 块未完成, 结论不完整。'):'');
+  var list=$('rvList');list.innerHTML='';
+  if(!n){
+    list.innerHTML='<div class="empty">✓ 硅基流动没有报出语义问题。</div>';
+  }else{
+    r.items.forEach(function(it){
+      var hi=it.level==='高';
+      list.insertAdjacentHTML('beforeend',
+        '<div class="look"><div class="lv '+(hi?'hi':'mid')+'">'+(hi?'▲':'●')+' '+it.level+'</div>'
+        +'<div class="lkind">'+esc(it.kind)+'</div>'
+        +'<div style="flex:1"><div class="lmsg">'+esc(it.note)+'</div>'
+        +'<div class="lids">#'+esc(it.id)+(it.quote?' · 原文: '+esc(it.quote):'')
+        +'</div></div></div>');
+    });
+  }
+  window.__rv=r;
+  $('rvPath').textContent=r.report?('报告: '+r.report):'';
+  log('⑥ 语义审核完成('+r.model+'): '+r.n+' 段 / '+r.n_chunks+' 块 / '+r.secs+' 秒 · '
+      +(n?('存疑 '+n+' 条'):'未发现问题')
+      +(r.n_failed?(' · '+r.n_failed+' 块未完成'):''));
+  (r.logs||[]).forEach(function(l){log('   '+l)});
+  r.items.forEach(function(it){
+    log('   '+(it.level==='高'?'▲':'●')+' ['+it.kind+'·'+it.id+'] '+it.note);
+  });
+}
+$('rvCopyBtn').addEventListener('click',function(){
+  var r=window.__rv;
+  if(!r||!r.items.length){log('✗ 没有可复制的存疑条目。');return}
+  api('/api/copy',{text:rvText(r)}).then(function(x){
+    if(x.error){log('✗ '+x.error);return}
+    log('已把 '+r.items.length+' 条存疑复制到剪贴板('+x.n_chars+' 字符); 粘给豆包, '
+        +'明确要求「只改点到的段, 其余照抄」。');
   });
 });
 function showTab(tab){
@@ -784,6 +915,8 @@ class H(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif path == "/api/check":
             self._check(b)
+        elif path == "/api/review":
+            self._review(b)
         elif path == "/api/commit":
             self._commit(b)
         elif path == "/api/copy":
@@ -863,6 +996,20 @@ class H(BaseHTTPRequestHandler):
                       for lv, k, m, u in r["items"]],
             "rows": [{"ratio": round(rt, 3), "id": uid, "orig": o, "zh": z}
                      for rt, uid, o, z in r["rows"]]})
+
+    def _review(self, b):
+        """⑥ 语义审核: 只读 —— 不落任何产物、不动已检查状态(审核不改门禁结论)。
+        慢(整篇要几十秒到几分钟), 但本服务器是 ThreadingHTTPServer, 心跳照走。"""
+        r = review(b.get("text", ""))
+        if "error" in r:
+            self._json({"error": r["error"]})
+            return
+        self._json({"ok": True, "job": r["job"], "n": r["n_units"],
+                    "n_chunks": r["n_chunks"], "n_failed": r["n_failed"],
+                    "secs": r["secs"], "model": r["model"], "report": r["report"],
+                    "logs": r["logs"],
+                    "items": [{"id": u, "kind": k, "level": lv, "note": n, "quote": q}
+                              for u, k, lv, n, q in r["items"]]})
 
     def _commit(self, b):
         with LOCK:
