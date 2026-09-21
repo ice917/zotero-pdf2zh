@@ -49,6 +49,9 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
 用法:
   python panel.py                        启动面板(自动开窗)
   python panel.py --selftest [回包文件]   无界面自检(跑 analyse 并打印待看清单)
+
+**逐步骤操作手册见 relay_spec.md 第 9 节**(启动/① → ⑥ 各步做什么与不做什么/退出规则/
+出问题先查什么)。本文件头只讲设计取舍与契约, 那节讲怎么用。
 """
 import hashlib
 import io
