@@ -144,11 +144,21 @@ def _child_terminal_size(cols, rows):
 
 def _decode_pty_utf8(data, leftover):
     buf = leftover + data
-    try:
-        return buf.decode("utf-8"), b""
-    except UnicodeDecodeError as exc:
-        complete = buf[: exc.start].decode("utf-8", errors="replace")
-        return complete, buf[exc.start :]
+    # A multi-byte character can be split across two reads: try to peel up to
+    # three trailing bytes off so the head is complete UTF-8, and keep those
+    # bytes as `leftover` for the next chunk.
+    for cut in range(0, 4):
+        head = buf[: len(buf) - cut] if cut else buf
+        try:
+            return head.decode("utf-8"), (buf[len(buf) - cut :] if cut else b"")
+        except UnicodeDecodeError:
+            continue
+    # Genuinely invalid bytes (e.g. a lone 0x80 from a child process that emits
+    # non-UTF-8). Replacing them is the only way forward: the old code kept
+    # `buf[exc.start:]` as `leftover`, so every later read failed again at
+    # offset 0, `_parse_progress` received an empty string forever (progress
+    # frozen) and `leftover` grew without bound.
+    return buf.decode("utf-8", errors="replace"), b""
 
 
 def _write_pty_chunk(data, leftover, task_id):

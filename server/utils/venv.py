@@ -26,6 +26,42 @@ DEFAULT_MIRROR_SOURCE = "https://mirrors.ustc.edu.cn/pypi/simple"
 PYPI_SOURCE = "https://pypi.org/simple"
 
 
+def _normalized_executable(token) -> str:
+    name = os.path.basename(str(token)).lower()
+    return name[:-4] if name.endswith(".exe") else name
+
+
+def _engine_from_command(command) -> str:
+    """Decide the managed env from the *executable* position only.
+
+    The previous heuristic searched the whole joined command line, so the
+    choice flipped to pdf2zh_next whenever any argument contained that
+    substring (an input PDF file name, an --output directory). The wrong
+    environment was then selected and the translation failed with a
+    misleading "environment unavailable" error.
+    """
+    parts = [str(part) for part in command if str(part).strip()]
+    if not parts:
+        return "pdf2zh"
+
+    head = _normalized_executable(parts[0])
+    if head == "pdf2zh_next":
+        return "pdf2zh_next"
+    if head == "pdf2zh" or head.startswith("pdf2zh-"):
+        return "pdf2zh"
+    if head == "python" or head.startswith("python3"):
+        for index, token in enumerate(parts[1:], start=1):
+            if token == "-m" and index + 1 < len(parts):
+                module = _normalized_executable(parts[index + 1])
+                return "pdf2zh_next" if module == "pdf2zh_next" else "pdf2zh"
+        return "pdf2zh"
+
+    # Unknown executable (custom wrapper): keep the historical scan so that
+    # existing callers do not change behaviour.
+    joined = " ".join(str(part) for part in command).lower()
+    return "pdf2zh_next" if "pdf2zh_next" in joined else "pdf2zh"
+
+
 def normalize_pkg_name(name: str) -> str:
     return name.lower().replace("_", "-").replace(".", "-").split("=")[0]
 
@@ -355,7 +391,7 @@ class VirtualEnvManager:
         return bin_dir if os.path.exists(bin_dir) else False
 
     def _resolved_command(self, command):
-        engine = "pdf2zh_next" if "pdf2zh_next" in " ".join(command).lower() else "pdf2zh"
+        engine = _engine_from_command(command)
         if not self.ensure_env(engine):
             raise RuntimeError(
                 f"无法准备可用的 {engine} 托管翻译环境。Server 本身仍可运行，"
