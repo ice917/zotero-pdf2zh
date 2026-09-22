@@ -55,6 +55,9 @@
                                  文件/--dry-run 不落库/实跑先备份改写前/路径全参数化
   30. test_polish_paths.py     v28.67 润色路径(P4): example 不带本机盘符(相对仓库根)/
                                  回填锚定 + 缺文件响亮告警/目录类缺失不算错/接线守卫
+  31. test_result_naming.py    v28.68 交件命名契约: 两份契约逐字节一致(tools↔server)/
+                                 新件缺省 webai 而旧件 .doubao* 原样保留(改名不断链)/
+                                 两族同权(glob/matches/belongs) + 四处调用点接线守卫
 
 设计约定:
     - 全部 stdlib + venv 内 pdf2zh, 不需要 pytest
@@ -101,6 +104,7 @@ SUITES = [
     "test_env_isolation.py",      # v28.67 每任务环境隔离(P1): 提字档只进本次子进程
     "test_dedouble_sweep.py",     # v28.67 去叠清扫(P3): import 无副作用 + 路径参数化
     "test_polish_paths.py",       # v28.67 润色路径(P4): example 不带本机盘符 + 缺路径响亮报错
+    "test_result_naming.py",      # v28.68 交件命名契约: 两侧一致/新旧互认/两族同权/接线守卫
 ]
 
 # 套件 → 它的"被测对象"(相对项目根)。**只在对象不随包分发时才需要登记** ——

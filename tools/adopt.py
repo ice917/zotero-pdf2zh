@@ -8,7 +8,7 @@
       注入时的侧车不是同一篇 -> 回锚错位 (seg_export/seg_inject 的 --sidecar
       帮助都写着"新论文请先归档", 但那只是句提醒, 没人拦你);
       [v28.9 已收口: converter 按文档散列另落一份 pdf-<md5>.jsonl, export --pdf 认领它]
-    - 豆包交件可能有多个版本 (wang2026.doubao.txt/doubao2/doubao3), 拿错一份
+    - 豆包交件可能有多个版本 (wang2026.webai.txt/webai2/webai3 或旧的 .doubao*), 拿错一份
       整轮白干;
     - `seg_inject` 的文档指纹探测失败会**静默回落 Cactaceae 默认值**, 对别的
       论文就是 "UPDATE 命中 0 行" 的 FAIL, 而原因看起来像"缓存没这条";
@@ -41,7 +41,7 @@
 用法 (解释器同 tools/tests/run_all.py):
   PY = D:/Users/<user>/anaconda3/envs/zotero-pdf2zh-venv/python.exe
   & $PY tools/adopt.py export --name payload_p2_p4 --pages 2-4 --pdf "D:/.../xxx.pdf" --doc "标题 (期刊, 年份)"
-  & $PY tools/adopt.py deliver --name payload_p2_p4 --text "D:/.../p2_p4.doubao.txt"
+  & $PY tools/adopt.py deliver --name payload_p2_p4 --text "D:/.../p2_p4.webai.txt"
   & $PY tools/adopt.py import  --name payload_p2_p4
   & $PY tools/adopt.py inject  --name payload_p2_p4
   & $PY tools/adopt.py render  --name payload_p2_p4 --pdf "D:/.../xxx.pdf"
@@ -153,6 +153,7 @@ if TOOLS not in sys.path:
 SI, SJ = _load_siblings()
 
 import engine as ENG                                    # noqa: E402  (须在 sys.path 之后)
+import result_naming as RN                              # noqa: E402  交件命名契约(后缀族)
 
 ENGINE = None          # 当前引擎画像; 由 use_engine() 设定
 SIDECAR = ""           # pdf2zh: 全局侧车; next: 空串(next 无侧车, 由 resolve_sidecar 拒绝)
@@ -915,12 +916,12 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
     L.append("5. 第二节的错位判据只认数字 / [n] / 𝒪( —— 载荷里数学记号多、ASCII 数字少的"
              "段落它可能**漏报**。所以第三节的并排若读出\"译文其实是相邻段的译文\"，"
              "即便第二节没列，也当错位带处理。")
-    L.append("6. 改完**用同一个文件名覆盖**重交（`%s.doubao.txt`）—— out/ 里留两份候选"
-             "（比如又存一份 `.doubao2.txt`）会让 deliver 判\"交件件不唯一\"直接拒收。"
+    L.append("6. 改完**用同一个文件名覆盖**重交（`%s`）—— out/ 里留两份候选"
+             "（比如又存一份 `.webai2.txt`）会让 deliver 判\"交件件不唯一\"直接拒收。"
              "**只改了几段就别整篇重吐**（输出一长就被截断，下一轮又冒出一批没译完的）："
              "用 `merge_result` 工具——patch 里只写要改的段（`#S386` + 该段新译文），"
              "它只替换点到的段（其余段一个字节不动），写回后**逐段回读比对**，"
-             "没生效会当场报出段号。" % name)
+             "没生效会当场报出段号。" % RN.normalize(name))
     L.append("")
     with open(p, "w", encoding="utf-8") as f:
         f.write("\n".join(L))
@@ -928,6 +929,16 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
 
 
 # ------------------------------------------------------------------ 阶段 2: deliver
+def delivery_candidates(name):
+    """out/ 下这一篇的全部交件(两族同权: `.doubao*` 与 `.webai*`), 按文件名排序。
+
+    [v28.68] 只扫一族就会漏掉另一半 —— 改名期间 out/ 里两族并存是常态。
+    口径取自 tools/result_naming.py(交件命名契约), 不在这里另写一套后缀。
+    """
+    return sorted(c for pat in RN.globs(name)
+                  for c in glob.glob(os.path.join(OUTDIR, pat)))
+
+
 def stage_deliver(args):
     led = load_ledger(args.name)
     if not guard(led, "deliver", args.force):
@@ -939,7 +950,11 @@ def stage_deliver(args):
     if args.clip:
         text = subprocess.run(["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"],
                               capture_output=True).stdout.decode("utf-8", "replace")
-        path = os.path.join(OUTDIR, args.name + ".doubao.txt")
+        # 落盘名: 该篇已"恰有一份"交件就沿用它的名字(改名不该让在跑的论文多出一份候选),
+        # 否则按缺省族新建。两族同权 —— 旧件叫 .doubao.txt 就继续叫 .doubao.txt。
+        cand = delivery_candidates(args.name)
+        fn = os.path.basename(cand[0]) if len(cand) == 1 else RN.normalize(args.name)
+        path = os.path.join(OUTDIR, fn)
         if os.path.exists(path) and not args.force:
             return die("已存在 %s; 覆盖请加 --force" % path)
         os.makedirs(OUTDIR, exist_ok=True)
@@ -953,9 +968,10 @@ def stage_deliver(args):
         with open(path, encoding="utf-8-sig") as f:
             text = f.read()
     else:
-        cand = sorted(glob.glob(os.path.join(OUTDIR, args.name + ".doubao*.txt")))
+        cand = delivery_candidates(args.name)
         if not cand:
-            return die("out/ 下没有 %s.doubao*.txt; 请用 --text 指定交件件" % args.name)
+            return die("out/ 下没有 %s 的交件(找 %s); 请用 --text 指定交件件"
+                       % (args.name, " / ".join(RN.globs(args.name))))
         if len(cand) > 1:
             print("[adopt] 交件候选 %d 份:" % len(cand))
             for c in cand:
@@ -1496,8 +1512,8 @@ def main():
 
     p = sub.add_parser("deliver", help="2 登记豆包交件 (段号守恒 + 留空/半截/错位/不变量/⋮ 内容门禁)")
     common(p)
-    p.add_argument("--text", default="", help="交件文件; 缺省自动找 out/<name>.doubao*.txt")
-    p.add_argument("--clip", action="store_true", help="从剪贴板取并落盘为 out/<name>.doubao.txt")
+    p.add_argument("--text", default="", help="交件文件; 缺省自动找 out/<name>.<族>*.txt (族=doubao|webai)")
+    p.add_argument("--clip", action="store_true", help="从剪贴板取并落盘为 out/<name>.webai.txt (该篇已有唯一交件则沿用其名)")
     p.add_argument("--waive", action="store_true",
                    help="[2026-09-20] 显式放行内容门禁不符(留痕于台账+报告)。"
                         "只给「确认过的合理改写」用; --force 跳的是顺序门禁, 不跳内容门禁")

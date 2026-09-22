@@ -28,9 +28,10 @@
                                整篇重译, 实测那样会洗掉大部分已定稿段落并重新引入
                                公式字形块破坏
   submit_result(name, text)    保存译文到 <项目根>/out, 返回段号统计。
-                               文件名统一落成 `<名>.doubao.txt` —— 与 tools/adopt.py
-                               的 deliver 自动发现规则 (out/<name>.doubao*.txt) 对齐;
-                               否则豆包交的件 deliver 认不到, 纯豆包环境就断在这
+                               文件名统一落成 `<名>.webai.txt` —— 与 tools/adopt.py
+                               的 deliver 自动发现规则 (out/<name>.<族>*.txt, 族见
+                               tools/result_naming.py) 对齐; 否则交的件 deliver 认不到,
+                               只有网页 AI 的环境就断在这一步
   merge_result(name, patch)    按段号把补丁并进**已有的**交件 (2026-09-20)。
                                只改了几段时用它, 不要整篇重吐 —— 整篇重吐要再吐全篇,
                                输出一长就撞上输出上限被截断, 下一轮又冒出一批"只译了
@@ -60,6 +61,13 @@ import sys
 import time
 import traceback
 
+# 交件命名契约(tools/ 侧)。桥可能被 MCP 宿主以任意 cwd 拉起, 故按**本文件所在目录**
+# 兜底入 path —— 与下面 seg_merge 的懒加载同一套理由(只依赖本仓库, 不依赖 cwd)。
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import result_naming as RN      # noqa: E402
+
 # 路径**不焊死在本机** —— 与 tools/adopt.py / tools/seg_export.py 同一套环境变量
 # 约定 (P2Z_PROJ / P2Z_INBOX)。桥是这条链上最容易被"换台电脑就废"的一环:
 # 别的用户把项目装在别的盘符时, 焊死的 D:\zotero-pdf2zh 会让所有工具全部指向空目录。
@@ -78,11 +86,11 @@ S_LINE = re.compile(r"(?m)^\s*#S(\d+)\s*$")
 # 跨页合并段在段内的断点记号 —— 与 seg_export / seg_import / seg_merge 同一符号。
 # selfcheck 的「⋮ 断点对账」按它计数, 口径必须与交付侧一致, 不能各写一个字符。
 BREAK = "⋮"
-_DOUBAO_SUFFIX = re.compile(r"\.doubao\d*$")
-# out/ 下的交件: `<论文名>.doubao[序号].txt`。第 1 组是论文名, 第 2 组是轮次号。
+# 交件命名(`<篇名>.<族>[轮次].txt`)的唯一事实源是 tools/result_naming.py —— 这里不再
+# 自己写死后缀族, 与 adopt.py / seg_merge.py 共用同一份; server 侧(等交件的轮询)
+# 自带逐字节相同的副本, 由 tools/tests/test_result_naming.py 断言两侧一致。
 # 只认这个形态 —— out/ 里还堆着 seg_import/seg_inject 的中间产物
-# (.imported.json / .merged.txt / .raw.txt), 一律不能当"上一版交件"甩给豆包。
-_RESULT_FILE = re.compile(r"^(.+?)\.doubao(\d*)\.txt$")
+# (.imported.json / .merged.txt / .raw.txt), 一律不能当"上一版交件"甩出去。
 
 # review/ 下按前缀区分七种报告; 默认取第一种 —— 门禁报告才有 PASS/FAIL 判定
 # 「门禁拒收」(2026-09-20 加) 是 deliver 阶段内容门禁拦下交件时落的清单: 哪几段
@@ -108,22 +116,12 @@ def _safe_name(name):
 
 
 def _result_name(name):
-    """交件文件名规范化 → `<stem>.doubao.txt`。
+    """交件文件名规范化 → `<篇名>.<族>[轮次].txt`(缺省族 `webai`)。
 
-    为什么要规范化: tools/adopt.py 的 deliver 缺省只认 `out/<name>.doubao*.txt`
-    (多轮定稿靠 .doubao/.doubao2/.doubao3 区分)。而豆包最常见的提交名是
-    inbox 里那个原名 (`egophys2026.txt`) —— 直接落盘就落成 `out/egophys2026.txt`,
-    deliver 找不到 → 断在交件这一步。
-
-    实测 (2026-09-19 豆包日志): 之所以历史上没断, 是因为人在对话框里额外叮嘱了
-    "存成 egophys2026.doubao.txt"。**依赖人记得说, 不是契约** —— 这个函数把它变成契约。
-
-    已带 `.doubao` / `.doubao2` / `.doubao3` 的名字原样保留(不叠成 .doubao.doubao)。
+    规范化本身住在交件命名契约里(tools/result_naming.py) —— 桥、adopt、seg_merge
+    若各写一套"后缀长什么样", 改名时就必然漏掉一处; 这里只转调, 不复制规则。
     """
-    stem, _ext = os.path.splitext(name)
-    if not _DOUBAO_SUFFIX.search(stem):
-        stem += ".doubao"
-    return stem + ".txt"
+    return RN.normalize(name)
 
 
 def tool_list_inbox(args):
@@ -139,9 +137,9 @@ def tool_list_inbox(args):
 
 def _stem_of(raw):
     """从交件名 / run 名 / 载荷名里取出"篇名"stem:
-    payload_x.doubao.txt / payload_x.doubao2.txt / payload_x.txt / payload_x → payload_x
+    payload_x.webai.txt / payload_x.doubao2.txt / payload_x.txt / payload_x → payload_x
     """
-    return _RESULT_FILE.match(_result_name(_safe_name(raw))).group(1)
+    return RN.stem_of(_safe_name(raw))
 
 
 def _load_payload(raw):
@@ -307,12 +305,13 @@ def _result_names(stem=None):
 
     stem 是论文名(如 "wang2026")。比对上放宽成前缀匹配 —— 交件名由 submit_result
     规范化而来, 但历史文件是人手起的, 别因为大小写/多一个空格就一条都列不出来。
+    两族(`.doubao` / `.webai`)同权: 改名的目的是"名实相符", 不是把旧件变成看不见。
     """
     if not os.path.isdir(OUTDIR):
         return []
-    names = [n for n in os.listdir(OUTDIR) if _RESULT_FILE.match(n)]
+    names = [n for n in os.listdir(OUTDIR) if RN.matches(n)]
     if stem:
-        names = [n for n in names if n.lower().startswith(stem.lower() + ".doubao")]
+        names = [n for n in names if RN.belongs(n, stem)]
     names.sort(key=lambda n: os.path.getmtime(os.path.join(OUTDIR, n)), reverse=True)
     return names
 
@@ -320,7 +319,7 @@ def _result_names(stem=None):
 def _seg_count(path):
     """数一份交件里的 #S 段号个数; 读不动返回 -1。
 
-    列交件必须带段数: 同一篇在 out/ 下有多轮(.doubao/.doubao2/.doubao3/.doubao4),
+    列交件必须带段数: 同一篇在 out/ 下有多轮(如 .webai/.webai2/.doubao3),
     光看字节数分不清哪份是全的、哪份是残件 —— 而"该在上一版基础上改"这件事,
     前提就是先认出哪份是全量上一版。
     """
@@ -447,7 +446,7 @@ def tool_submit_result(args):
     fn = _result_name(fn)
     p = os.path.join(OUTDIR, fn)
     # 先认上一版再由它算差异: 写盘之后最新的那份就成了自己, 认出来没有意义
-    prev = _prev_round(_RESULT_FILE.match(fn).group(1), fn)
+    prev = _prev_round(RN.stem_of(fn), fn)
     with open(p, "w", encoding="utf-8") as f:
         f.write(text)
     segs = S_LINE.findall(text)
@@ -510,7 +509,7 @@ def tool_merge_result(args):
     if info["noop"]:
         stats += ("\n⚠️ 这些段的新文本与原文**一模一样**(等于没改, 确认是有意为之?): %s"
                   % ", ".join("#S%d" % k for k in info["noop"]))
-    stats += "\n" + "\n".join(SM.audit_text(_RESULT_FILE.match(fn).group(1), info["text"]))
+    stats += "\n" + "\n".join(SM.audit_text(RN.stem_of(fn), info["text"]))
     _log("合稿 %s: %d 段生效, %d 段未改动" % (fn, info["applied"], len(info["noop"])))
     return stats
 
@@ -803,7 +802,7 @@ TOOLS = [
                        "name 从 list_results 的结果里原样复制。",
         "inputSchema": {
             "type": "object",
-            "properties": {"name": {"type": "string", "description": "交件文件名, 如 wang2026.doubao3.txt"}},
+            "properties": {"name": {"type": "string", "description": "交件文件名, 如 wang2026.webai3.txt (旧件 wang2026.doubao3.txt 同样认)"}},
             "required": ["name"],
         },
     },
@@ -811,8 +810,8 @@ TOOLS = [
         "name": "submit_result",
         "description": "提交译文: 保存到 out/ 并返回统计。每段译文行首保留 #S编号, 跨页断点处保留 ⋮。"
                        "name 直接填 get_payload 取件时那个**原名**即可 (如 egophys2026.txt) —— "
-                       "落盘时会自动规范成 `原名.doubao.txt`, 交给 adopt 的 deliver 认领; "
-                       "若要交多轮定稿, 用 `egophys2026.doubao2.txt` 这样带序号的名字。"
+                       "落盘时会自动规范成 `原名.webai.txt`, 交给 adopt 的 deliver 认领; "
+                       "若要交多轮定稿, 用 `egophys2026.webai2.txt` 这样带序号的名字。"
                        "返回值会附上与上一版相比的改动段数: 若提示'改动面过大', 说明这一轮是在重译, "
                        "应当先用 get_result 读回上一版再改",
         "inputSchema": {
@@ -838,7 +837,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "name": {"type": "string",
-                         "description": "要改的交件名(list_results 里的名字, 或 payload 原名), 如 egophys2026.doubao.txt"},
+                         "description": "要改的交件名(list_results 里的名字, 或 payload 原名), 如 egophys2026.webai.txt"},
                 "patch": {"type": "string",
                           "description": "只含要改的段: #S编号 行 + 该段新译文; 没出现的段一律不动"},
             },
@@ -878,7 +877,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "name": {"type": "string",
-                         "description": "交件名(如 egophys2026.doubao.txt)或载荷名(如 payload_p2_p4); 传了 text 时可省"},
+                         "description": "交件名(如 egophys2026.webai.txt)或载荷名(如 payload_p2_p4); 传了 text 时可省"},
                 "text": {"type": "string",
                          "description": "要自检的全文(含 #S 编号行); 不传则按 name 去 out/ 取那份交件"},
             },

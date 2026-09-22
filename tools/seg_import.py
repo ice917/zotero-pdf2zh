@@ -44,6 +44,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 # [v28.39] 引擎画像: 侧车路径随 P2Z_ENGINE 走(adopt 会把该变量传给子进程); 缺省画像
 # pdf2zh 1.x —— 与引入本层之前逐字节一致。
 import engine as _ENG                                     # noqa: E402
+import result_naming as RN                                # noqa: E402  交件命名契约(后缀族)
 _PROF = _ENG.active()
 SIDECAR = _PROF.sidecar or ""
 PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
@@ -204,7 +205,8 @@ def write_rework_note(man, src, report, detail):
         L.extend(lines)
     L.append("")
     L.append("## 交件")
-    L.append("- 交件名: `%s.doubao*.txt`（递增，别覆盖上一版）" % name)
+    L.append("- 交件名: `%s`（递增，别覆盖上一版；旧的 `.doubao*` 名字也认）"
+             % RN.normalize(name))
     L.append("- 段号必须 #S1–#S%s 连续无缺。" % (max(keys) if keys else "?"))
     L.append("- 没点到的段逐字符照抄上一版。")
     L.append("")

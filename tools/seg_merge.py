@@ -9,7 +9,7 @@
   **改完没生效就提交了** —— 全程没有任何东西告诉他"你的替换没落地"。
 
 做什么:
-  1. 读已有交件(缺省 out/<name>.doubao.txt)与补丁文件(只含要改的段)
+  1. 读已有交件(缺省 out/<name>.webai.txt, 旧件 out/<name>.doubao.txt 同样认)与补丁文件(只含要改的段)
   2. 只替换补丁点到的段, **其余字节一个都不动**(按正文区间切片, 不重排全文)
   3. 写临时文件 -> 回读逐段比对 -> 通过才原子替换正式交件
      (校验不过/写失败时, 正式交件原封不动 —— 要么全生效, 要么完全没动)
@@ -36,7 +36,6 @@
 退出码: 合稿并校验通过 0 / 补丁不合法或校验未过 1
 """
 import argparse
-import glob
 import os
 import sys
 
@@ -53,6 +52,8 @@ except Exception:
 #   SI.KEY_LINE / SI.parse_blocks —— 段号行怎么认 (与门禁同一套, 容忍 markdown 加粗)
 #   ratio_audit                   —— 长度比自查 (与门禁报告同一份实现)
 #   INBOX / OUTDIR                —— 路径也认 P2Z_PROJ, 换台电脑不废
+#   A.delivery_candidates / A.RN  —— 交件命名的后缀族(doubao|webai)只认
+#                                    tools/result_naming.py 那一份契约, 本文件不写死
 import adopt as A  # noqa: E402
 
 BOM = b"\xef\xbb\xbf"
@@ -262,7 +263,7 @@ def audit_text(name, text=""):
     同一口径, 免得两处漂。text 为空时按名字去 out/ 取最新那份。
     """
     if not text:
-        cand = sorted(glob.glob(os.path.join(A.OUTDIR, name + ".doubao*.txt")))
+        cand = A.delivery_candidates(name)
         if not cand:
             return ["(交件不在, 跳过长度比自查)"]
         text, _ = _read(cand[-1])
@@ -294,18 +295,18 @@ def audit_text(name, text=""):
 
 def main():
     ap = argparse.ArgumentParser(description="按段号把补丁并进已有交件(逐段回读校验)")
-    ap.add_argument("--name", required=True, help="run 名(对应 out/<name>.doubao*.txt)")
+    ap.add_argument("--name", required=True, help="run 名(对应 out/<name>.<族>*.txt, 族=doubao|webai)")
     ap.add_argument("--patch", required=True, help="补丁文件: 只含要改的 #S编号 块")
-    ap.add_argument("--delivery", default="", help="交件路径; 缺省取 out/<name>.doubao*.txt(须唯一)")
+    ap.add_argument("--delivery", default="", help="交件路径; 缺省取 out/<name>.<族>*.txt(须唯一)")
     args = ap.parse_args()
 
     if args.delivery:
         path = os.path.abspath(args.delivery)
     else:
-        cand = sorted(glob.glob(os.path.join(A.OUTDIR, args.name + ".doubao*.txt")))
+        cand = A.delivery_candidates(args.name)
         if not cand:
-            return die("out/ 下没有 %s.doubao*.txt —— 先交一版全文, 之后才谈得上按段号合稿"
-                       % args.name)
+            return die("out/ 下没有 %s 的交件(找 %s) —— 先交一版全文, 之后才谈得上按段号合稿"
+                       % (args.name, " / ".join(A.RN.globs(args.name))))
         if len(cand) > 1:
             return die("交件候选 %d 份(%s), 请用 --delivery 指定要合的那一份"
                        % (len(cand), ", ".join(os.path.basename(c) for c in cand)))

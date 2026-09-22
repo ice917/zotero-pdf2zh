@@ -20,12 +20,15 @@ from utils.config import Config
 from utils.config_map import pdf2zh_next_service_aliases
 from utils.config_migration import prepare_config_files
 from utils.cropper import Cropper
+# [v28.68] 交件命名契约: 后缀族 doubao|webai 只认这两份(tools/result_naming.py 与
+# server/utils/result_naming.py, 由 tools/tests/test_result_naming.py 断言一致)。
+from utils.result_naming import globs as result_globs
 import traceback
 import argparse
 import sys  # 用于退出脚本
 import re   # 用于解析版本号和提取错误信息
 import io
-import glob    # [v28.23] 等豆包交件落盘(out/<name>.doubao*.txt)
+import glob    # [v28.23] 等网页 AI 交件落盘(out/<name>.<族>*.txt, 族=doubao|webai)
 import hashlib  # [v28.26] 按 PDF 内容散列定位本轮的归档侧车(提字进度源)
 import socket  # 用于端口检查
 import time    # 用于 SSE 推送间隔
@@ -1180,24 +1183,28 @@ class PDFTranslator:
             return self._handle_exception(e, context='/translate', task_id=task_id)
 
     def _wait_for_doubao_delivery(self, task_id, name, minutes, since_ts):
-        """[v28.23] 等豆包交件落盘 out/<name>.doubao*.txt; 超时返回 ""。
+        """[v28.23] 等网页 AI 交件落盘 out/<name>.<族>*.txt (族=doubao|webai); 超时返回 ""。
 
         为什么轮询文件而不是等 MCP 反向通知: 交件本身就是"文件落盘"(桥的
         submit_result 与剪贴板粘贴落盘走同一个命名), 而 MCP 服务端→客户端
         没有"唤醒 agent 干活"的标准语义 —— 现在是**我们等它**, 不是它等我们推。
 
         只认 since_ts 之后落盘的文件: out/ 里常常堆着同一篇的历史交件
-        (wang2026.doubao1..5 实测), 认错一份整轮白干 —— adopt 的 deliver 门禁
+        (wang2026.webai1..5 实测), 认错一份整轮白干 —— adopt 的 deliver 门禁
         也是为这个设的。认"本次任务开始后才出现的、最新的一份", 是自动回路里
         唯一站得住的判据(无人可问, 不能拿旧的充新的)。
+
+        [v28.68] 两族都要扫: 交件命名的后缀族从单一 `doubao` 扩成 `doubao|webai`
+        (新件缺省 webai, 旧件继续认) —— 只扫一族就会漏掉另一半, 而这一处漏了
+        的后果是"等到超时", 看起来像交件没交, 实际是名字没对上。
         """
         proj = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
-        pattern = os.path.join(proj, "out", name + ".doubao*.txt")
+        patterns = [os.path.join(proj, "out", pat) for pat in result_globs(name)]
         floor = since_ts - 1.0   # 让 1s 内的时间戳粒度(±1)不误杀
         deadline = time.time() + minutes * 60.0
         waited = 0
         while True:
-            hits = [f for f in glob.glob(pattern)
+            hits = [f for pat in patterns for f in glob.glob(pat)
                     if os.path.isfile(f) and os.path.getsize(f) > 0
                     and os.path.getmtime(f) >= floor]
             if hits:

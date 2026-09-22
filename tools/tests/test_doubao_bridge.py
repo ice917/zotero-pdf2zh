@@ -8,11 +8,13 @@
      P2Z_PROJ / P2Z_INBOX 环境变量约定。
 
   ② 交件命名与下游对不上: 桥按 `out/<name>` 原样落盘, 而 tools/adopt.py 的
-     deliver 缺省只认 `out/<name>.doubao*.txt`。豆包最常见的提交名是 inbox 里
-     那个原名 → 落成 `out/egophys2026.txt` → deliver 认不到, 断在交件这一步。
-     实测 2026-09-19 豆包日志: 历史上没断是因为**人在对话框里额外叮嘱了**
-     "存成 egophys2026.doubao.txt" —— 依赖人记得说, 不是契约。
-     修法: 落盘前统一规范成 `<stem>.doubao.txt`(已带 .doubaoN 的原样保留)。
+     deliver 缺省只认 `out/<name>.<族>*.txt`(族见 tools/result_naming.py)。豆包
+     最常见的提交名是 inbox 里那个原名 → 落成 `out/egophys2026.txt` → deliver
+     认不到, 断在交件这一步。实测 2026-09-19 豆包日志: 历史上没断是因为**人在
+     对话框里额外叮嘱了** "存成 egophys2026.doubao.txt" —— 依赖人记得说, 不是契约。
+     修法: 落盘前统一规范成 `<stem>.<族>.txt`(已带族+轮次的原样保留)。
+     [v28.68] 缺省族由 `doubao` 改 `webai`(粘贴通道不绑厂商); 旧的 `.doubao*`
+     一个字节不动、照样被认 —— 改名断掉在跑的论文是本末倒置。
 
   ③ [v28.4] 豆包看不见问题: 桥只有 inbox/out 两个视野, 而"哪儿错了"写在
      server/translated/review/*.md 里。豆包因此只能整篇重抄、不能矫正。
@@ -28,6 +30,7 @@
 
 本测试锁五点:
   ① `_result_name` 的规范化边界(原名/带序号/无扩展名/多段扩展名) + `_stem_of` 取篇名
+     + v28.68 新旧两族的互认(新件缺省 webai / 旧件 .doubao* 原样保留)
   ② 真跑一次 STDIO JSON-RPC 往返: 十一工具齐全 + 交件落到规范名 + 缺件报错不崩
      + 未知方法回 -32601 + stdout 洁净(日志不许混进协议通道)
      + merge_result 只动点到段(未点到段逐字不变) / 名字歧义与段号不存在都当场报错
@@ -37,7 +40,7 @@
   ③ 全流程锁在 P2Z_PROJ 沙箱内 —— 真项目的 inbox/out 一个字节都不碰
   ④ report 两工具: 判定行抽取 / kind 过滤 / limit 截断 / 子串定位 / 歧义报错 /
      路径穿越名进不来
-  ⑤ results 两工具: 只认 doubao 系列(中间产物不混进来) / 段数与时间 /
+  ⑤ results 两工具: 只认交件(两族都算, 中间产物不混进来) / 段数与时间 /
      子串定位 / 歧义报错 / 路径穿越名进不来 / 交件回执的改动量自检
 
 运行: venv python test_doubao_bridge.py, 退出码 0=全过
@@ -93,41 +96,51 @@ def main():
             failed += 1
             print(f"  FAIL {name} {detail}")
 
-    # ---- ① 交件命名规范化 ----
-    check("① 原名补 .doubao", BR._result_name("egophys2026.txt") == "egophys2026.doubao.txt",
+    # ---- ① 交件命名规范化 (v28.68: 缺省族 webai, 旧族 doubao 继续认) ----
+    check("① 原名补 .webai", BR._result_name("egophys2026.txt") == "egophys2026.webai.txt",
           BR._result_name("egophys2026.txt"))
-    check("① payload 原名补 .doubao",
-          BR._result_name("payload_p2_p4.txt") == "payload_p2_p4.doubao.txt",
+    check("① payload 原名补 .webai",
+          BR._result_name("payload_p2_p4.txt") == "payload_p2_p4.webai.txt",
           BR._result_name("payload_p2_p4.txt"))
-    check("① .doubao 不叠成 .doubao.doubao",
+    check("① .webai 不叠成 .webai.webai",
+          BR._result_name("wang2026.webai.txt") == "wang2026.webai.txt",
+          BR._result_name("wang2026.webai.txt"))
+    check("① .webai2 保留(多轮定稿)",
+          BR._result_name("wang2026.webai2.txt") == "wang2026.webai2.txt",
+          BR._result_name("wang2026.webai2.txt"))
+    # 旧族一路照旧: 改名不许把在跑的论文断链(旧件原样保留 = out/ 里不凭空多出候选)
+    check("① 旧件 .doubao 原样保留(不叠成 .webai.doubao)",
           BR._result_name("wang2026.doubao.txt") == "wang2026.doubao.txt",
           BR._result_name("wang2026.doubao.txt"))
-    check("① .doubao2 保留(多轮定稿)",
+    check("① 旧件 .doubao2 保留",
           BR._result_name("wang2026.doubao2.txt") == "wang2026.doubao2.txt",
           BR._result_name("wang2026.doubao2.txt"))
-    check("① .doubao3 保留",
+    check("① 旧件 .doubao3 保留",
           BR._result_name("wang2026.doubao3.txt") == "wang2026.doubao3.txt",
           BR._result_name("wang2026.doubao3.txt"))
-    check("① 无扩展名 → .doubao.txt",
-          BR._result_name("roundtrip_test") == "roundtrip_test.doubao.txt",
+    check("① 无扩展名 → .webai.txt",
+          BR._result_name("roundtrip_test") == "roundtrip_test.webai.txt",
           BR._result_name("roundtrip_test"))
     check("① 多段扩展名取最后一段",
-          BR._result_name("paper.v2.txt") == "paper.v2.doubao.txt",
+          BR._result_name("paper.v2.txt") == "paper.v2.webai.txt",
           BR._result_name("paper.v2.txt"))
     check("① 非 .txt 也统一成 .txt(下游只认 .txt)",
-          BR._result_name("note.md") == "note.doubao.txt", BR._result_name("note.md"))
+          BR._result_name("note.md") == "note.webai.txt", BR._result_name("note.md"))
     check("① 规范化后仍能通过文件名白名单",
-          BR._safe_name(BR._result_name("payload p2.txt")) == "payload p2.doubao.txt")
+          BR._safe_name(BR._result_name("payload p2.txt")) == "payload p2.webai.txt")
 
     # ---- ①b 篇名归一: 交件名/载荷原名/run 名 都该归到同一个 stem ----
-    check("① _stem_of 从交件名取篇名",
+    check("① _stem_of 从交件名取篇名(新族)",
+          BR._stem_of("payload_x.webai2.txt") == "payload_x", BR._stem_of("payload_x.webai2.txt"))
+    check("① _stem_of 从交件名取篇名(旧族)",
           BR._stem_of("payload_x.doubao2.txt") == "payload_x", BR._stem_of("payload_x.doubao2.txt"))
     check("① _stem_of 从载荷原名取篇名",
           BR._stem_of("payload_x.txt") == "payload_x", BR._stem_of("payload_x.txt"))
     check("① _stem_of 从 run 名取篇名",
           BR._stem_of("payload_x") == "payload_x", BR._stem_of("payload_x"))
-    check("① _stem_of 三条入口归到同一个篇名(否则 selfcheck 找不到载荷)",
-          BR._stem_of("payload_x.doubao2.txt") == BR._stem_of("payload_x.txt") == BR._stem_of("payload_x"))
+    check("① _stem_of 四条入口归到同一个篇名(否则 selfcheck 找不到载荷)",
+          BR._stem_of("payload_x.webai2.txt") == BR._stem_of("payload_x.doubao2.txt")
+          == BR._stem_of("payload_x.txt") == BR._stem_of("payload_x"))
 
     # ---- ②/③ 真 STDIO 往返, 全程锁在沙箱 ----
     tmp = tempfile.mkdtemp(prefix="p2z_bridge_")
@@ -252,13 +265,13 @@ def main():
               answers[3]["result"]["content"][0]["text"][:80])
 
         # ---- 缺陷② 的直接锁: 交件必须落在 deliver 认得到的名字上 ----
-        check("② 交件落到 <原名>.doubao.txt",
-              os.path.isfile(os.path.join(outdir, "payload_x.doubao.txt")),
+        check("② 交件落到 <原名>.webai.txt",
+              os.path.isfile(os.path.join(outdir, "payload_x.webai.txt")),
               sorted(os.listdir(outdir)))
         check("② 交件没有裸落成原名",
               not os.path.exists(os.path.join(outdir, "payload_x.txt")),
               sorted(os.listdir(outdir)))
-        with open(os.path.join(outdir, "payload_x.doubao.txt"), encoding="utf-8") as f:
+        with open(os.path.join(outdir, "payload_x.webai.txt"), encoding="utf-8") as f:
             check("② 交件内容逐字一致", f.read() == PAYLOAD)
         check("② 交件回执含段号统计",
               "#S: 1,2" in answers[4]["result"]["content"][0]["text"],
@@ -268,12 +281,12 @@ def main():
         r4 = answers[4]["result"]["content"][0]["text"]
         check("② 首轮交件没有上一版 → 回执不带差异行", "与上一版" not in r4, r4)
         r8 = answers[8]["result"]["content"][0]["text"]
-        check("② 次轮回执带与上一版的改动段数",
-              "与上一版 payload_x.doubao.txt 相比: 1/2 段有改动" in r8, r8)
+        check("② 次轮回执带与上一版的改动段数(上一版是新族那件)",
+              "与上一版 payload_x.webai.txt 相比: 1/2 段有改动" in r8, r8)
         check("② 改动面越过阈值时提示'在重译'", "改动面过大" in r8, r8)
         r9 = answers[9]["result"]["content"][0]["text"]
-        check("⑤ list_results 列出历轮",
-              "payload_x.doubao2.txt" in r9 and "payload_x.doubao.txt" in r9, r9)
+        check("⑤ list_results 列出历轮(两族并列)",
+              "payload_x.doubao2.txt" in r9 and "payload_x.webai.txt" in r9, r9)
         check("⑤ list_results 带段数", "2 段" in r9, r9)
 
         # ---- merge_result 的直接锁: 只改点到段 / 未点到段逐字不变 / 两类拒绝 ----
@@ -312,7 +325,7 @@ def main():
 
         # ---- start_delivery: 开底稿(骨架) -> 拒覆盖 -> force 重开 ----
         r14 = answers[14]["result"]["content"][0]["text"]
-        skel_path = os.path.join(outdir, "payload_z.doubao.txt")
+        skel_path = os.path.join(outdir, "payload_z.webai.txt")
         check("② start_delivery 开出底稿文件", os.path.isfile(skel_path),
               sorted(os.listdir(outdir)))
         with open(skel_path, encoding="utf-8") as f:
@@ -366,11 +379,11 @@ def main():
         # ---- ③ 沙箱隔离 ----
         check("③ inbox/out 全在沙箱内",
               os.path.isfile(os.path.join(inbox, "payload_x.txt"))
-              and os.path.isfile(os.path.join(outdir, "payload_x.doubao.txt")))
+              and os.path.isfile(os.path.join(outdir, "payload_x.webai.txt")))
         check("③ 真项目 out/ 未被写入",
               not os.path.isfile(os.path.join(
                   os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh"),
-                  "out", "payload_x.doubao.txt")))
+                  "out", "payload_x.webai.txt")))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -466,7 +479,7 @@ def main():
         BR.OUTDIR = outd
 
         txt = BR.tool_list_results({})
-        check("⑤ 只列 doubao 系列交件(中间产物不混入)",
+        check("⑤ 只列交件(两族都算, 中间产物不混入)",
               "imported.json" not in txt and ".merged.txt" not in txt, txt)
         check("⑤ 段数随列表返回", "3 段" in txt and "1 段" in txt, txt)
         check("⑤ 缺省按时间倒序(上一版在前)",

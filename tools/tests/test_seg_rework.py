@@ -127,7 +127,7 @@ def main():
               "include 3D fabrication" in note_txt, note_txt[:600])
         check("③ 单子要求只改点到的段", "只改下面点到的段" in note_txt)
         check("③ 单子写明交件名与段号范围",
-              "demo2026.doubao*.txt" in note_txt and "#S1–#S1" in note_txt, note_txt[-300:])
+              "demo2026.webai.txt" in note_txt and "#S1–#S1" in note_txt, note_txt[-300:])
         check("③ 单子判 FAIL 计数正确",
               "需返工 1 段 / 1 处字符没有落点" in note_txt, note_txt[:300])
         check("③ 没有别的小节时不空编号",

@@ -229,6 +229,25 @@ def main():
           rc == 0 and d7b.get("state") == "ok" and d7b.get("n_seg") == 2,
           (rc, d7b, out[-200:]))
 
+    # ⑦c [v28.68] 改名: 新族(.webai)单份照样认领; 两族并存同样判"不唯一"
+    #     —— 改名期间 out/ 里两族并存是常态, 只扫一族就会把旧件当新一轮拿错
+    reset(mk_manifest("c7c", [[(1, 0)], [(1, 1)]]))
+    run(["export", "--name", "c7c", "--pages", "1"])
+    with open(os.path.join(AD.OUTDIR, "c7c.webai.txt"), "w", encoding="utf-8") as f:
+        f.write("#S1\n甲\n#S2\n乙\n")
+    rc, out = run(["deliver", "--name", "c7c"])
+    d7c = AD.load_ledger("c7c")["stages"].get("deliver", {})
+    check("⑦c 新族单份交件自动认领",
+          rc == 0 and d7c.get("state") == "ok" and d7c.get("n_seg") == 2, (rc, d7c, out[-200:]))
+
+    reset(mk_manifest("c7d", [[(1, 0)]]))
+    run(["export", "--name", "c7d", "--pages", "1"])
+    for fn in ("c7d.doubao.txt", "c7d.webai.txt"):
+        with open(os.path.join(AD.OUTDIR, fn), "w", encoding="utf-8") as f:
+            f.write("#S1\n甲\n")
+    rc, out = run(["deliver", "--name", "c7d"])
+    check("⑦d 两族并存 -> 判不唯一(不猜哪份新)", rc == 1 and "不唯一" in out, out[-200:])
+
     # ⑧ deliver 通过 + import 侧车被改写 -> 拦
     reset(mk_manifest("c8", [[(1, 0)], [(1, 1)]]))
     run(["export", "--name", "c8", "--pages", "1"])
@@ -631,7 +650,7 @@ def main():
     check('㉕f 改法第 2 条讲"整段译完"并教它比长度自查',
           "每段都要整段译完" in body2b and "只译了开头" in body2b, "")
     check("㉕f 改法明说覆盖同名重交(out/ 不许留第二份候选)",
-          "用同一个文件名覆盖" in body2b and ".doubao2.txt" in body2b, body2b[-700:])
+          "用同一个文件名覆盖" in body2b and ".webai2.txt" in body2b, body2b[-700:])
     check('㉕f 改法点出"并段/重切"=内容漂移的头号成因',
           "内容漂移的头号成因" in body2b, "")
     check("㉕f 改法交代错位判据会漏报(math 记号多的段落)",

@@ -1,11 +1,17 @@
-# zotero-pdf2zh · 豆包译文采纳管线（Doubao Adoption Pipeline）
+# zotero-pdf2zh · 网页 AI 译文采纳管线（Web-AI Adoption Pipeline）
 
 > 基于 [guaguastandup/zotero-pdf2zh](https://github.com/guaguastandup/zotero-pdf2zh) v4.1.7（AGPL-3.0）的改造。
 > 上游解决"把 PDF 翻成中文"；本仓库的增量解决一个上游没碰的问题：**改一个词，不要重译整段**。
+>
+> 这条采纳回路**不绑厂商**：真契约只有两条（编号守恒 + 占位符原位），载荷自带抬头，
+> 回包的包装（``` 围栏、首尾客套、编号被列成清单）会被自动清洗 —— 所以粘贴通道交给哪家
+> 网页 AI 都行。本机当前默认用**豆包**（基础对话免费不限次），换 Kimi / DeepSeek / ChatGPT
+> 网页版不用改提示词；交件后缀族 `doubao|webai` 新旧互认（见 `tools/result_naming.py`）。
 
 ## 一句话
 
-把翻译产出的"所有权"从 LLM 手里拿回来：译文来源与模型解耦，外部定稿（如豆包整篇通读的译文）
+把翻译产出的"所有权"从 LLM 手里拿回来：译文来源与模型解耦，外部定稿（由能通读全文的
+网页 AI 给出，本机当前用豆包）
 经过**段落对齐 → 数字/拉丁名回锚 → 缓存注入**三道机械工序装回原版面。
 此后"改字 = 改字"：45 秒重渲染，0 次 LLM 调用，13 项版面验收断言自动把关。
 
@@ -17,7 +23,7 @@
 | 墙 | 解法 |
 |---|---|
 | 版面保真（公式/表格/双栏/跨页断句） | 版面层不动：34 页 / 154 段槽位图 + `{vN}` 字形表，公式表格原位保留；`verify_render` 13 项断言 + `post_check` 质检门禁 |
-| 语境准确（`successful gamete ≠ 成功的配子`） | 整篇交给能通读全文的引擎（豆包基础对话，免费不限次），术语约束降级为译后校验清单，语境级译法只进文档级台账 |
+| 语境准确（`successful gamete ≠ 成功的配子`） | 整篇交给能通读全文的网页 AI（当前默认豆包基础对话，免费不限次；可换厂商），术语约束降级为译后校验清单，语境级译法只进文档级台账 |
 | 迭代成本（缓存键绑参数，改词 = 重译 39 分钟） | 外部定稿注入缓存：页级→段内占位符重编号 + 文档指纹作用域，改字 = 改字 |
 
 ## 架构
@@ -27,7 +33,7 @@
                                 │
                                 │ seg_export  编号段落包(#S编号+字形还原+断词修复+跨页合并⋮)
                                 ▼
-                        [豆包 基础对话]  ◀── 剪贴板（人工两次粘贴，免费零额度）
+                        [网页 AI 对话]  ◀── 剪贴板（人工两次粘贴，免费零额度）
                                 │
                                 │ seg_import  编号对账 / ⋮对账 / 高价值字形回锚 / 纯标点按契约丢弃
                                 ▼
@@ -38,8 +44,9 @@
 
 可选自动化通道：`doubao_bridge.py` 是零依赖手写的 STDIO MCP 桥（list_inbox / get_payload /
 list_reports / get_report / list_results / get_result / submit_result / search_term），注册进
-豆包「技能·连接器」后可省掉剪贴板（消耗 Agent 模式额度）；其中 `search_term` 让豆包**定稿时自己查证据**，
-不必等人喂数据（见 [术语查证](#术语查证先拿证据再裁决)），`list_reports` / `get_report` 让豆包
+任意支持 MCP 连接器的网页 AI（本机当前用豆包的「技能·连接器」）后可省掉剪贴板（消耗该家 Agent 模式额度）；
+其中 `search_term` 让这位 AI**定稿时自己查证据**，
+不必等人喂数据（见 [术语查证](#术语查证先拿证据再裁决)），`list_reports` / `get_report` 让它
 **自己读质检报告**、知道上一轮哪一页被门禁判死，`list_results` / `get_result` 让它**读回自己上一版稿子**——
 前两个给"哪儿错了"，这两个给"上一版长什么样"，两个都看得见，改稿才是改动而不是重抄一遍；
 `submit_result` 的回执里附上与上一版的改动段数，改动面过大时直接提示"这一轮是在重译"。
@@ -50,8 +57,8 @@ list_reports / get_report / list_results / get_result / submit_result / search_t
 
 ### 自动回路：一个任务内跑完两趟（v28.23，默认关）
 
-上面那套是手工多步（导出 → 豆包 → import → inject → 渲染）。想让**服务端在一次任务里**
-把这条回路走完（第一趟只提字 → 停下来等豆包 → 交稿后回灌 → 第二趟重渲染），把运营开关打开：
+上面那套是手工多步（导出 → 网页 AI → import → inject → 渲染）。想让**服务端在一次任务里**
+把这条回路走完（第一趟只提字 → 停下来等交稿 → 交稿后回灌 → 第二趟重渲染），把运营开关打开：
 
 ```powershell
 $env:PAUSE_TRANSLATE   = "1"    # 不设 = 行为与过去完全一致（开关默认关）
@@ -63,17 +70,17 @@ python server.py
 
 1. **提字中**：引擎收到 `PAUSE_TRANSLATE=1`，只提字、不调翻译 LLM（这一趟零翻译调用），
    跑出的侧车由 `adopt export` 裁成 `inbox/<任务名>.txt`；
-2. **待译**：worker 停住，每 5 秒看一次 `out/<任务名>.doubao*.txt` —— 豆包用桥
+2. **待译**：worker 停住，每 5 秒看一次 `out/<任务名>.<族>*.txt`（族 = `doubao` / `webai`，两族同权）——网页 AI 用桥
    `submit_result` 交件，或人工把译文另存成这个名字，判据相同。只认**本次任务开始之后**
    落盘的最新一份（`out/` 里同一篇的历史交件不作数）；界面不卡，任务卡显示「待译」；
-3. **回灌重渲染**：`deliver → import → inject` 把豆包稿写进缓存（就地改写第一趟留下的骨架行），
+3. **回灌重渲染**：`deliver → import → inject` 把这份稿子写进缓存（就地改写第一趟留下的骨架行），
    服务端随后在同一任务里把开关还原成"关"重跑一遍 —— 全部命中缓存，零翻译调用；
-4. **完成**：产物就是「豆包稿 + 原版面」的中文 PDF。
+4. **完成**：产物就是「网页 AI 稿 + 原版面」的中文 PDF。
 
 等不到交稿也不会卡死：到上限走 `abort()` —— 先 `adopt rollback` 撤掉骨架行，再回落成
 正常机器翻译，任务照样 `success`，产物是正常中文 PDF。
 
-**载荷就绪会响两声**（第一趟比机器翻译快一个量级，人一转头的功夫就过去了，而"该叫豆包了"
+**载荷就绪会响两声**（第一趟比机器翻译快一个量级，人一转头的功夫就过去了，而"该交给网页 AI 了"
 是这条链上唯一需要人立刻接手的时刻）：默认放随服务端自带的 `server/notify-complete.wav`，
 想换音就设 `PDF2ZH_NOTIFY_SOUND` 指向任意 WAV（必须 16-bit PCM —— `winsound` 只吃这种）；
 两个都没有时退回三声蜂鸣，全程静默失败、不影响任务。
@@ -307,7 +314,8 @@ python tools\appendix_species.py --pdf $out --redraw
 | `tools/seg_export.py` | 侧车 → 编号段落包：字形还原、PDF 断词修复、跨页续接合并 |
 | `tools/seg_import.py` | 译文校验与回锚：编号/⋮/数字/拉丁名逐一对账 |
 | `tools/seg_inject.py` | 缓存注入：重编号 + 文档指纹作用域 + 前置断言 + 自动备份 |
-| `tools/doubao_bridge.py` | 豆包本地 MCP 桥（STDIO JSON-RPC，零第三方依赖）：inbox/payload/result 三件套 + `search_term` 术语证据检索 + `list_reports`/`get_report` 读质检报告 + `list_results`/`get_result` 读回上一版交件 |
+| `tools/doubao_bridge.py` | 网页 AI 本地 MCP 桥（STDIO JSON-RPC，零第三方依赖；文件名沿用历史）：inbox/payload/result 三件套 + `search_term` 术语证据检索 + `list_reports`/`get_report` 读质检报告 + `list_results`/`get_result` 读回上一版交件 |
+| `tools/result_naming.py` | 交件命名契约唯一事实源：族 `doubao\|webai` 新旧互认、新件缺省 `webai`（`server/utils/result_naming.py` 是逐字节第二份） |
 | `tools/force_rerender.py` | force 重渲染（防漏传 config 静默回落 bing 重译） |
 | `tools/verify_render.py` | 渲染验收：新串落页 / 旧串清零，13 项断言 |
 | `tools/post_check.py` | 翻译后质检门禁：汉化率 / 引用完整性 / 占位符残留 |
@@ -385,7 +393,7 @@ Copy-Item "$env:USERPROFILE\.cache\pdf2zh\segflow\latest.jsonl" segflow\<书名>
 python tools/seg_export.py --pages 2-4 --name payload_p2_p4 --sidecar segflow/<书名>.jsonl
 Set-Clipboard ([IO.File]::ReadAllText('inbox/payload_p2_p4.txt',[Text.Encoding]::UTF8))
 
-# 2) 豆包基础对话：粘贴 → 译完全选复制
+# 2) 网页 AI 对话（本机当前用豆包基础对话）：粘贴 → 译完全选复制
 
 # 3) 校验（必须 PASS）
 python tools/seg_import.py --manifest inbox/payload_p2_p4.manifest.json --clip --sidecar segflow/<书名>.jsonl
@@ -489,9 +497,9 @@ python tools\term_verify.py <清单.md> --source all               # 全源合�
 - **标了"循环证据"的条目不能用**——库里存着 pdf2zh 自己产出的中文译文 PDF，
   命中它的摘录等于"拿旧译法验证旧译法"。
 
-### 让豆包自己查（MCP 工具 `search_term`）
+### 让网页 AI 自己查（MCP 工具 `search_term`）
 
-豆包就是采纳流程里的那个 LLM。把 `tools/doubao_bridge.py` 注册进豆包的「技能·连接器」后，
+网页 AI 就是采纳流程里的那个 LLM。把 `tools/doubao_bridge.py` 注册进它的「技能·连接器」（本机当前用豆包）后，
 它定稿时可以直接调 `search_term` 取证据——不必你先把术语抄成清单再喂过去。
 
 - 一次查一个术语（`term`），可传 `sources` / `max_results`；返回**证据文本，不落文件**
@@ -499,12 +507,12 @@ python tools\term_verify.py <清单.md> --source all               # 全源合�
 - 被限流或不可达的源会先被剔除并在报告头写明；全部不可达时返回错误，而不是给一份空报告
 - 与命令行版一致：只出证据，不改译文、不写术语表
 
-#### 和豆包自带联网搜索的区别（以及什么时候该调它）
+#### 和网页 AI 自带联网搜索的区别（以及什么时候该调它）
 
 豆包首战**没调**这个工具——它用自身知识 + 自带联网搜索把 `herkogamy` 答对了
 （词源、分类、Webb & Lloyd 都对）。所以这里说清二者差别，免得你纠结"到底要不要调"：
 
-| | 豆包自带联网搜索 | `search_term` |
+| | 网页 AI 自带联网搜索 | `search_term` |
 |---|---|---|
 | 语料来源 | 公开互联网（网页、摘要、开放获取全文） | **你自己 Zotero 库里的 PDF 全文** + OpenAlex |
 | 能否查正在译的这本书 | **不能**（付费专著公网上没有） | 能，直接给原句 |
@@ -514,10 +522,10 @@ python tools\term_verify.py <清单.md> --source all               # 全源合�
 
 **判断标准不是"这词难不难"，而是"答案是否必须来自你自己的语料"：**
 
-- 「herkogamy 是什么意思」→ 豆包自己答就够，调不调都行
+- 「herkogamy 是什么意思」→ 网页 AI 自己答就够，调不调都行
 - 「herkogamy 在**我正在译的这本书**里怎么用的 / 我的译名**有没有本书依据**」→ 必须调它
 
-反过来，豆包的搜索也有它更强的地方：覆盖面更广（新闻、标准文档、你库里没有的近期论文）、
+反过来，网页 AI 的搜索也有它更强的地方：覆盖面更广（新闻、标准文档、你库里没有的近期论文）、
 零前置、更新鲜。**二者互补，不互相替代**——本项目只需它补上"私有语料"这一块，
 所以工具描述里特意写明"你自带的联网搜索拿不到用户收藏的 PDF 原文"。
 
@@ -544,7 +552,7 @@ python tools\term_verify.py <清单.md> --source all               # 全源合�
 ## 已知限制
 
 - 整页大表格保持英文原样（字形保优先于翻译，表格翻译是后续课题）
-- 豆包标点与字形标点并存处可能产生双重标点（吸收算法待改逐字符增量）
+- 网页 AI 标点与字形标点并存处可能产生双重标点（吸收算法待改逐字符增量）
 - 纯拉丁段落不经过 CJK 清理规则
 - `seg_inject` 的文档指纹默认自动探测；若探测不到会回落到作者所用文献的兜底值，换文献使用时请显式传入 `--fp`
 - `style_links` 是"叠绘"而非"替换"：视觉上与原版蓝字一致，但锚文本在 PDF 文本层重复一次（复制年份会得到 `19901990`）
@@ -563,5 +571,5 @@ python tools\term_verify.py <清单.md> --source all               # 全源合�
 - 本仓库基于 [guaguastandup/zotero-pdf2zh](https://github.com/guaguastandup/zotero-pdf2zh) v4.1.7 改造，
   依 **AGPL-3.0** 同协议开源；上游改动之外的新文件由仓库作者贡献。
 - 底层翻译引擎：[PDFMathTranslate (pdf2zh)](https://github.com/Byaidu/PDFMathTranslate)（AGPL-3.0）。
-- 译文引擎推荐豆包桌面版（基础对话免费）；本仓库与字节跳动无隶属关系。
+- 译文引擎推荐任意能通读全文的网页 AI（本机当前用豆包桌面版，基础对话免费）；本仓库与任何 AI 厂商无隶属关系。
 - 仅供学习研究；请勿翻译、传播受版权保护的出版物全文。
