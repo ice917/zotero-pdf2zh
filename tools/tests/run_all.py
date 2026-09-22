@@ -107,11 +107,9 @@ SUITES = [
 # 其余套件的被测对象都是 tools/ 下已入库的脚本, 天然在场。
 # strategist.py 属"含本机路径、本地保留暂不开源"(见 .gitignore 开源红线二期),
 # 公开 clone 里没有它 → test_strategist.py 必须 SKIP 而不是 FAIL。
-# 同理 dedouble_sweep.py 也在 .gitignore 的"本机路径"名单里(v28.67 的 P3 只改了它的
-# import 副作用与参数化, 是否开放分发是另一个决定), 故 test_dedouble_sweep.py 一并登记。
+# (v28.67 起 `dedouble_sweep.py` 已随 P3 重写脱敏入库, 故不再登记 —— 公开侧也会真跑。)
 OPTIONAL_SUBJECTS = {
     "test_strategist.py": "tools/strategist.py",
-    "test_dedouble_sweep.py": "tools/dedouble_sweep.py",
 }
 
 

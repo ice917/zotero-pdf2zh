@@ -47,7 +47,9 @@ server/md-translate/config.json
 
 # 本机路径与个人文件 (开源红线): 本地保留不入库
 server/config/local_paths.json
-tools/dedouble_sweep.py
+# [2026-09-22 v28.67] tools/dedouble_sweep.py 解除本机保留、已入库:
+#   v26.7 那版写死三个本机路径且 import 即改真库; 经 P3 重写(__main__ 守卫 + 路径全参数化
+#   + 写库前先落备份)后文件内已无本机盘符/用户名 -> 公开分发(旧版见历史 5293526)。
 
 # 解压残留与运行时状态 (上游 zip 重下会再带回来, 只忽略不清理)
 .DS_Store
