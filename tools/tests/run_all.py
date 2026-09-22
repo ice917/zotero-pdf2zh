@@ -59,7 +59,8 @@
                                  新件缺省 webai 而旧件 .doubao* 原样保留(改名不断链)/
                                  两族同权(glob/matches/belongs) + 四处调用点接线守卫
   32. test_pre_render_ledger.py v28.69 渲染前保底底片 + 本轮硬拦截: import 无副作用/
-                                 底片内容与只读契约/底片失败不拦渲染/逃生门记账/前端接线
+                                 底片内容与只读契约/逃生门记账/前端接线
+                                 v28.70 底片失败即中止出稿(工序一步没走 + 台账「未出稿」)
 
 设计约定:
     - 全部 stdlib + venv 内 pdf2zh, 不需要 pytest

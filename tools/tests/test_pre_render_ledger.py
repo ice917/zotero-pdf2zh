@@ -15,8 +15,9 @@
   ② 底片内容 —— 正文逐段「原文/译文」交错; 表格保持**真表格**(可翻格上原文下译文,
      无译文格只留原文); 表注从 notes_zh.json 回填; 落点 <PROJ>\\ledger\\<论文名>_译稿.docx;
      且**只读**既有产物(回包/manifest/notes 字节不变)。
-  ③ 底片失败**不拦渲染** —— 真正的底是 TSV 与缓存库, 副本做不出来不该卡住出稿。
-     只在会触发重渲染的任务上做(其它任务的 ④ 只是排版)。
+  ③ 底片失败**拦在渲染之前**(v28.70 改判) —— 做不出来就抛 `LedgerFailed`, 出稿中止、报错提醒,
+     渲染工序一步都不许走。原判"副本而已, 失败也放行"的毛病: PDF 照样出来且与正常那份无异,
+     想补底片只能重走一遍, 白多一份 PDF 等人去删。只在会触发重渲染的任务上做(其它只是排版)。
   ④ 本轮硬拦截 —— ① 复制成功即进本轮清单; ④ 出稿**渲染任务**时清单里还有没出稿的,
      直接拒绝(带 blocked 标记); 逃生门 force=true 放行并记台账("强制出稿" + 放弃了谁);
      渲染出稿成功即本轮结束、清单清空。非渲染任务永不拦(否则"先做表格"自己就被拦死)。
@@ -61,6 +62,7 @@ import watch_clip as WC       # noqa: E402
 import panel as PN            # noqa: E402
 
 APX = os.path.join(TBL, "appendix_tables_zh.docx")
+FLAG = os.path.join(TBL, "after_ran.flag")     # 出稿工序"真的跑过"的自证文件(见 §③)
 LEDGER = PN.VENDOR_LEDGER
 BODY_TEXT = "#S1\n你好世界。\n"
 
@@ -184,25 +186,41 @@ def main():                                     # noqa: C901
           [p.text for p in t.rows[1].cells[0].paragraphs] == ["10"],
           [p.text for p in t.rows[1].cells[0].paragraphs])
 
-    # ---- ③ 底片失败不拦渲染; 只在渲染任务上做 ----
+    # ---- ③ 底片: 失败要抛(原因带上) / 成功报路径 / 只在渲染任务上做 ----
     real_build = ML.build
     ML.build = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
     logs = []
-    WC._snapshot(log=logs.append)
-    check("③ 底片炸了也不抛(不拦渲染)", any("底片生成失败" in l for l in logs), logs)
+    try:
+        WC._snapshot(log=logs.append)
+        check("③ 底片炸了必须抛 LedgerFailed(不许吞)", False, "没抛, 出稿会被放行")
+    except WC.LedgerFailed as e:
+        check("③ 底片炸了抛 LedgerFailed, 且原因原样带出", "boom" in str(e), str(e))
     ML.build = real_build
     logs = []
-    WC._snapshot(log=logs.append)
-    check("③ 正常时把产物路径报出来", any("_译稿.docx" in l for l in logs), logs)
-
-    calls = []
-    real_snap, WC._snapshot = WC._snapshot, (lambda log=print: calls.append(1))
+    out = WC._snapshot(log=logs.append)
+    check("③ 正常时把产物路径报出来", bool(out) and out.endswith("_译稿.docx"), out)
 
     def fake_job(render):
         return {"label": "正文 x", "resp": "fake.tsv", "blocks": True, "render": render,
                 "cmd": lambda: [sys.executable, "-c", "print('PASS ok')"],
-                "after": [], "out": lambda: os.path.join(TBL, "fake_out.docx")}
+                "after": [[sys.executable, "-c",
+                           "open(r'%s','a').write('x')" % FLAG]],
+                "out": lambda: os.path.join(TBL, "fake_out.docx")}
 
+    # 拦得彻底 = 出稿工序一步没走(用 after 里那条命令写标记文件来自证)
+    ML.build = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    if os.path.exists(FLAG):
+        os.remove(FLAG)
+    try:
+        r = WC.run_job(fake_job(True), ["S1"], {"S1": "甲"}, log=lambda *_: None)
+        check("③ 底片失败 -> run_job 抛 LedgerFailed(不返回产物)", False, r)
+    except WC.LedgerFailed:
+        check("③ 底片失败 -> run_job 抛 LedgerFailed(不返回产物)", True)
+    check("③ 底片失败拦得彻底: 出稿工序一步没走(没产物)", not os.path.exists(FLAG))
+    ML.build = real_build
+
+    calls = []
+    real_snap, WC._snapshot = WC._snapshot, (lambda log=print: calls.append(1))
     r = WC.run_job(fake_job(True), ["S1"], {"S1": "甲"}, log=lambda *_: None)
     check("③ 渲染任务: 门禁过后、工序之前存底片", r and len(calls) == 1, calls)
     calls.clear()
@@ -279,6 +297,29 @@ def main():                                     # noqa: C901
         arm(body_job, BODY_TEXT)
         r = http(base, "api/commit", {"text": BODY_TEXT})
         check("⑤ 补完了就放行, 且本轮随之结束(清单清空)",
+              r["ok"] is True and r["out"] == "OUT" and r["round"] == [], r)
+
+        # ---- 底片没做出来: 拦下出稿 + 报错提醒 + 记台账, 且不毁掉重试的路(v28.70) ----
+        def stub_ledger_fail(job, ids, got, log=print):
+            raise PN.wc.LedgerFailed("底片生成失败(RuntimeError('boom'))")
+
+        PN.note_sent(body_job, 2)
+        arm(body_job, BODY_TEXT)
+        opened[:] = []
+        PN.wc.run_job = stub_ledger_fail
+        r = http(base, "api/commit", {"text": BODY_TEXT})
+        check("⑤ 底片没做成 -> 拦下出稿并报错(原因原样提醒)",
+              r["ok"] is False and "底片" in r["error"] and "boom" in r["error"], r)
+        check("⑤ 底片没做成: 渲染工序一步没走(没产物、没开文档)", not opened, opened)
+        check("⑤ 底片没做成也记台账(未出稿 + 原因)",
+              "未出稿" in ledger_text() and "底片没做成" in ledger_text(), ledger_text())
+        check("⑤ 底片没做成: 已检查状态保住(修好后可直接重试 ④, 不用重贴/重跑 ③)",
+              PN.STATE["checked"] is not None)
+        check("⑤ 底片没做成: 本轮清单不动(那块仍算未出稿)",
+              [(x["short"], x["done"]) for x in r["round"]] == [("正文", False)], r["round"])
+        PN.wc.run_job = stub_run
+        r = http(base, "api/commit", {"text": BODY_TEXT})
+        check("⑤ 修好后重试 ④ 一次就放行(没有多余的 PDF 要删)",
               r["ok"] is True and r["out"] == "OUT" and r["round"] == [], r)
 
         with PN.LOCK:

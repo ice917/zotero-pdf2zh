@@ -1363,7 +1363,19 @@ class H(BaseHTTPRequestHandler):
                                  "先把它们逐个做完(①→③→④); 确实要跳过就点「仍然出稿」。" % names})
             return
         logs = []
-        out = wc.run_job(job, ids, got, log=logs.append)
+        try:
+            out = wc.run_job(job, ids, got, log=logs.append)
+        except wc.LedgerFailed as e:
+            # 底片没做出来 = 渲染的存档点缺了 -> **不出稿**(v28.70)。放它渲染的后果是: PDF 照样
+            # 出来且与正常那份无异, 想补底片只能重走一遍, 白多一份 PDF 等人去删。
+            wc.beep(False)
+            ledger("出稿", job["label"], len(ids), 0, "未出稿", "底片没做成: %s" % e)
+            logs.append("✗ %s" % e)
+            logs.append("✗ 已拦下出稿(渲染一步没走)。回包已落盘 —— 修好后重新点 ④ 即可,"
+                        " 不用重贴、不用重跑 ③。")
+            self._json({"ok": False, "log": logs, "round": round_state(),
+                        "error": "底片没做成, 已拦下出稿: %s —— 修好后重新点 ④(回包已落盘)。" % e})
+            return
         wc.beep(bool(out))
         if not out:
             ledger("出稿", job["label"], len(ids), 0, "出稿失败", "排版/注入未过")
