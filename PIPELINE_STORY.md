@@ -493,3 +493,91 @@ SILAGE / wang2026 / EgoPhys 这些论文名与事故背景 —— 所以 `tools/
 > 后者不依赖 `tools/tests/`，所以工具链此前不入库，也**没有**让用户侧失去保护 ——
 > 丢掉的只是"别人能自己复核这套判据"的能力，本轮补回。
 
+---
+
+## 第十二章 把话带回上游（2026-09-22，v28.66）：核对过的反馈清单
+
+> 缘起：有人问"我们到底解决了官方的什么问题"。第一次回答把两层"官方"混成了一层，
+> 还把**上游已经自己修好**的条目当成了现存缺陷。本章是**核对之后**的版本：
+> 每条都标复核状态，**被推翻和撤掉的两条单独列在末尾**，不允许再混进"官方缺陷"清单。
+
+### 一、先把两层"官方"分开
+
+| 层 | 是谁 | 我们与它的关系 | 反馈往哪送 |
+|---|---|---|---|
+| **上游本体** | `guaguastandup/zotero-pdf2zh` v4.1.7（Zotero 插件 + Flask server + 环境管理 + 启动/更新器） | fork 它、深度改它（`patches/` 就是改动镜像） | 提给本仓库 |
+| **翻译内核** | `pdf2zh` 1.9.11 / `pdf2zh_next` 2.9.0（BabelDOC） | 只调用、**不打补丁**；`--skip-subset-fonts` 这类是上游自己就有 | 提给对应内核仓库 |
+
+判据（可复现）：`refs/remotes/fork/main = 35af40f` 就是上游 v4.1.7 的**原版树**，
+两份历史**没有共同祖先**，所以 `git diff 35af40f HEAD` 正好等于**"我们对上游的全部改动"** ——
+反馈候选只从这份 diff 里取，不从"感觉上官方应该有问题"里取。
+
+### 二、反馈清单（按严重度，带复核状态）
+
+| # | 上游位置 | 症状（一句话） | 复核状态 | 去向 |
+|---|---|---|---|---|
+| 1 | `utils/execute.py:145-151` | PTY 出现真非法字节后 `leftover` 永久卡在头部 → 进度解析**永久冻结**、内存无界增长 | **已复核**（脚本实测） | **已备 PR** |
+| 2 | `utils/venv.py:358` | 引擎由整条命令行子串判定，输入路径含 `pdf2zh_next` 就选错环境，报错方向完全误导 | **已复核**（脚本实测） | **已备 PR** |
+| 3 | `utils/cropper.py:195-254` | `merge_pdf` 异常路径不关句柄 → Windows 上产物被占用、"重试也失败" | 已复核 | issue |
+| 4 | `utils/cropper.py:298` | `pdf_dual_mode` 丢弃 `merge_pdf` 返回值，返回一个**不存在**的路径 | 已复核 | issue |
+| 5 | `utils/deepseek_thinking.py:98-118` | `toml.dump` 全量重写 `config.toml` → **抹掉用户注释**与键顺序 | 已复核 | issue |
+| 6 | `utils/execute.py:454-473` | "句柄有效"≠"是控制台"（stdout 重定向/服务化）→ 监视线程**静默退出**，进度恒 0 | 已复核 | issue |
+| 7 | `utils/execute.py:252-274` | tqdm 分支未 `return`，会被 legacy 正则用**另一个分母**二次覆写 | 已复核（结构） | issue（先补日志） |
+| 8 | `server.py:1036` | `-p 1-5` 塞进单个 token；实测**碰巧能用**（argparse 前导空格 + `int()` 容忍） | 已复核（实测，**非故障**） | issue（低优先，一致性） |
+| 9 | `server.py:1086-1088` | `--pages 1-{end}` 无 `end < 1` 守卫，`skip_last_pages ≥ 页数` 时生成非法区间 | 已复核 | issue |
+| 10 | `server.py:1050` | `basename(...).replace('.pdf','')` 不是去扩展名 → `Paper.PDF` 时产物路径对不上 | 已复核（推理） | issue |
+| 11 | `utils/execute2.py` / `execute3.py` / `record.py` | 4.1.7 仍保留、全仓**零引用**的孤儿文件（各带一份旧的 `_execute_with_inherit`） | 已复核（全仓零引用） | issue（建议删） |
+
+另有 6 条属"扫描到但我方未逐条复读"（`utils/config.py` 字体键早退、空值键被清理循环删掉、
+`example` 当托管事实源、TOML 写字符串 `"null"`、
+`print(self.__dict__)` 泄密、`environment_lifecycle.py` 不可达代码）——**在 issue 正文里单独列表并标注"待确认"**，
+不进上表，避免把没核实的东西说成结论。
+
+### 三、两条已经备好的 PR（只含这两条改动）
+
+落点：`D:\zotero-pdf2zh-eval\feedback\`（**不进本仓库**）
+
+| 交付物 | 内容 |
+|---|---|
+| `pr_upstream_fix.patch` | 8038 字节 / 3 文件 / +151 −6；`git apply --check` 在 `main` 上通过 |
+| `PR_描述_上游修复.md` | 提交信息、改动前后代码、复现输出、8 条测试覆盖表、影响面、一键提交命令 |
+| `repro_old_behavior.py` | 只用标准库的最小复现：输出 `leftover 30 字节 / 后续进度行未被解析到 / 引擎选错` |
+| `issue_上游缺陷报告.md` | 11 条已复核 + 6 条待确认 + 2 条撤销，按上游 issue 模板填好执行环境 |
+| 上游克隆内的分支 | `D:\zotero-pdf2zh-eval\upstream` @ `feedback/upstream`（commit `773bfa5`，**未推送**） |
+
+两条 PR 改动都做了"**先红后绿**"：本机 Python 3.12 下新增的 8 条回归测试全绿，
+其中 4 条在旧实现下必红（`_engine_from_command` 不存在时收集期即失败，行为级红证据在 `repro_old_behavior.py`）。
+测试文件放在 `server/tests/`，被上游 CI 已有的 `unittest discover` **自动收集，不需要改 workflow**。
+
+### 四、这两条**不**做成上游 PR（有意不做）
+
+第九章"给官方的四条建议"里的第 2、3 条 —— **补"渲染残渣"断言**、**表页零汉化视为预期** —— 我们**不走 PR**：
+
+- 上游本体**没有门禁层**。这两条是"给一条质检流水线加断言/加豁免"，上游没有这条流水线，
+  提交过去只能是**没人调用的死代码**，属于表面功夫；
+- 它们真正的归属是**我们的 `tools/post_check.py`**（第 5 断言 v28.17、表页豁免 v28.46 都已落地），
+  对外只适合以"建议 + 实测证据"的形式写进 issue，让上游自己决定要不要建这套东西。
+
+### 五、本章的口径纠正（三条，必须记住）
+
+1. **"`.example` 会覆盖用户配置"——上游已自修。**
+   上游 v4.1.7 已有 `server/utils/config_migration.py`：文件已存在时走 `_merge_defaults(defaults, current)`
+   **以用户值为准**（`config_migration.py:29/125/155`），坏文件先 `_backup_invalid` 再恢复默认；
+   `server/server.py:1244-1246` 也写明
+   `# Never overwrite an existing user config with the .example template.`。
+   → 本条从"官方缺陷"清单里**删除**（我们的"用户值优先"补丁与它**同向**，不是对立）。
+2. **"`task_manager` 返回内部字典活引用"——不成立，主动撤销。**
+   复核 `task_manager.py:123-130`：`get_active_tasks_list` / `get_history` 返回的都是 `list(...)` **浅拷贝**，
+   列表结构本身安全；被共享的只是元素对象。原判据是扫描器的误读。
+3. **"next 分支把主 `config.toml` 交给子进程会被回写"——不成立，主动撤销。**
+   原判据只看到"pdf2zh 1.x 有副本、next 没有"的不对称，**没有验证 next 内核是否真的写回**。
+   复核（读已发布内核 `pdf2zh_next 2.9.0` 源码）：`config/main.py:587-596` 读完 `--config-file` 即
+   `del merged_args["config_file"]`；全包唯一写用户配置的 `write_user_default_config_file()`（`:615-628`）
+   落点固定在 `~/.config/pdf2zh/config.v3.toml`（`const.py:8-10`）且**只被 GUI 调用**（`gui.py:911/3472`）；
+   `_update_version_default_config()`（`:269-281`）写 `~/.config/pdf2zh/default/2.9.0.toml`。
+   → 传入的配置文件是**只读**的。**保留的观察**：不对称本身仍值得记（若未来 next 引入写回，本侧无保护），
+   但当下**不是缺陷**，已从 issue 与风险榜中撤下。
+
+> 教训落地：**"先核对再反馈"不是谨慎，是必需**。这几条如果不核对就发出去，
+> 官方只要回一句"我们早就修了 / 你读错了"，整份反馈的可信度就一起打折。
+
