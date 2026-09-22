@@ -22,7 +22,7 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
   第二层  只给人看机器判不了的 -> **待看清单**(正常回包为**空**)
   第三层  剩下的用"外行也能判"的读数兜底(一致性: 同一原文必须同一译文 —— 零阈值纯机械)
 
-  [v28.59] 补上门禁够不到的最后一层: **⑥ 语义审核**(手动点按钮, 硅基流动
+  [v28.59] 补上门禁够不到的最后一层: **④ 语义审核**(手动点按钮, 硅基流动
   DeepSeek-V3.2, 只审不改) —— 漏译/错译/数字/术语/指代/表达, 逐段「原文↔译文」核对,
   结论进存疑清单, 可一键复制给翻译方返工。三条边界: 审核者必须是**与翻译方无关的第三方**
   (relay_spec 第 4 条: 被翻译方不得自校); 它**只报不改**(生成式改写不可信, 见润色钩子
@@ -32,10 +32,10 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
   占位符原位"两条, 载荷自带抬头(文档名/术语表/规则), 所以换家**不用改提示词**; 别家的
   "包装"(代码围栏/首尾客套/把编号列成 Markdown 清单)由 watch_clip.parse_units 剥掉。
   换家之后补三件事, 都在头部「翻译方」下拉的射程内:
-    归因 —— ③ 检查 / ④ 出稿各往工作目录的 vendor_ledger.tsv 追加一行(哪家在什么任务上
+    归因 —— ③ 检查 / ⑤ 出稿各往工作目录的 vendor_ledger.tsv 追加一行(哪家在什么任务上
             过没过、待看几条), "换了家到底行不行"从此有据可查, 不靠印象;
-    说人话 —— ⑤ 的责任归属按实际翻译方显示(原来是写死的"豆包的问题");
-    守红线 —— ⑥ 审核者与翻译方**同源则拒审**(翻译方选 DeepSeek 网页版而审核者也是
+    说人话 —— 报错明细的责任归属按实际翻译方显示(原来是写死的"豆包的问题");
+    守红线 —— ④ 审核者与翻译方**同源则拒审**(翻译方选 DeepSeek 网页版而审核者也是
             DeepSeek 时, 审核就退化成自我确认; 判据 reviewer.conflicts, 服务器端拦,
             前端禁用按钮只是提示)。
 
@@ -57,10 +57,10 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
     篇归属   —— 表格/表注 manifest 里由装配器烙的篇名(mk_job.py --paper / mk_notes_job.py 沿用
                  同目录 job_manifest.json)"与正文那篇是否一致"; 老目录没烙(空)则按"一个工作目录
                  = 一篇"当本篇的并标 unlabeled 让人核, 烙了但不一致的标 foreign(那是别人的表)。
-    提醒而非拦截 —— ④ 出稿的是**会触发重渲染**的任务(正文)时, 若这一篇还有没出稿的: 黄条提醒
+    提醒而非拦截 —— ⑤ 出稿的是**会触发重渲染**的任务(正文)时, 若这一篇还有没出稿的: 黄条提醒
                  + 台账记成"已出稿(缺: X)", 照旧渲染。顺序随用户(任意顺序), 齐了就过, 缺了提醒。
-                 表格/表注的 ④ 只是排版, 不提醒。逃生门那颗按钮随之删除 —— 没有拦截就不需要它。
-    外发台账 —— ① 复制仍落一行(阶段「复制」): 与 ③/④ 两行合起来, 一轮的完整轨迹
+                 表格/表注的 ⑤ 只是排版, 不提醒。逃生门那颗按钮随之删除 —— 没有拦截就不需要它。
+    外发台账 —— ① 复制仍落一行(阶段「复制」): 与 ③/⑤ 两行合起来, 一轮的完整轨迹
                  (发了哪几块、谁翻的、过没过、出没出稿)全在 vendor_ledger.tsv 里。
     (底片失败即中止出稿是 [v28.70] 的判, 与本条无关, 仍然硬拦 —— 见 _commit / LedgerFailed。)
 
@@ -83,8 +83,13 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
   python panel.py                        启动面板(自动开窗)
   python panel.py --selftest [回包文件]   无界面自检(跑 analyse 并打印待看清单)
 
-**逐步骤操作手册见 relay_spec.md 第 9 节**(启动/① → ⑥ 各步做什么与不做什么/退出规则/
+**逐步骤操作手册见 relay_spec.md 第 9 节**(启动/① → ⑤ 各步做什么与不做什么/退出规则/
 出问题先查什么)。本文件头只讲设计取舍与契约, 那节讲怎么用。
+
+  [v28.72] **编号按工序重排**。原来是 ① 复制 ② 粘贴 ③ 检查 **④ 出稿 ⑤ 报错明细 ⑥ 语义审核** ——
+    ④⑤⑥ 三个号与工序反着: 审核本该在出稿**之前**(出了稿再审, 审出问题就得重做), 而报错明细
+    根本不是一步操作(它是 ③ 的输出物, 只在门禁 FAIL 时现身)。现在: **④ 语义审核 → ⑤ 出稿**,
+    报错明细**不占号**。编号与按钮行左→右一致, 也就不用再解释"为什么 6 排在 4 前面"。
 """
 import hashlib
 import io
@@ -104,7 +109,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import watch_clip as wc          # 复用识别/落盘/门禁/剪贴板全链, 不重复实现
-import reviewer as rv            # ⑥ 语义审核(硅基流动): 只审不改, 与豆包无关的第三方
+import reviewer as rv            # ④ 语义审核(硅基流动): 只审不改, 与豆包无关的第三方
 
 PH = re.compile(r"\{S\d{3}\}|\{v\d+\}")   # 表格/正文两种占位符都剥掉再比长度
 SUSPECT_K = 0.5      # 长度比低于"全批中位数"的此倍 -> 列入待看(读数, 不判定)
@@ -135,9 +140,9 @@ def _save_theme(name):
 # 真契约只有两条 —— **编号守恒 + 占位符原位**(违反会被 ③ 当场抓住, 不是静默出错);
 # 载荷自带抬头(文档名/术语表/规则), 所以**换家不用改提示词**。任何网页 AI 都能接。
 # 选择落在**工作目录**(与主题文件同级, 数据侧不入仓库), 这里只解决"换家之后"的三件事:
-#   归因: ③ 检查 / ④ 出稿各往台账追加一行 -> "换了家之后到底行不行"靠台账回答, 不靠感觉
-#   说人话: ⑤ 的责任归属按实际翻译方显示, 不再是写死的"豆包的问题"
-#   守红线: ⑥ 审核者与翻译方**同源则拒审**(relay_spec §4.5: 被翻译方不得自校)
+#   归因: ③ 检查 / ⑤ 出稿各往台账追加一行 -> "换了家之后到底行不行"靠台账回答, 不靠感觉
+#   说人话: 报错明细的责任归属按实际翻译方显示, 不再是写死的"豆包的问题"
+#   守红线: ④ 审核者与翻译方**同源则拒审**(relay_spec §4.5: 被翻译方不得自校)
 # 族名靠 reviewer.family_of 按名字认("硅基流动 API(DeepSeek)" -> deepseek), 认不出算不同源。
 VENDORS = ("豆包", "ChatGPT", "Claude", "Kimi", "DeepSeek 网页版",
            "硅基流动 API(DeepSeek)", "其他网页 AI")
@@ -252,7 +257,7 @@ def pending_of(todos):
 def note_sent(job, n_units):
     """① 复制成功时记一笔**外发历史**("这一轮我把哪几块发出去了")。
 
-    与 ③ 检查/④ 出稿那两行合起来能还原一轮的完整轨迹; **旁证, 不是门禁** —— 台账写不进去
+    与 ③ 检查/⑤ 出稿那两行合起来能还原一轮的完整轨迹; **旁证, 不是门禁** —— 台账写不进去
     不影响复制本身。
     """
     ledger("复制", job["label"], n_units, 0, "已复制", "")
@@ -306,7 +311,7 @@ _REWORK_LINE = re.compile(r"返工单:\s*(\S.*?)\s*$")
 # 读不到、门禁脚本自己崩了)。把它们误报成"翻译方的错"会让用户拿着返工单去问翻译方,
 # 白跑一轮还在原地。其余带 FAIL 行的译者侧失败(字形丢失、段数不符、⋮ 错位)才是翻译方的。
 # (v28.62 之前这里写死"豆包"; 现在翻译方可以是任意网页 AI, 故只报**角色**, 具体是谁
-#  由 panel 的 ⑤ 卡片按用户选中的翻译方补上。)
+#  由 panel 的 报错明细卡片按用户选中的翻译方补上。)
 _TOOL_FAIL_MARK = ("未接线", "找不到载荷原文", "读不到", "Traceback", "退出码",
                    "manifest", "sidecar", "无法校验")
 
@@ -366,7 +371,7 @@ def _persist_rework(tmp, lines):
             out.append("返工单(已保留): %s" % mapping[m.group(1)])
         else:
             out.append(ln)
-    out.append("提示: 返工单只列「必须改」的段与缺失字形 —— 上面「⑤ 报错明细」里可一键"
+    out.append("提示: 返工单只列「必须改」的段与缺失字形 —— 上面「报错明细」里可一键"
                "复制给翻译方, 让它只改那些段, 其余段务必照抄不要重译。")
     return out, body
 
@@ -457,7 +462,7 @@ def _doc_of(job):
 
 
 def review(text):
-    """纯逻辑(便于 --selftest/单测): 回包 -> (原文, 译文) 对照 -> 交 ⑥ 语义审核。
+    """纯逻辑(便于 --selftest/单测): 回包 -> (原文, 译文) 对照 -> 交 ④ 语义审核。
 
     与 analyse 的区别: **不跑门禁** —— 审核不需要、也不该等沙箱; 只要求编号齐全,
     因为编号不齐连段都对不上, 审出来的条目落不到任何一段上。
@@ -474,7 +479,7 @@ def review(text):
     fam = rv_conflict()
     if fam:
         return {"error": "红线: 审核者(硅基流动 %s)与翻译方(%s)同源 —— 被翻译方不得自校。"
-                         "换一个翻译方, 或换一个审核者再点 ⑥。"
+                         "换一个翻译方, 或换一个审核者再点 ④。"
                          % (rv.config()["model"], _load_vendor())}
     hit = wc.match_job(text, log=lambda *a: None)
     if not hit:
@@ -621,7 +626,7 @@ section.glass{padding:14px 18px}
 .banner.warn{color:var(--warn);font-weight:700}
 .banner.ok{color:var(--ok)}
 .banner.err{color:var(--danger)}
-/* ⑤ 报错明细: 只在门禁 FAIL 时出现 —— 说到「哪段、缺哪个字形」, 并可一键复制给翻译方。
+/* 报错明细: 只在门禁 FAIL 时出现 —— 说到「哪段、缺哪个字形」, 并可一键复制给翻译方。
    网页 AI 没有桥、读不到 inbox 里的返工单文件, 只能靠粘贴, 故正文直接摊在面板上。 */
 .rw-badge{display:inline-flex;align-items:center;padding:2px 10px;border-radius:999px;
   font-size:12px;font-weight:600;vertical-align:middle}
@@ -686,7 +691,7 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
       <div class="dd-list" role="listbox" hidden></div>
     </div>
     <label>翻译方</label>
-    <div class="dd" id="vendorSel" title="谁在翻译你家论文 —— 只影响台账归因、⑤ 的措辞与 ⑥ 的同源守卫, 不影响门禁(门禁只看编号与占位符)">
+    <div class="dd" id="vendorSel" title="谁在翻译你家论文 —— 只影响台账归因、报错明细的措辞与 ④ 的同源守卫, 不影响门禁(门禁只看编号与占位符)">
       <button class="dd-btn" type="button" aria-haspopup="listbox" aria-expanded="false"><span class="dd-val">—</span><span class="dd-arrow">▾</span></button>
       <div class="dd-list" role="listbox" hidden></div>
     </div>
@@ -698,8 +703,8 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
 
   <section class="glass row">
     <button class="btn" id="checkBtn" type="button">③ 检查(只读预览)</button>
-    <button class="btn" id="reviewBtn" type="button">⑥ 语义审核</button>
-    <button class="btn primary" id="commitBtn" type="button" disabled>④ 确认写入并出稿</button>
+    <button class="btn" id="reviewBtn" type="button">④ 语义审核</button>
+    <button class="btn primary" id="commitBtn" type="button" disabled>⑤ 确认写入并出稿</button>
     <span class="muted" id="rvGuard"></span>
   </section>
 
@@ -712,7 +717,7 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
 
   <section class="glass" id="rwCard" hidden>
     <div class="row spread">
-      <span class="sec-ttl">⑤ 报错明细 <span class="rw-badge" id="rwBadge"></span></span>
+      <span class="sec-ttl">报错明细 <span class="muted">（③ 检查未过时才有 —— 它是 ③ 的输出物, 不是一步操作）</span> <span class="rw-badge" id="rwBadge"></span></span>
       <button class="btn small" id="rwCopyBtn" type="button">复制给翻译方</button>
     </div>
     <div class="muted" id="rwWhy"></div>
@@ -721,7 +726,7 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
 
   <section class="glass" id="rvCard" hidden>
     <div class="row spread">
-      <span class="sec-ttl">⑥ 语义审核(独立第三方) <span class="rw-badge" id="rvBadge"></span></span>
+      <span class="sec-ttl">④ 语义审核(独立第三方) <span class="rw-badge" id="rvBadge"></span></span>
       <button class="btn small" id="rvCopyBtn" type="button">复制给翻译方</button>
     </div>
     <div class="muted" id="rvWhy"></div>
@@ -795,8 +800,8 @@ function renderTodos(list){
   }).join(' · ');
 }
 function edited(){
-  commitBtn.disabled=true;commitBtn.textContent='④ 确认写入并出稿';
-  $('rvCard').hidden=true;window.__rv='';       /* ⑥ 的结论是针对旧文本的, 一改即作废 */
+  commitBtn.disabled=true;commitBtn.textContent='⑤ 确认写入并出稿';
+  $('rvCard').hidden=true;window.__rv='';       /* ④ 的结论是针对旧文本的, 一改即作废 */
   setBanner('idle','内容已改 —— 请重新点 ③ 检查。');
 }
 ta.addEventListener('input',edited);
@@ -821,7 +826,7 @@ $('buildBtn').addEventListener('click',function(){
   });
 });
 $('checkBtn').addEventListener('click',function(){
-  commitBtn.disabled=true;commitBtn.textContent='④ 确认写入并出稿';
+  commitBtn.disabled=true;commitBtn.textContent='⑤ 确认写入并出稿';
   setBanner('busy','检查中…(在临时沙箱里跑真门禁)');
   api('/api/check',{text:ta.value}).then(function(r){
     if(r.error){
@@ -863,14 +868,14 @@ $('rwCopyBtn').addEventListener('click',function(){
     log('已把报错明细复制到剪贴板('+r.n_chars+' 字符); 粘给'+vendor+', 明确要求「只改点到的段, 其余照抄」。');
   });
 });
-/* ⑥ 语义审核: 门禁之外的那一层 —— 漏译/错译/数字/术语/指代/表达。审核者是**与翻译方无关**
+/* ④ 语义审核: 门禁之外的那一层 —— 漏译/错译/数字/术语/指代/表达。审核者是**与翻译方无关**
    的第三方(硅基流动), 只报不改: 结论进存疑清单给用户裁决, 不参与放行。手动触发, 付费调用。
    翻译方与审核者同源时服务器直接拒审(按钮也已禁用) —— 被翻译方不得自校。 */
 $('reviewBtn').addEventListener('click',function(){
   if(!ta.value.trim()){log('✗ 粘贴区是空的 —— 先把'+vendor+'的回包粘到 ②。');return}
   var b=$('reviewBtn'),txt=b.textContent;
   b.disabled=true;b.textContent='审核中…';
-  log('▶ 提交 ⑥ 语义审核: 整篇「原文↔译文」发给硅基流动(付费, 只审不改), 通常几十秒到几分钟。');
+  log('▶ 提交 ④ 语义审核: 整篇「原文↔译文」发给硅基流动(付费, 只审不改), 通常几十秒到几分钟。');
   api('/api/review',{text:ta.value}).then(function(r){
     b.textContent=txt;applyVendorGuard();       /* 恢复按钮态: 同源则该保持禁用 */
     if(r.error){
@@ -914,7 +919,7 @@ function renderReview(r){
   }
   window.__rv=r;
   $('rvPath').textContent=r.report?('报告: '+r.report):'';
-  log('⑥ 语义审核完成('+r.model+'): '+r.n+' 段 / '+r.n_chunks+' 块 / '+r.secs+' 秒 · '
+  log('④ 语义审核完成('+r.model+'): '+r.n+' 段 / '+r.n_chunks+' 块 / '+r.secs+' 秒 · '
       +(n?('存疑 '+n+' 条'):'未发现问题')
       +(r.n_failed?(' · '+r.n_failed+' 块未完成'):''));
   (r.logs||[]).forEach(function(l){log('   '+l)});
@@ -980,13 +985,13 @@ function render(r){
   segBtn('all',r.n);
   if(r.ok){
     commitBtn.disabled=false;
-    commitBtn.textContent='④ 确认写入并出稿'+(r.items.length?'（还有 '+r.items.length+' 条待看）':'');
+    commitBtn.textContent='⑤ 确认写入并出稿'+(r.items.length?'（还有 '+r.items.length+' 条待看）':'');
     showTab('look');
   }else{
     log('   门禁未过, 不写入。修正后重新粘贴再检查。');
   }
 }
-/* ④ 出稿。底片(渲染前的存档)做不出来时服务器直接拦下(见 _commit), 这里只显示失败;
+/* ⑤ 出稿。底片(渲染前的存档)做不出来时服务器直接拦下(见 _commit), 这里只显示失败;
    **正文**出稿时若这一篇还有没出稿的, 服务器只**提醒**(日志黄条 + 台账记「缺 X」)并照旧渲染 ——
    顺序随你, 齐了就过, 缺了提醒。(v28.69 的硬拦截 + 逃生门已删: 渲染根本不读表格产物。) */
 function doCommit(){
@@ -1068,7 +1073,7 @@ function mkDropdown(el,onPick){
 var taskDD=mkDropdown($('taskSel'));
 /* 翻译方: 只影响归因/措辞/守卫, 不影响门禁 —— 门禁永远只看编号与占位符。
    哪些翻译方与审核者同源, 由**服务器**算好给前端(判据在 reviewer.conflicts), 前端只做
-   成员判断 —— 两处各写一套认族规则迟早会漂; 服务器端在 ⑥ 入口还会再拦一次(不只靠
+   成员判断 —— 两处各写一套认族规则迟早会漂; 服务器端在 ④ 入口还会再拦一次(不只靠
    这里禁用按钮: 前端禁用只是提示, 真正的门在服务器)。 */
 var vendor='',rvConflicts=[];
 var vendorDD=mkDropdown($('vendorSel'),function(v){
@@ -1078,7 +1083,7 @@ var vendorDD=mkDropdown($('vendorSel'),function(v){
     if(r.error){log('✗ '+r.error);return}
     rvConflicts=r.rv_conflicts||rvConflicts;applyVendorGuard();
     log('翻译方已切到「'+v+'」'+((r.rv_conflicts||[]).indexOf(v)>=0
-        ?' —— 与审核者同源, ⑥ 已禁用':'(台账与 ⑤ 的归因都按它记)'));
+        ?' —— 与审核者同源, ④ 已禁用':'(台账与报错明细的归因都按它记)'));
   });
 });
 function applyVendorGuard(){
@@ -1086,7 +1091,7 @@ function applyVendorGuard(){
   $('reviewBtn').disabled=hit;
   $('reviewBtn').title=hit?('审核者与「'+vendor+'」同源, 拒审 —— 被翻译方不得自校')
                           :'独立第三方审校「原文↔译文」; 只审不改, 不参与放行';
-  $('rvGuard').textContent=hit?('✗ 审核者与「'+vendor+'」同源, 已禁用 ⑥'):'';
+  $('rvGuard').textContent=hit?('✗ 审核者与「'+vendor+'」同源, 已禁用 ④'):'';
 }
 /* 兜底退出倒计时(用户可控)。剩余秒数一律以**服务器**给的为准(前端算会漂),
    两次心跳之间才做本地递减 —— 否则每 5s 才跳一次数字, 看着像卡住。
@@ -1137,7 +1142,7 @@ api('/api/state').then(function(s){
   renderTodos(s.todos);
   theme=s.theme||theme;applyTheme();
   renderIdle(s.idle);
-  log('翻译方「'+vendor+'」; 审核者 '+s.rv_model+' —— ⑥ 只审不改, 且与翻译方同源时拒审。');
+  log('翻译方「'+vendor+'」; 审核者 '+s.rv_model+' —— ④ 只审不改, 且与翻译方同源时拒审。');
   ping();setInterval(ping,5000);
 });
 </script>
@@ -1246,7 +1251,7 @@ class H(BaseHTTPRequestHandler):
             if not _save_vendor(b.get("vendor")):
                 self._json({"error": "不是已知的翻译方。"})
                 return
-            # 回带同源清单: 换家后 ⑥ 的可用性跟着变, 前端不必自己维护一套认族规则
+            # 回带同源清单: 换家后 ④ 的可用性跟着变, 前端不必自己维护一套认族规则
             self._json({"ok": True, "vendor": _load_vendor(), "rv_model": rv.config()["model"],
                         "rv_conflicts": [v for v in VENDORS if rv_conflict(v)]})
         elif path == "/api/send":
@@ -1356,7 +1361,7 @@ class H(BaseHTTPRequestHandler):
                      for rt, uid, o, z in r["rows"]]})
 
     def _review(self, b):
-        """⑥ 语义审核: 只读 —— 不落任何产物、不动已检查状态(审核不改门禁结论)。
+        """④ 语义审核: 只读 —— 不落任何产物、不动已检查状态(审核不改门禁结论)。
         慢(整篇要几十秒到几分钟), 但本服务器是 ThreadingHTTPServer, 心跳照走。"""
         r = review(b.get("text", ""))
         if "error" in r:
@@ -1399,10 +1404,10 @@ class H(BaseHTTPRequestHandler):
             wc.beep(False)
             ledger("出稿", job["label"], len(ids), 0, "未出稿", "底片没做成: %s" % e)
             logs.append("✗ %s" % e)
-            logs.append("✗ 已拦下出稿(渲染一步没走)。回包已落盘 —— 修好后重新点 ④ 即可,"
+            logs.append("✗ 已拦下出稿(渲染一步没走)。回包已落盘 —— 修好后重新点 ⑤ 即可,"
                         " 不用重贴、不用重跑 ③。")
             self._json({"ok": False, "log": logs, "todos": paper_tasks(),
-                        "error": "底片没做成, 已拦下出稿: %s —— 修好后重新点 ④(回包已落盘)。" % e})
+                        "error": "底片没做成, 已拦下出稿: %s —— 修好后重新点 ⑤(回包已落盘)。" % e})
             return
         wc.beep(bool(out))
         if not out:
