@@ -18,8 +18,11 @@
      逐条记入审计。
 
   3) 产物: job_doubao.txt(编号<TAB>文本, 整段粘给豆包)
-           job_manifest.json(表结构 + 编号 -> 行/列/原文/占位符原值, 对账契约)
+           job_manifest.json(表结构 + 编号 -> 行/列/原文/占位符原值, 对账契约; paper=篇名)
            job_audit.txt(列画像/判定证据/连字还原/跳过格/规模)。
+
+篇名(v28.71): `--paper <篇名>` 或 env P2Z_BODY_NAME —— 面板据此判"这篇该做的都做了吗";
+取不到就留空(不编造), 面板按"一个工作目录 = 一篇"兜底。
 
 对账见 check_job.py; 演练回包见 mock_doubao.py。
 """
@@ -104,8 +107,25 @@ PREAMBLE = """【任务】下面每行是学术表格里的一个待译片段, �
 【待译】"""
 
 
+def _paper():
+    """这批表格属于哪篇(v28.71) —— 面板据此判"这篇该做的都做了吗"。
+
+    来源: --paper <篇名>, 缺省取 env P2Z_BODY_NAME(面板 _build 会传当前正文那篇)。
+    取不到就留空 —— 不编造篇名: 面板会按"一个工作目录 = 一篇"兜底, 并标出来让人核。
+    """
+    a = sys.argv
+    if "--paper" in a:
+        i = a.index("--paper")
+        if i + 1 < len(a):
+            return a[i + 1].strip()
+    return (os.environ.get("P2Z_BODY_NAME") or "").strip()
+
+
 def main():
+    paper = _paper()
     manifest = {"tables": {}, "units": []}
+    if paper:
+        manifest["paper"] = paper
     audit, phmap = [], {}
     units = manifest["units"]
 
@@ -197,6 +217,8 @@ def main():
     print("占位符 %d 个" % len(phmap))
     print("manifest -> job_manifest.json")
     print("审计     -> job_audit.txt")
+    if paper:
+        print("篇名     -> %s" % paper)
     # 列策略速览
     for tb in TABLES:
         tp = manifest["tables"][tb]

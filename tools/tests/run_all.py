@@ -58,9 +58,12 @@
   31. test_result_naming.py    v28.68 交件命名契约: 两份契约逐字节一致(tools↔server)/
                                  新件缺省 webai 而旧件 .doubao* 原样保留(改名不断链)/
                                  两族同权(glob/matches/belongs) + 四处调用点接线守卫
-  32. test_pre_render_ledger.py v28.69 渲染前保底底片 + 本轮硬拦截: import 无副作用/
-                                 底片内容与只读契约/逃生门记账/前端接线
+  32. test_pre_render_ledger.py v28.69 渲染前保底底片 + 本篇待办: import 无副作用/
+                                 底片内容与只读契约/前端接线
                                  v28.70 底片失败即中止出稿(工序一步没走 + 台账「未出稿」)
+                                 v28.71 判据换成「这一篇该做的都做了吗」: 产物判据 done/stale/
+                                 todo 不落内存 + 篇名归属(foreign/unlabeled) + 缺了只提醒不拦
+                                 (台账「已出稿(缺: X)」), 逃生门那条线整条删除
 
 设计约定:
     - 全部 stdlib + venv 内 pdf2zh, 不需要 pytest
@@ -108,7 +111,7 @@ SUITES = [
     "test_dedouble_sweep.py",     # v28.67 去叠清扫(P3): import 无副作用 + 路径参数化
     "test_polish_paths.py",       # v28.67 润色路径(P4): example 不带本机盘符 + 缺路径响亮报错
     "test_result_naming.py",    # v28.68 交件命名契约: 两侧一致/新旧互认/两族同权/接线守卫
-    "test_pre_render_ledger.py",  # v28.69 渲染前保底底片 + 本轮硬拦截(逃生门记账)
+    "test_pre_render_ledger.py",  # v28.69 渲染前保底底片 / v28.70 底片失败即停 / v28.71 本篇待办只提醒
 ]
 
 # 套件 → 它的"被测对象"(相对项目根)。**只在对象不随包分发时才需要登记** ——

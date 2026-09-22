@@ -102,6 +102,19 @@ def foots_from_audit(label):
     return []
 
 
+def _paper_from_job():
+    """篇名沿用同目录的 job_manifest.json(v28.71)。
+
+    表注与表格正文同属一个工作目录 = 同一篇, 所以不另要参数 —— 表注装配是手工跑的,
+    多一个开关只会多一处忘。没有 job_manifest.json / 没烙篇名就留空(不编造)。
+    """
+    try:
+        with io.open(os.path.join(D, "job_manifest.json"), encoding="utf-8") as f:
+            return (json.load(f).get("paper") or "").strip()
+    except Exception:
+        return ""
+
+
 def assemble():
     units, audit = [], []
     phmap = {}
@@ -151,8 +164,12 @@ def assemble():
         f.write(PREAMBLE + "\n")
         for u in units:
             f.write("%s\t%s\n" % (u["id"], u["orig"]))
+    man = {"units": units}
+    paper = _paper_from_job()
+    if paper:                              # 烙篇名: 面板据此判"这篇该做的都做了吗"
+        man["paper"] = paper
     with io.open(os.path.join(D, "notes_manifest.json"), "w", encoding="utf-8") as f:
-        json.dump({"units": units}, f, ensure_ascii=False, indent=1)
+        json.dump(man, f, ensure_ascii=False, indent=1)
     print("\n".join(audit))
     print("-" * 78)
     print("单元 %d 个 / %d 字符 -> job_notes_doubao.txt"

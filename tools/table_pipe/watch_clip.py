@@ -197,20 +197,25 @@ def body_out():
 # 任务注册表: 装配器/待译文本/回包文件 -> 门禁 -> 出稿工序。panel.py 复用本表, 不要另起一份。
 # 每条任务的 cmd 是**门禁**(检查阶段在临时沙箱里跑, 落盘只发生在确认);
 # after 是确认后的出稿工序(表格=排附录; 正文=注入缓存+重渲染);
-# out 是最终产物路径(出稿后自动打开)。
+# out 是最终产物路径(出稿后自动打开);
+# outs/ins 是"出过稿没有"的判据(产物 / 输入, 见 released); paper 是篇名(v28.71)。
 JOBS = [
     dict(label="表格正文", pre="k", manifest="job_manifest.json",
          job="job_doubao.txt", resp="job_response.tsv",
          cmd=lambda: [PY, os.path.join(SD, "check_job.py"), "job_response.tsv"],
          after=lambda: [[PY, os.path.join(SD, "mk_appendix.py")]],
-         out=lambda: DOCX),
+         out=lambda: DOCX,
+         outs=lambda: _table_outs(),
+         ins=lambda: [os.path.join(D, "job_manifest.json")]),
     dict(label="表注", pre="n", manifest="notes_manifest.json",
          job="job_notes_doubao.txt", resp="job_notes_response.tsv",
          cmd=lambda: [PY, os.path.join(SD, "mk_notes_job.py"), "check",
                       "job_notes_response.tsv"],
          after=lambda: [[PY, os.path.join(SD, "mk_appendix.py")]],
-         out=lambda: DOCX),
-    dict(label="正文 " + BODY_NAME, pre="S", blocks=True, render=True,
+         out=lambda: DOCX,
+         outs=lambda: [os.path.join(D, "notes_zh.json")],
+         ins=lambda: [os.path.join(D, "notes_manifest.json")]),
+    dict(label="正文 " + BODY_NAME, pre="S", blocks=True, render=True, paper=BODY_NAME,
          manifest=body_manifest(), payload=body_payload(),
          sidecar=body_sidecar(), pdf=BODY_PDF,
          job=body_payload(), resp=BODY_NAME + "_response.tsv",
@@ -226,7 +231,9 @@ JOBS = [
              [PY, os.path.join(TOOLS, "force_rerender.py"),
               "--pdf", BODY_PDF, "--timeout", "1800"],
          ],
-         out=lambda: body_out()),
+         out=lambda: body_out(),
+         outs=lambda: [body_out()],
+         ins=lambda: [body_payload()]),
 ]
 
 # ---------------------------------------------------------- 正文任务自动切换
@@ -314,6 +321,7 @@ def refresh_body():
     if not changed:
         return
     JOBS[2] = dict(label="正文 " + BODY_NAME, pre="S", blocks=True, render=True,
+                   paper=BODY_NAME,
                    manifest=body_manifest(), payload=body_payload(),
                    sidecar=body_sidecar(), pdf=BODY_PDF,
                    job=body_payload(), resp=BODY_NAME + "_response.tsv",
@@ -329,7 +337,9 @@ def refresh_body():
                        [PY, os.path.join(TOOLS, "force_rerender.py"),
                         "--pdf", BODY_PDF, "--timeout", "1800"],
                    ],
-                   out=lambda: body_out())
+                   out=lambda: body_out(),
+                   outs=lambda: [body_out()],
+                   ins=lambda: [body_payload()])
 
 CJK = re.compile(r"[\u3400-\u9fff\uf900-\ufaff]")
 PREAMBLE_MARK = ("【待译】", "【任务】")
@@ -488,9 +498,91 @@ def manifest_ids(job):
 
 
 def available_jobs():
-    """manifest 在位的任务 —— 面板的任务下拉/监听器的识别只在这些任务里找。"""
+    """manifest 在位的任务 —— 面板的任务下拉/监听器的识别只在这些任务里找。
+    表格/表注的显示名带上**篇名**(见 _stamp_paper), 所以下拉与台账都看得出这表是哪篇的。"""
     refresh_body()
-    return [j for j in JOBS if os.path.exists(manifest_path(j))]
+    return [_stamp_paper(j) for j in JOBS if os.path.exists(manifest_path(j))]
+
+
+# ------------------------------------------------- 篇名 & "出过稿没有"(v28.71)
+# 面板要回答的问题从"你碰过的做完了吗"换成"**这篇**该做的都做了吗", 于是需要两样东西:
+#   ① 篇名 —— 表格/表注的 manifest 里由装配器烙进去(mk_job.py --paper; 取不到就留空,
+#      老工作目录照样能跑, 面板按"一个工作目录 = 一篇"兜底并标出来让人核);
+#   ② "出过稿没有" —— 判据是**产物**而不是内存记录: 回填产物(table_*.zh.tsv /
+#      notes_zh.json)只有 ④ 门禁全过之后才写(③ 跑在临时沙箱里, 不落盘), 所以"产物在"
+#      就等于"这一刻确实出过稿"; 产物比它的**输入**(manifest/载荷)旧 = 装配过新一轮 ->
+#      判"要重做"。这样重启面板、隔天回来都不失忆, 也不必再维护一份会过期的"本轮清单"。
+
+_PAPER_CACHE = {}                    # manifest 路径 -> (mtime, 篇名); 面板 5s 轮询, 别每次解 JSON
+
+
+def paper_of(job):
+    """job 的篇名: 正文任务就是它自己那篇(建表时写入), 表格/表注读 manifest 里烙的篇名。
+    读不到/没烙 -> "" (调用方按未标篇名处理, 不编造)。"""
+    if job.get("paper"):
+        return job["paper"]
+    if job.get("render"):
+        return ""
+    p = manifest_path(job)
+    try:
+        mt = os.path.getmtime(p)
+    except OSError:
+        return ""
+    hit = _PAPER_CACHE.get(p)
+    if hit and hit[0] == mt:
+        return hit[1]
+    try:
+        with io.open(p, encoding="utf-8") as f:
+            paper = (json.load(f).get("paper") or "").strip()
+    except Exception:
+        paper = ""
+    _PAPER_CACHE[p] = (mt, paper)
+    return paper
+
+
+def _stamp_paper(job):
+    """把篇名缀到表格/表注的显示名后面 -> "表格正文 Cactaceae2009"。没烙篇名就原样返回。"""
+    p = paper_of(job)
+    if not p or job.get("render"):
+        return job
+    j = dict(job)
+    j["label"] = job["label"] + " " + p
+    j["paper"] = p
+    return j
+
+
+def _mtime(p):
+    try:
+        return os.path.getmtime(p)
+    except OSError:
+        return None
+
+
+def _table_outs():
+    """表格正文的回填产物: manifest 里每张表一个 <表>.zh.tsv(check_job.py 只在门禁全过时写)。"""
+    try:
+        with io.open(manifest_path(JOBS[0]), encoding="utf-8") as f:
+            return [os.path.join(D, t + ".zh.tsv") for t in (json.load(f).get("tables") or {})]
+    except Exception:
+        return []
+
+
+def released(job):
+    """这块**出过稿没有** -> (状态, 说明); 状态 in {"done", "stale", "todo"}。
+
+    产物齐全且都不比输入旧 = done; 产物在但比输入旧 = stale(装配过新一轮, 得重做);
+    产物缺 = todo。没有产物判据的任务(理论上不该有)一律算 todo —— 宁可多拦一次。
+    """
+    outs = list((job.get("outs") or (lambda: []))())
+    ins = [t for t in (_mtime(p) for p in (job.get("ins") or (lambda: []))()) if t is not None]
+    if not outs:
+        return "todo", "没有产物判据"
+    ot = [_mtime(p) for p in outs]
+    if any(t is None for t in ot):
+        return "todo", "还没出过稿"
+    if ins and min(ot) < max(ins):
+        return "stale", "产物比输入旧(装配过新一轮)"
+    return "done", ""
 
 
 # ---------------- 回包"包装"清洗(v28.62): 剪贴板这条路本来就不绑豆包 ----------------
