@@ -15,7 +15,7 @@
 注意: 只可在"backfill -> table_zh 之后、尚未 relink 过"的成品上运行一次
      (锚文本取自原版同页同矩形, relink 过的成品矩形已搬移, 不可作输入)。
 """
-import io, re, sys, os
+import io, json, re, sys, os
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 import pymupdf
 
@@ -69,18 +69,43 @@ def pick_hit(hits, center, occupied):
     return min(cands, key=dist2)
 
 
+def true_page(o):
+    """侧车记录的**真实 PDF 页码**(1 基); 记录里没有 pageid 时回落 None。
+
+    与 seg_export.py / backfill_pages.py 同一口径: 侧车的 `page` 是 receive_layout
+    的**回调计数**, 不是页码 —— 图形对象也会各占一号(end_figure -> receive_layout),
+    所以图多的论文整体漂移。真实页码只有 `pageid` 说得准(LTPage.pageid, 0 基;
+    图形继承所在页的 pageid)。
+    """
+    pid = o.get("pageid")
+    return None if pid is None else int(pid) + 1
+
+
 def zero_pages(sidecar):
-    out = set()
+    """零可译段页的**真实页码**集合。
+
+    [v28.67] 修口径(P5): 旧版直接拿 o["page"](回调计数)当页码去和 pno+1(真实页序)
+    比, 图多的论文整体漂移 —— 会**跳过错的页**: 该重定位的页被当"回填页"跳过(热区
+    留在原坐标), 而真正的回填页反而被重定位(白搜一遍)。实测形态与 seg_export 记的
+    Melhani 漂移同源(真实 43/44 对应回调 55/56)。
+
+    一个真实页可能有多条记录(页面回调 + 若干图形回调), 必须**按页归并**再判:
+    只要该页有一条记录含可译文字, 这页就不算零可译。
+    老侧车无 pageid -> 回落用 `page` 当页码(与旧行为一致, 不误伤归档件)。
+    """
+    by_page = {}
     for line in open(sidecar, encoding="utf-8"):
         line = line.strip()
         if not line:
             continue
-        o = __import__("json").loads(line)
+        o = json.loads(line)
+        pg = true_page(o)
+        if pg is None:
+            pg = o["page"]
         tr = any((s.get("raw") or "").strip() and not PURE_GLYPH.match((s.get("raw") or "").strip())
                  and re.search(r"[A-Za-z0-9]", s["raw"]) for s in o["segs"])
-        if not tr:
-            out.add(o["page"])
-    return out
+        by_page[pg] = by_page.get(pg, False) or tr
+    return {pg for pg, tr in by_page.items() if not tr}
 
 
 def main():

@@ -1211,27 +1211,6 @@ class PDFTranslator:
             time.sleep(5)
             waited += 5
 
-    def _two_pass_adopt(self, task_id, input_path, config, engine):
-        """[v28.23] 两趟回路的**开关还原壳**。
-
-        坑(实测踩到, 症状极具欺骗性): 第一趟要把 PAUSE_TRANSLATE 置 1、第二趟
-        必须置空, 顺手在 finally 里 pop 就顺手把"运营开关"也 pop 了 —— 于是
-        第一个任务跑完, 后续任务读不到开关, 静默退回"直接机器翻译"(第二个任务
-        照样烧钱, 而日志看起来一切正常)。运营开关是环境变量, 不是一次性令牌:
-        一进一出原样还回去。
-
-        [v28.44] engine 一路透传到 adopt 子进程(见 _run_tool): 本回路眼下只在
-        engine == pdf2zh 分支上挂, 但子进程不能靠"调用方总是 1.x"这条隐含前提活着。
-        """
-        _op_switch = os.environ.get("PAUSE_TRANSLATE")
-        try:
-            return self._two_pass_run(task_id, input_path, config, engine)
-        finally:
-            if _op_switch is None:
-                os.environ.pop("PAUSE_TRANSLATE", None)
-            else:
-                os.environ["PAUSE_TRANSLATE"] = _op_switch
-
     def _two_pass_run(self, task_id, input_path, config, engine):
         """[v28.23] 一趟任务内的两趟采纳回路。
 
@@ -1239,6 +1218,13 @@ class PDFTranslator:
         全篇侧车(豆包要的整篇载荷); export 裁成 inbox 载荷 → 任务停在「待译」;
         豆包交件后 deliver/import/inject 把译文灌回缓存库; 第二趟关掉开关重跑,
         全命中缓存 → 零翻译调用, 产物仍由引擎排版。
+
+        [v28.67] 这里是**唯一**会临时开"提字档"的地方, 且只对**本次子进程**开
+        (translate_pdf 的 extra_env), 父进程 os.environ 全程不动。此前另有一个
+        `_two_pass_adopt` 壳子专门"进门记下开关、出门原样还回", 防的是"第一趟
+        finally 里 pop 顺手把**运营开关**也 pop 掉, 于是第二个任务静默退回机器
+        翻译(照样烧钱, 日志全绿)"(PIPELINE_STORY 第十二章)。改用每任务注入后,
+        父子进程的全局环境都不再被改写 —— 那个坑与壳子一起消失。
 
         止损两条路(2026-09-20 分家, 见下面 abort_fallback / abort_keep_delivery):
         「没有交件可留」的中断(导出失败、等稿超时)撤骨架行后回落成正常翻译, 用户至少
@@ -1309,7 +1295,7 @@ class PDFTranslator:
             'status': '提字中',
             'message': '第一趟：提取全篇原文（不翻译、不写缓存）',
         })
-        os.environ["PAUSE_TRANSLATE"] = "1"
+        # [v28.67] 开关不再写进 os.environ —— 见下面 translate_pdf 的 extra_env。
         # [v28.26] 提字进度: 侧车逐页追加 → 每 3 秒把"第几页/几段"写到卡片上。
         # 引擎那套进度解析要靠①抓控制台或②launch.ps1 的日志尾, IDE 终端里两样都
         # 没有(实测卡在 0%); 侧车是引擎自己写的文件, 拿它当进度源与终端形态无关。
@@ -1338,10 +1324,12 @@ class PDFTranslator:
 
         threading.Thread(target=_watch, daemon=True).start()
         try:
-            self.translate_pdf(input_path, config, task_id)
+            # [v28.67] "提字档"只作用于**本次子进程**: 旧写法改父进程 os.environ,
+            # 并发提交两篇时另一篇会跟着被暂停 -> 静默出一份全英文产物(P1)。
+            self.translate_pdf(input_path, config, task_id,
+                               extra_env={"PAUSE_TRANSLATE": "1"})
         finally:
             stop_watch.set()
-            os.environ.pop("PAUSE_TRANSLATE", None)
 
         # ---- 侧车 -> inbox 载荷（豆包要的整篇）----
         rc, out = _run_tool("adopt.py", [
@@ -1408,7 +1396,7 @@ class PDFTranslator:
             # [v28.53] 默认开(零 LLM 提字), force 请求旁路 —— force_rerender 提交的
             # 是"译文已回灌"的重渲染, 直接走渲染, 不能被卷进"提字 → 等交件"。
             if _two_pass_enabled() and not force:
-                fileList = self._two_pass_adopt(task_id, input_path, config, engine)
+                fileList = self._two_pass_run(task_id, input_path, config, engine)
             else:
                 fileList = self.translate_pdf(input_path, config, task_id)
             mono_path, dual_path = fileList[0], fileList[1]
@@ -2005,7 +1993,7 @@ class PDFTranslator:
             return inpath.replace('.pdf', f'.{outtype}.pdf')
         return inpath.replace(f'{intype}.pdf', f'{outtype}.pdf')
 
-    def translate_pdf(self, input_path, config, task_id=None):
+    def translate_pdf(self, input_path, config, task_id=None, extra_env=None):
         # TODO: 如果翻译失败了, 自动执行跳过字体子集化, 并且显示生成的文件的大小
         config.update_config_file(config_path[pdf2zh])
         if config.targetLang == 'zh-CN': # TOFIX, pdf2zh 1.x converter没有通过
@@ -2063,20 +2051,28 @@ class PDFTranslator:
         if config.babeldoc:
             print("🔍 [Zotero PDF2zh Server] 目前不推荐使用pdf2zh 1.x + babeldoc, 如有需要，请直接使用pdf2zh_next")
             cmd.append('--babeldoc')
-        # [自研补丁 2026-09-19 v28.9] 把本篇原文 PDF 的绝对路径交给 pdf2zh 子进程:
-        # 侧车要按"文档"归档 (converter 的 _segflow_paths 读 P2Z_DOC_PDF), 而转换器
-        # 自己拿不到输入路径 —— 上游 TranslateConverter 签名里没有它。子进程默认
-        # 继承 os.environ, 故在父进程设一次即可; 唯一假设是"同时只翻一篇", 与既有
-        # 的共享日志独占闸是同一假设。转换器读不到时只写 latest.jsonl, 不阻断翻译。
-        os.environ["P2Z_DOC_PDF"] = os.path.abspath(input_path)
+        # [自研补丁 2026-09-19 v28.9 / v28.67 重写] 每任务环境一次备齐, **只注入本次
+        # 子进程**, 不动父进程 os.environ:
+        #   ① P2Z_DOC_PDF = 本篇原文 PDF 的绝对路径。侧车要按"文档"归档(converter 的
+        #      _segflow_paths 读它), 而转换器自己拿不到 —— 上游 TranslateConverter
+        #      签名里没有输入路径。转换器读不到时只写 latest.jsonl, 不阻断翻译。
+        #   ② extra_env: 调用方指定的本次专属开关(提字趟的 PAUSE_TRANSLATE=1)。
+        # 旧写法把 ① 写在 os.environ 上并注明"唯一假设是同时只翻一篇" —— 服务端是
+        # threaded=True, 这个假设不成立: 并发提交两篇时后一篇会拿到前一篇的文档路径
+        # 与暂停开关(侧车归档到错误文档 / 静默出全英文产物, 见 PIPELINE_STORY 第十二章 P1)。
+        child_env = {"P2Z_DOC_PDF": os.path.abspath(input_path)}
+        if extra_env:
+            child_env.update({k: str(v) for k, v in extra_env.items()})
         try:
             # 使用 execute_with_progress 替代原来的 execute_in_env / subprocess.run
             # 实时解析子进程输出中的进度信息并更新 task_manager
-            execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None)
+            execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None,
+                                  extra_env=child_env)
         except subprocess.CalledProcessError as e:
             print(f"⚠️ 翻译失败, 错误信息: {e}, 尝试跳过字体子集化, 重新渲染\n")
             cmd.append('--skip-subset-fonts')
-            execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None)
+            execute_with_progress(cmd, task_id, args, self.env_manager if args.enable_venv else None,
+                                  extra_env=child_env)
         # [自研补丁] 用 splitext 取 stem: 旧写法 .replace('.pdf','') 会替换
         # 文件名中所有出现, 在 'a.pdf.b.pdf' 类名字上与 stem 语义分歧
         fileName = os.path.splitext(os.path.basename(input_path))[0]

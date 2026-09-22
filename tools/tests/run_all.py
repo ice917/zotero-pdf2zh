@@ -49,16 +49,24 @@
                                  且 y 不镜像/译文页原有 URI 活下来/同源与页数两道门禁
   27. test_relink_pages.py     v28.65 热区重定位: 碎片命中必须先并成"一次出现"的整框
                                  (否则热区只剩一个括号宽, 点数字点不到)/并框判据/端到端
+  28. test_env_isolation.py    v28.67 每任务环境隔离(P1): 提字档只注入本次子进程/不传即无
+                                 残留/并发两篇各看各的/父进程全局全程干净 + 源码静态守卫
+  29. test_dedouble_sweep.py   v28.67 去叠清扫 import 无副作用(P3): 合成库上验 import 不落
+                                 文件/--dry-run 不落库/实跑先备份改写前/路径全参数化
+  30. test_polish_paths.py     v28.67 润色路径(P4): example 不带本机盘符(相对仓库根)/
+                                 回填锚定 + 缺文件响亮告警/目录类缺失不算错/接线守卫
 
 设计约定:
     - 全部 stdlib + venv 内 pdf2zh, 不需要 pytest
     - 每个测试独立进程运行, 互不污染; 汇总退出码 (0=全过)
     - venv 路径可用环境变量 PDF2ZH_VENV_SITE 覆盖
+    - 回归**不改工作区**: 教训台账(lessons.py)指到临时文件, 见下面 P11 注释
     - 灵敏度测试(需真实 LLM 消耗)不属于本回归套件, 其脚本与结论见 改动记录.md 2026-09-11 条目
 """
 import os
 import subprocess
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -90,14 +98,20 @@ SUITES = [
     "test_heal_render.py",        # v28.63 渲染残渣治伤: 干跑体检/擦盖同框/链接补回/dual 映射
     "test_dual_links.py",         # v28.64 dual 双侧链接: 落点映射/两侧门禁/URI 活下来
     "test_relink_pages.py",       # v28.65 碎片热区: 并框判据 + 端到端覆盖整锚
+    "test_env_isolation.py",      # v28.67 每任务环境隔离(P1): 提字档只进本次子进程
+    "test_dedouble_sweep.py",     # v28.67 去叠清扫(P3): import 无副作用 + 路径参数化
+    "test_polish_paths.py",       # v28.67 润色路径(P4): example 不带本机盘符 + 缺路径响亮报错
 ]
 
 # 套件 → 它的"被测对象"(相对项目根)。**只在对象不随包分发时才需要登记** ——
 # 其余套件的被测对象都是 tools/ 下已入库的脚本, 天然在场。
 # strategist.py 属"含本机路径、本地保留暂不开源"(见 .gitignore 开源红线二期),
 # 公开 clone 里没有它 → test_strategist.py 必须 SKIP 而不是 FAIL。
+# 同理 dedouble_sweep.py 也在 .gitignore 的"本机路径"名单里(v28.67 的 P3 只改了它的
+# import 副作用与参数化, 是否开放分发是另一个决定), 故 test_dedouble_sweep.py 一并登记。
 OPTIONAL_SUBJECTS = {
     "test_strategist.py": "tools/strategist.py",
+    "test_dedouble_sweep.py": "tools/dedouble_sweep.py",
 }
 
 
@@ -106,6 +120,13 @@ def main():
     py = venv_python if os.path.exists(venv_python) else sys.executable
     root = os.path.dirname(os.path.dirname(HERE))
     print(f"回归运行器 | python={py}\n{'=' * 62}")
+    # [v28.67] P11: 回归不该动工作区。test_seg_rework 会走 seg_import 写返工单 ->
+    # 顺带 _LES.record() 记教训, 而 lessons 的默认 PATH 是**入库文件** tools/lessons.tsv
+    # (去重时还会把日期刷成今天) —— 跑一次回归就脏一次 git status。把台账指到临时文件,
+    # 被测代码路径一行不改。
+    env = os.environ.copy()
+    env["PDF2ZH_LESSONS_TSV"] = os.path.join(
+        tempfile.mkdtemp(prefix="pdf2zh_regr_lessons_"), "lessons.tsv")
     failures, skipped = [], []
     for suite in SUITES:
         path = os.path.join(HERE, suite)
@@ -119,7 +140,7 @@ def main():
                   % ", ".join(os.path.relpath(p, root).replace("\\", "/") for p in absent))
             skipped.append(suite)
             continue
-        proc = subprocess.run([py, path], cwd=HERE)
+        proc = subprocess.run([py, path], cwd=HERE, env=env)
         if proc.returncode != 0:
             failures.append(suite)
     print(f"\n{'=' * 62}")

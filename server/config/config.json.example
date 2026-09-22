@@ -10,7 +10,7 @@
                 "OPENAILIKED_BASE_URL": "https://ark.cn-beijing.volces.com/api/v3",
                 "OPENAILIKED_MODEL": "deepseek-v3-250324",
                 "POLISH": "1",
-                "POLISH_GLOSSARY": "D:/zotero-pdf2zh/server/glossary/terms.csv"
+                "POLISH_GLOSSARY": "server/glossary/terms.csv"
             }
         },
         {
@@ -42,9 +42,9 @@
                 "SILICON_MODEL": "deepseek-ai/DeepSeek-V3",
                 "POLISH": "0",
                 "POLISH_REFLECT": "1",
-                "POLISH_GLOSSARY": "D:/zotero-pdf2zh/server/glossary/terms.csv",
-                "POLISH_GUIDELINE": "D:/zotero-pdf2zh/server/glossary/guideline.txt",
-                "POLISH_REPORT_DIR": "D:/zotero-pdf2zh/server/translated/review"
+                "POLISH_GLOSSARY": "server/glossary/terms.csv",
+                "POLISH_GUIDELINE": "server/glossary/guideline.txt",
+                "POLISH_REPORT_DIR": "server/translated/review"
             }
         },
         

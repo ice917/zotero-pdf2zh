@@ -17,12 +17,17 @@
 
 台账是人可读可改的 TSV: `类型<TAB>证据<TAB>上下文<TAB>日期`。删掉某行即不再注入;
 清空文件即回到纯静态规则。写入失败一律吞掉(台账是辅助, 不能反过来卡住门禁)。
+
+[v28.67] 台账路径可用 `PDF2ZH_LESSONS_TSV` 覆盖 —— 回归套件会触发 `record()`, 若不
+改路径就每跑一次回归都动一次**入库文件**(去重时还会刷新日期, 见 P11)。跑门禁时把它
+指向临时文件, 被测代码一行不改, 仓库保持干净。
 """
 import io
 import os
 import time
 
-PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lessons.tsv")
+PATH = (os.environ.get("PDF2ZH_LESSONS_TSV")
+        or os.path.join(os.path.dirname(os.path.abspath(__file__)), "lessons.tsv"))
 
 MAX_KEEP = 50           # 台账最多留几条(超出丢最旧)
 MAX_INJECT = 6          # 注入提示词最多几条

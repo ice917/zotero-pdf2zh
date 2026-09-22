@@ -202,8 +202,16 @@ def _write_pty_chunk(data, leftover, task_id):
     return leftover
 
 
-def execute_with_progress(cmd, task_id, args, env_manager):
-    """Execute translation command and update task progress in real time."""
+def execute_with_progress(cmd, task_id, args, env_manager, extra_env=None):
+    """Execute translation command and update task progress in real time.
+
+    [v28.67] extra_env: 本次调用专属的环境变量(如提字趟的 PAUSE_TRANSLATE=1、
+    按文档归档用的 P2Z_DOC_PDF)。以前这两项是**在父进程 os.environ 上设**的,
+    隐含假设"同时只翻一篇"; 服务端是 threaded=True, 并发提交两篇不同 PDF 时
+    后一篇会读到前一篇留下的开关 —— 一篇进提字趟, 另一篇跟着被暂停, 静默出一份
+    全英文产物(PIPELINE_STORY 第十二章 P1)。子进程本来就该拿到"这次调用专属"
+    的环境, 传 dict 即可, 不需要动全局。
+    """
     final_cmd = cmd
     final_env = os.environ.copy()
     final_env["PYTHONUNBUFFERED"] = "1"
@@ -225,6 +233,11 @@ def execute_with_progress(cmd, task_id, args, env_manager):
         final_env = managed_python_env(final_env)
         # venv env is copied from os.environ and would undo COLUMNS/LINES.
         _apply_terminal_size_env(final_env, child_cols, child_rows)
+
+    # [v28.67] 每任务注入放在最后: 上面的 managed_python_env 是从 os.environ 拷的,
+    # 只有压在这之后, 本次调用的专属开关才不会被它盖掉。
+    if extra_env:
+        final_env.update({k: str(v) for k, v in extra_env.items()})
 
     # DeepSeek V4 is special: the plugin stores the user's choice in generic
     # extraData, while pdf2zh_next 2.9+ exposes that choice as explicit CLI

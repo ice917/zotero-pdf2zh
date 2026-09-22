@@ -55,6 +55,30 @@ def _safe_log_value(key, value):
     return value
 
 
+# [v28.67] 润色钩子的路径键(P4)。`config.json.example` 是 POLISH* 的**托管事实源**
+# (见 _update_config_file_locked 的回填), 一度写着本机绝对路径 `D:/zotero-pdf2zh/...`
+# —— 公开克隆/换机后就是一个不存在的路径, 而译端对缺失文件只 `logger.exception`
+# 之后静默降级(`_load_polish_glossary` 返回 {}), 钩子**无声失效**, 没人会发现。
+# 故 example 里一律写**相对仓库根**的路径, 回填时锚定成绝对路径, 并当场查存在性。
+_POLISH_FILE_KEYS = ('POLISH_GLOSSARY', 'POLISH_GUIDELINE')
+_POLISH_DIR_KEYS = ('POLISH_REPORT_DIR',)      # 目录: 缺失不算错(落盘时才 makedirs)
+
+
+def polish_backfill_value(key, value, repo_root):
+    """锚定 example 里的 POLISH 路径值, 返回 (落库值, 告警文案或 "")。
+
+    相对值按**仓库根**解析(example 里写 `server/glossary/terms.csv`), 绝对值原样保留;
+    仅**文件类**键查存在性 —— 目录类缺失是正常的(审校报告落盘时才 makedirs)。
+    """
+    v = str(value)
+    if key in _POLISH_FILE_KEYS + _POLISH_DIR_KEYS and not os.path.isabs(v):
+        v = os.path.normpath(os.path.join(repo_root, v))
+    if key in _POLISH_FILE_KEYS and not os.path.exists(v):
+        return v, (f"⚠️ 润色钩子路径不存在: {key} = {v} —— 文件缺失时译端只记日志后"
+                   f"静默降级, 钩子会**无声失效**; 请改 server/config/config.json.example")
+    return v, ""
+
+
 def stringToBoolean(value):
     if value == 'true' or value == 'True' or value == True or value == 1:
         return True
@@ -356,18 +380,25 @@ class Config:
             # 注意: 这是有意托管——POLISH_* 以 example 为准无条件回填,
             # 插件 UI 对这些键的修改不会生效; 调整润色配置请改 config.json.example。
             try:
+                _repo_root = os.path.dirname(os.path.dirname(os.path.dirname(
+                    os.path.abspath(__file__))))
                 _server_cfg_path = os.path.join(
-                    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                    'config', 'config.json.example')
+                    _repo_root, 'server', 'config', 'config.json.example')
                 with open(_server_cfg_path, 'r', encoding='utf-8') as f:
                     _server_cfg = json.load(f)
                 for _t_src in _server_cfg.get('translators', []):
                     if _t_src.get('name') == service:
                         for _k, _v in (_t_src.get('envs') or {}).items():
                             if _k.startswith('POLISH') and _v not in (None, "", [], {}):
-                                translator['envs'][_k] = _v
+                                # [v28.67] 路径键先在仓库根上锚定 + 查存在性(P4):
+                                # example 里写相对路径 -> 公开克隆不带本机盘符;
+                                # 缺文件当场响亮报错 -> 不再"静默失效"
+                                _vv, _warn = polish_backfill_value(_k, _v, _repo_root)
+                                translator['envs'][_k] = _vv
                                 translator_keys.append(_k)
-                                print(f"✏️ 润色钩子配置: {_k} = {_v}")
+                                print(f"✏️ 润色钩子配置: {_k} = {_vv}")
+                                if _warn:
+                                    print(_warn)
                         break
             except Exception:
                 print("⚠️ 读取润色钩子预置配置失败, POLISH 键可能丢失")

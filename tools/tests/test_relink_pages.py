@@ -10,8 +10,11 @@
   实测 GeoTLM 145 条命名链接里 **49 条**中招, 而原版同一批 **0 条** —— 全是本步
   引入的, 不是既有缺陷。修法: 先把碎片命中并成"一次出现"的整框, 再挑最近者。
 
-本套件锁两条: ① `merge_fragments` 的并框判据(该并的并、不该并的不并);
-② 端到端 —— 合成一张碎片排版页, 跑真工具, 断言热区**覆盖整个锚**而不是一个字。
+本套件锁三条: ① `merge_fragments` 的并框判据(该并的并、不该并的不并);
+② 端到端 —— 合成一张碎片排版页, 跑真工具, 断言热区**覆盖整个锚**而不是一个字;
+③ [v28.67] `zero_pages` 的**页码口径** —— 侧车 `page` 是回调计数, 真实页码是
+`pageid + 1`; 旧版拿回调计数当页码, 图多的论文整体漂移 -> **跳过错的页**(该重定位
+的页被当回填页跳过, 真正的回填页反而白搜一遍)。
 
 合成碎片排版的手法(实测得出): 逐字 `insert_text`, 且把锚内部的字符**基线压低 3pt**
 —— 这样 PyMuPDF 就把它们当成各自独立的碎片, `search_for` 逐字返回矩形, 与真件同构。
@@ -19,6 +22,7 @@
 
 运行: venv python test_relink_pages.py, 退出码 0=全过
 """
+import json
 import os
 import subprocess
 import sys
@@ -202,6 +206,75 @@ def main():
     check("⑫ 未命中 -> 矩形保持原位且进了报告",
           os.path.exists(rep) and "'[9]'" in open(rep, encoding="utf-8").read(),
           open(rep, encoding="utf-8").read() if os.path.exists(rep) else "无报告")
+
+    # ============ 四、zero_pages: 页码口径(真实页序, 不是回调计数) ============
+    # 侧车的 `page` 是 receive_layout 的**回调计数**(图形对象也各占一号),
+    # 真实页码只有 `pageid + 1` 说得准。旧版拿回调计数当页码 -> 跳过错的页。
+    def sidecar(name, recs):
+        p = os.path.join(tmp, name)
+        with open(p, "w", encoding="utf-8") as f:
+            for r in recs:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        return p
+
+    sc = sidecar("drift.jsonl", [
+        {"page": 1, "pageid": 0, "segs": [{"raw": "Intro text"}]},   # 真实 p1 有正文
+        {"page": 2, "pageid": 0, "segs": [{"raw": "{v0}"}]},         # 图形回调, 仍属真实 p1
+        {"page": 3, "pageid": 1, "segs": [{"raw": "Body text"}]},    # 真实 p2 有正文
+        {"page": 4, "pageid": 2, "segs": [{"raw": "{v1}"}]},         # 真实 p3 纯字形
+    ])
+    got = RL.zero_pages(sc)
+    check("⑬ 漂移侧车 -> 报**真实**零页 {3}(旧口径报 {2,4}: 跳过错的页)",
+          got == {3}, "得 %s" % sorted(got))
+
+    # 同一真实页多条记录: 只要有一条含可译文字, 这页就不算零可译(按页归并)
+    sc = sidecar("same.jsonl", [
+        {"page": 5, "pageid": 2, "segs": [{"raw": "{v0}"}]},         # 图形回调
+        {"page": 6, "pageid": 2, "segs": [{"raw": "Table text"}]},   # 页面回调, 有文字
+    ])
+    check("⑭ 同页多记录有一条可译 -> 该页不算零页", RL.zero_pages(sc) == set(),
+          repr(RL.zero_pages(sc)))
+
+    # 老侧车(无 pageid) -> 回落 page 口径, 不误伤归档件
+    sc = sidecar("old.jsonl", [
+        {"page": 1, "segs": [{"raw": "Intro"}]},
+        {"page": 2, "segs": [{"raw": "{v0}"}]},
+    ])
+    check("⑮ 无 pageid -> 回落 page 口径", RL.zero_pages(sc) == {2}, repr(RL.zero_pages(sc)))
+
+    # 端到端: --sidecar 指的**真实零页**必须被跳过(热区留在原坐标)
+    org2 = os.path.join(tmp, "orig2.pdf")
+    tgt2 = os.path.join(tmp, "mono2.pdf")
+    o = pymupdf.open()
+    t = pymupdf.open()
+    for _ in range(2):
+        o.new_page(width=612, height=792)
+        t.new_page(width=612, height=792)
+    for pno in (0, 1):
+        plain_marker(o[pno], 99, 100, "[5]")
+        o[pno].insert_link({"kind": pymupdf.LINK_NAMED,
+                            "from": pymupdf.Rect(98.5, 89, 112, 103), "nameddest": "x"})
+        frag_marker(t[pno], 200, 200, "[5]")
+        t[pno].insert_link({"kind": pymupdf.LINK_NAMED,
+                            "from": pymupdf.Rect(98.5, 89, 112, 103), "nameddest": "x"})
+    o.save(org2); o.close()
+    t.save(tgt2); t.close()
+
+    sc = sidecar("e2e.jsonl", [
+        {"page": 1, "pageid": 0, "segs": [{"raw": "Page one text"}]},
+        {"page": 2, "pageid": 1, "segs": [{"raw": "{v0}"}]},         # 真实 p2 纯字形
+    ])
+    p2_before = links(tgt2, 1)
+    rc, so, se = run(RELINK, "--target", tgt2, "--original", org2, "--sidecar", sc)
+    check("⑯ 端到端带 --sidecar 退出码 0", rc == 0, "%d %s" % (rc, se[-300:]))
+    check("⑯ 真实零页(第 2 页)被跳过 -> 报「跳过(回填页/短锚): 1」",
+          "跳过(回填页/短锚): 1" in so, so.strip())
+    check("⑰ 零页的热区**一格未动**(留在原坐标)", links(tgt2, 1) == p2_before,
+          "%s vs %s" % (links(tgt2, 1), p2_before))
+    b0 = links(tgt2, 0)[0]
+    check("⑰ 非零页(第 1 页)照常重定位(热区宽 %.2f > 8)" % b0.width,
+          b0.width > 8.0 and abs(b0.x0 - 200) < 0.6,
+          "x=[%.2f,%.2f] w=%.2f" % (b0.x0, b0.x1, b0.width))
 
     print("\nrelink_pages 热区重定位单元测试: %d PASS / %d FAIL" % (passed, failed))
     return 1 if failed else 0
