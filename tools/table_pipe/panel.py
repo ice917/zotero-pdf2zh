@@ -42,6 +42,19 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
 **试过但否掉的读数**(别重新起头): 拉丁碎片保真 —— 实测误报 105/115
 ("Subfamily"->"亚科"被判成"丢了拉丁串"), 字面上分不开"该保留的学名"与"该翻译的英文词"。
 
+  [v28.69] 三步之间补上"**哪块还没做**"这一环(用户实测: 表格做完直接去渲染, 表格页仍是英文):
+    本轮清单 —— ① 复制成功即把该任务记进内存清单(复制 = 你真的要做它), 操作区下方一行
+                 实时显示"哪几块已出稿 / 哪几块没出稿"。**判据只能是这个**: 表格 manifest
+                 里没有论文信息(它只认工作目录), 硬要按论文分组就得让用户手工标注 ——
+                 而清单是用户用鼠标自己画出来的, 零操作且不会认错。
+    硬拦截   —— ④ 出稿的任务**会触发重渲染**时(正文), 若本轮清单里还有没出稿的, 直接拒绝。
+                 渲染一出就没法回头补(缓存已注入、PDF 已出), 这是唯一值得硬拦的那一步;
+                 表格正文/表注的 ④ 只是排版, 不拦 —— 否则"先做表格"这一步自己就被拦住了。
+    逃生门   —— 弹出一颗危险色按钮「仍然出稿（放弃未完成的任务）」, 重发带 force 的请求;
+                 用了就在台账里记成"强制出稿"并列明放弃了哪几块(不是静默放行)。
+    外发台账 —— ① 复制也落一行(阶段「复制」): 与 ③/④ 两行合起来, 一轮的完整轨迹
+                 (发了哪几块、谁翻的、过没过、出没出稿)全在 vendor_ledger.tsv 里。
+
 网页版特有的两条契约:
   退出: 页面关窗前 sendBeacon 打 /api/bye -> 进 15s 宽限期, 期内有新心跳(F5 刷新 /
         别的页面还活着)则告别作废, 否则退出; 兜底是心跳, 收过心跳后
@@ -167,6 +180,51 @@ def ledger(stage, job_label, n_units, n_suspect, verdict, note=""):
                        str(note).replace("\t", " ").replace("\n", " ")[:200]))
     except OSError:
         pass
+
+
+def short_of(label):
+    """任务短名(下拉里的标签可能带论文全名, 清单里放不下): "正文 Li _ - 2026 - …" -> "正文"。"""
+    return label.split(" ")[0]
+
+
+def _is_render(job):
+    """会**触发重渲染**的任务(正文) —— 只有它该被硬拦。
+
+    其余任务的 ④ 只是排版(附录/表注 JSON), 拦它们没意义: 顺序本来就是"表格正文 -> 表注 ->
+    正文", 谁先出稿都行; 渲染才是那一步回不了头的动作。
+    """
+    return bool(job.get("render"))
+
+
+def round_state():
+    """本轮清单(按 ① 复制的先后) -> [{"label", "short", "done"}]。
+
+    "本轮"= 面板本次运行里用户**① 复制过**的任务。复制=你真的要做它, 于是不必去猜
+    "这个表格属于哪篇论文"(manifest 里根本没有论文信息)。渲染任务出稿成功即本轮结束,
+    清单清空 —— 下一篇重新记。
+    """
+    with LOCK:
+        r = list(STATE["round"].items())
+    return [{"label": k, "short": short_of(k), "done": v["done"]} for k, v in r]
+
+
+def round_pending(exclude=None):
+    """本轮清单里**还没出稿**的任务(排除自己) —— 硬拦截的唯一判据。"""
+    with LOCK:
+        r = dict(STATE["round"])
+    return [k for k, v in r.items() if not v["done"] and k != exclude]
+
+
+def note_sent(job, n_units):
+    """① 复制成功时记一笔: 进本轮清单 + 落外发台账。
+
+    台账记的是**外发历史**("这一轮我把哪几块发出去了"), 与 ③ 检查/④ 出稿那两行合起来能
+    还原一轮的完整轨迹。**旁证, 不是门禁** —— 台账写不进去不影响复制本身。
+    """
+    with LOCK:
+        STATE["round"][job["label"]] = {"done": False}
+    ledger("复制", job["label"], n_units, 0, "已复制", "")
+    return round_state()
 
 
 def _brief(seq, n=12):
@@ -495,6 +553,15 @@ section.glass{padding:14px 18px}
 }
 .btn.primary:hover{box-shadow:0 8px 26px -6px var(--primary)}
 .btn.small{padding:5px 13px;font-size:12.5px}
+/* 逃生门: 只在硬拦截出现后现身。做成危险色 —— 点它意味着放弃未完成的任务。 */
+.btn.danger{
+  background:transparent;border-color:color-mix(in srgb,var(--danger) 60%,transparent);
+  color:var(--danger);
+}
+.btn.danger:hover{background:color-mix(in srgb,var(--danger) 14%,transparent)}
+.roundrow{padding:9px 18px;font-size:12.5px}
+.roundrow .done{color:var(--ok)}
+.roundrow .todo{color:var(--warn);font-weight:700}
 /* 自定义下拉: 原生 <select> 的弹层是操作系统画的, 圆角/毛玻璃都改不了(颜色也仅部分
    可控, 实测 Edge/Win 不跟 color-scheme) —— 要"我们的圆角风格"只能自绘。 */
 .dd{position:relative}
@@ -603,10 +670,17 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
     <button class="btn" id="checkBtn" type="button">③ 检查(只读预览)</button>
     <button class="btn" id="reviewBtn" type="button">⑥ 语义审核</button>
     <button class="btn primary" id="commitBtn" type="button" disabled>④ 确认写入并出稿</button>
+    <button class="btn danger" id="forceBtn" type="button" hidden
+            title="本轮还有任务没出稿时才会出现; 用它出稿会把跳过的任务记进台账">仍然出稿（放弃未完成的任务）</button>
     <span class="muted" id="rvGuard"></span>
   </section>
 
   <div class="glass banner idle" id="banner">尚未检查。</div>
+
+  <div class="glass row roundrow" id="roundRow">
+    <span class="muted">本轮</span>
+    <span id="roundStat">还没复制过任何任务 —— ① 复制过哪几块, 这里就列哪几块。</span>
+  </div>
 
   <section class="glass" id="rwCard" hidden>
     <div class="row spread">
@@ -675,8 +749,22 @@ function log(msg){
   logBox.scrollTop=logBox.scrollHeight;
 }
 function setBanner(kind,text){banner.className='glass banner '+kind;banner.textContent=text}
+/* 本轮清单: ① 复制过哪几块、哪几块已经出稿。硬拦截(④ 渲染任务)就以此为准 ——
+   复制=你真的要做它, 所以不必去猜"这块属于哪篇论文"。渲染出稿成功即本轮结束、清单清空。 */
+function renderRound(list){
+  var el=$('roundStat');
+  if(!list||!list.length){
+    el.textContent='还没复制过任何任务 —— ① 复制过哪几块, 这里就列哪几块。';
+    return;
+  }
+  el.innerHTML=list.map(function(x){
+    return esc(x.short)+(x.done?'<span class="done"> ✓ 已出稿</span>'
+                             :'<span class="todo"> ○ 未出稿</span>');
+  }).join(' · ');
+}
 function edited(){
   commitBtn.disabled=true;commitBtn.textContent='④ 确认写入并出稿';
+  $('forceBtn').hidden=true;                    /* 逃生门只对"那一次检查"有效 */
   $('rvCard').hidden=true;window.__rv='';       /* ⑥ 的结论是针对旧文本的, 一改即作废 */
   setBanner('idle','内容已改 —— 请重新点 ③ 检查。');
 }
@@ -684,6 +772,7 @@ ta.addEventListener('input',edited);
 $('sendBtn').addEventListener('click',function(){
   api('/api/send',{task:$('taskSel').value}).then(function(r){
     if(r.error){log('✗ '+r.error);return}
+    renderRound(r.round);
     $('sendStat').textContent='已复制 '+r.n_units+' 单元 / '+r.n_chars+' 字符';
     log('已把「'+r.label+'」待译文本复制到剪贴板('+r.n_units+' 单元 / '+r.n_chars+' 字符); 粘进'
         +vendor+'即可(载荷自带抬头, 换家也不用改提示词)。');
@@ -866,20 +955,35 @@ function render(r){
     log('   门禁未过, 不写入。修正后重新粘贴再检查。');
   }
 }
-commitBtn.addEventListener('click',function(){
+/* ④ 出稿。两条路: 正常点(force=false, 服务器会硬拦"本轮还有任务没出稿"),
+   或拦截后点逃生门(force=true, 跳过的任务记进台账)。 */
+function doCommit(force){
   commitBtn.disabled=true;
-  setBanner('busy','正在写入并排版…');
-  api('/api/commit',{text:ta.value}).then(function(r){
+  setBanner('busy',force?'强制出稿中(跳过未完成的任务)…':'正在写入并排版…');
+  api('/api/commit',{text:ta.value,force:!!force}).then(function(r){
     (r.log||[]).forEach(function(l){log(l)});
+    renderRound(r.round);
     if(!r.ok){
+      if(r.blocked){                      /* 硬拦截: ④ 保持禁用, 让用户先补做 */
+        $('forceBtn').hidden=false;
+        setBanner('err','✗ '+r.error);
+        log('✗ '+r.error);
+        return;
+      }
       setBanner('err','✗ '+(r.error||'未出稿'));
       log('✗ '+(r.error||'未出稿(门禁未过或排版失败)。'));
       if(!r.stale)commitBtn.disabled=false;
       return;
     }
+    $('forceBtn').hidden=true;
     setBanner('ok','✓ 已出稿: '+r.out);
     log('✓ 出稿: '+r.out+'  (翻译方 '+vendor+', 已记台账)');
   });
+}
+commitBtn.addEventListener('click',function(){doCommit(false)});
+$('forceBtn').addEventListener('click',function(){
+  log('▶ 强制出稿: 放弃本轮未完成的任务(会记进台账, 事后可查)。');
+  doCommit(true);
 });
 $('themeBtn').addEventListener('click',function(){
   theme=theme==='dark'?'light':'dark';applyTheme();
@@ -1008,6 +1112,7 @@ api('/api/state').then(function(s){
   vendor=vendorDD.pick(s.vendor||'');       /* 服务器记住的选择(工作目录里的 .panel_vendor) */
   rvConflicts=s.rv_conflicts||[];applyVendorGuard();
   $('workdir').textContent='工作目录 '+(s.workdir||'');
+  renderRound(s.round);
   theme=s.theme||theme;applyTheme();
   renderIdle(s.idle);
   log('翻译方「'+vendor+'」; 审核者 '+s.rv_model+' —— ⑥ 只审不改, 且与翻译方同源时拒审。');
@@ -1023,7 +1128,8 @@ api('/api/state').then(function(s){
 
 IDLE_LIMIT = 1800    # 心跳静默多少秒算"窗口已关"(30min: 用户切去豆包翻长文, 后台标签被浏览器节流/冻结)
 BYE_GRACE = 15       # 收到告别后的宽限秒数
-STATE = {"checked": None, "sha": None, "ping": None, "bye_at": None, "idle_off": False}
+STATE = {"checked": None, "sha": None, "ping": None, "bye_at": None, "idle_off": False,
+         "round": {}}
 LOCK = threading.Lock()
 
 
@@ -1098,6 +1204,7 @@ class H(BaseHTTPRequestHandler):
                         "rv_conflicts": [v for v in VENDORS if rv_conflict(v)],
                         "rv_model": rv.config()["model"],
                         "workdir": wc.D, "theme": _load_theme(),
+                        "round": round_state(),   # 本轮的"哪块还没做"清单(① 复制过才算数)
                         "idle": idle_state()})    # 页面一开就显示倒计时, 不等第一次心跳
         elif path == "/api/ping":
             with LOCK:
@@ -1190,7 +1297,9 @@ class H(BaseHTTPRequestHandler):
         if not wc.write_clip(text):
             self._json({"error": "剪贴板被别的程序占住, 稍后再试。"})
             return
-        self._json({"label": job["label"], "n_units": n, "n_chars": len(text)})
+        # 复制成功才记账: 记进本轮清单("这块要做了")+ 外发台账("这块发出去了")
+        self._json({"label": job["label"], "n_units": n, "n_chars": len(text),
+                    "round": note_sent(job, n)})
 
     def _check(self, b):
         text = b.get("text", "")
@@ -1243,21 +1352,41 @@ class H(BaseHTTPRequestHandler):
                         "error": "粘贴区内容已改, 之前的检查结果作废 —— 请重新点 ③ 检查。"}, 409)
             return
         job, ids, got = checked
+        pend = round_pending(exclude=job["label"])
+        if pend and _is_render(job) and not b.get("force"):
+            # 硬拦截: 渲染一出就没法回头补 —— 本轮复制过的任务里还有没出稿的, 先做完它们。
+            # 逃生门: 确实要跳过就重发一次带 force 的请求(前端那颗按钮), 会记进台账。
+            names = "、".join(short_of(l) for l in pend)
+            self._json({"ok": False, "blocked": True, "round": round_state(),
+                        "pending": [{"label": l, "short": short_of(l)} for l in pend],
+                        "error": "本轮还有任务没出稿: %s —— 渲染一出就没法回头补, "
+                                 "先把它们逐个做完(①→③→④); 确实要跳过就点「仍然出稿」。" % names})
+            return
         logs = []
         out = wc.run_job(job, ids, got, log=logs.append)
         wc.beep(bool(out))
         if not out:
             ledger("出稿", job["label"], len(ids), 0, "出稿失败", "排版/注入未过")
-            self._json({"ok": False, "log": logs, "error": "未出稿(门禁未过或排版失败)。"})
+            self._json({"ok": False, "log": logs, "round": round_state(),
+                        "error": "未出稿(门禁未过或排版失败)。"})
             return
-        ledger("出稿", job["label"], len(ids), 0, "已出稿", out)
+        skipped = [short_of(l) for l in pend] if _is_render(job) else []
+        ledger("出稿", job["label"], len(ids), 0, "强制出稿" if skipped else "已出稿",
+               ("放弃未完成: " + "、".join(skipped)) if skipped else out)
         with LOCK:                            # 已落盘, 防双击重复出稿
             STATE["checked"] = None
+            STATE["round"][job["label"]] = {"done": True}
+            if _is_render(job):               # 渲染完成 = 本轮结束, 下一篇重新记
+                STATE["round"].clear()
+        if skipped:
+            logs.append("! 强制出稿: 跳过了未完成的任务(%s) —— 已记台账。" % "、".join(skipped))
+        if _is_render(job):
+            logs.append("✓ 本轮结束 —— 本轮任务清单已清空, 下一篇从头记。")
         try:
             os.startfile(out)
         except Exception as e:
             logs.append("(自动打开失败: %r)" % e)
-        self._json({"ok": True, "log": logs, "out": out})
+        self._json({"ok": True, "log": logs, "out": out, "round": round_state()})
 
 
 def open_app(url):

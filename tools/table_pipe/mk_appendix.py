@@ -189,4 +189,7 @@ def main():
     print("  表注: %s" % ("已回填" if notes else "占位(红字), 待 notes 往返"))
 
 
-main()
+# 守门: 本件被 import 时(如 mk_ledger.py 复用其排版函数)**不得**执行 main(),
+# 否则 import 即真生成 appendix_tables_zh.docx, 破坏调用方的只读契约。
+if __name__ == "__main__":
+    main()

@@ -58,6 +58,8 @@
   31. test_result_naming.py    v28.68 交件命名契约: 两份契约逐字节一致(tools↔server)/
                                  新件缺省 webai 而旧件 .doubao* 原样保留(改名不断链)/
                                  两族同权(glob/matches/belongs) + 四处调用点接线守卫
+  32. test_pre_render_ledger.py v28.69 渲染前保底底片 + 本轮硬拦截: import 无副作用/
+                                 底片内容与只读契约/底片失败不拦渲染/逃生门记账/前端接线
 
 设计约定:
     - 全部 stdlib + venv 内 pdf2zh, 不需要 pytest
@@ -104,7 +106,8 @@ SUITES = [
     "test_env_isolation.py",      # v28.67 每任务环境隔离(P1): 提字档只进本次子进程
     "test_dedouble_sweep.py",     # v28.67 去叠清扫(P3): import 无副作用 + 路径参数化
     "test_polish_paths.py",       # v28.67 润色路径(P4): example 不带本机盘符 + 缺路径响亮报错
-    "test_result_naming.py",      # v28.68 交件命名契约: 两侧一致/新旧互认/两族同权/接线守卫
+    "test_result_naming.py",    # v28.68 交件命名契约: 两侧一致/新旧互认/两族同权/接线守卫
+    "test_pre_render_ledger.py",  # v28.69 渲染前保底底片 + 本轮硬拦截(逃生门记账)
 ]
 
 # 套件 → 它的"被测对象"(相对项目根)。**只在对象不随包分发时才需要登记** ——

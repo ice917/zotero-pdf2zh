@@ -210,7 +210,7 @@ JOBS = [
                       "job_notes_response.tsv"],
          after=lambda: [[PY, os.path.join(SD, "mk_appendix.py")]],
          out=lambda: DOCX),
-    dict(label="正文 " + BODY_NAME, pre="S", blocks=True,
+    dict(label="正文 " + BODY_NAME, pre="S", blocks=True, render=True,
          manifest=body_manifest(), payload=body_payload(),
          sidecar=body_sidecar(), pdf=BODY_PDF,
          job=body_payload(), resp=BODY_NAME + "_response.tsv",
@@ -313,7 +313,7 @@ def refresh_body():
             BODY_PDF = new_pdf
     if not changed:
         return
-    JOBS[2] = dict(label="正文 " + BODY_NAME, pre="S", blocks=True,
+    JOBS[2] = dict(label="正文 " + BODY_NAME, pre="S", blocks=True, render=True,
                    manifest=body_manifest(), payload=body_payload(),
                    sidecar=body_sidecar(), pdf=BODY_PDF,
                    job=body_payload(), resp=BODY_NAME + "_response.tsv",
@@ -604,8 +604,27 @@ def write_resp(path, job, ids, got):
                 f.write("%s\t%s\n" % (uid, got[uid]))
 
 
+def _snapshot(log=print):
+    """渲染前的**保底底片**: 把此刻已过的译稿固化成一份人读 Word(mk_ledger.build)。
+
+    只在会触发重渲染的任务上做(正文): 渲染一出, 缓存被注入、产物落盘, 原始译稿就散在
+    TSV 与 #S 块里了 —— 那是机读格式, 人事后想核"当时到底译成了什么"很费劲。底片就是
+    **渲染前的人读存档点**: 正文逐段「原文/译文」对照 + 表格保持原表结构(见 mk_ledger)。
+
+    **失败只报警, 绝不拦渲染**: 真正的底是 TSV 与缓存库, 底片只是副本; 副本没做出来
+    不该卡住出稿(mk_ledger 只读既有文件, 也不该在这里制造副作用)。
+    """
+    try:
+        import mk_ledger                       # 惰性导入: mk_ledger 反过来 import 本模块
+        out = mk_ledger.build(log=log)
+        if not out:
+            log("  (没有可固化的译稿, 本轮不出底片)")
+    except Exception as e:                     # noqa: BLE001 —— 任何异常都不许冒泡
+        log("  ! 底片生成失败(%r) —— 不拦渲染, 真实底仍是 TSV 与缓存库。" % (e,))
+
+
 def run_job(job, ids, got, log=print):
-    """落盘 -> 门禁 -> 通过则跑出稿工序(表格=排附录; 正文=注入缓存+重渲染)。
+    """落盘 -> 门禁 -> 渲染前存底片 -> 出稿工序(表格=排附录; 正文=注入缓存+重渲染)。
     返回产物路径(出稿后由调用方打开); 未出稿返回 None。"""
     resp = os.path.join(D, job["resp"])
     write_resp(resp, job, ids, got)
@@ -618,6 +637,9 @@ def run_job(job, ids, got, log=print):
     if p.returncode != 0:
         log("  ✗ 门禁未过, 未出稿。修正后重新粘贴即可。")
         return None
+
+    if job.get("render"):                      # 渲染前存底片(只读, 不拦)
+        _snapshot(log)
 
     after = job.get("after")               # 工序表也是 lambda(惰性求路径), 先调再遍历
     after = after() if callable(after) else (after or [])
