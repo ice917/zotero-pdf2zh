@@ -22,6 +22,8 @@ __pycache__/
 inbox/
 out/
 segflow/
+ledger/
+tools/table_pipe/*_response*.tsv
 对照抽查点.md
 docs/
 zotero-pdf-2-zh-*.xpi
