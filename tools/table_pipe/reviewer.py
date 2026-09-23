@@ -20,6 +20,18 @@
 接缝断裂、文风突变是军师层(strategist.py)的活, 本件不重复, 也不报机械门禁已覆盖的项
 (编号/占位符/⋮/标点) —— 那是噪音, 会把自己报出的真问题淹掉。
 
+[v28.75] 责任划分: 审核者要说清"错在译文还是在原文"。老扫描件的文本层缺陷(形近字母数字
+混淆/缺字/断字 —— `011`=on、`340/00`=34‰、`lao mellae`=lamellae)在**原文里就已存在**,
+而译者被载荷规则硬性要求**逐字符照抄**原文数字与字母(机检按字形落点验收)。把这类报成
+「数字」「错译」＝ 让用户拿着返工单去找翻译方改一个**改不动**的东西(改了反而破坏字形
+回锚)。故单列 kind = 源文缺陷, 报告里与译文侧存疑分节呈现, 面板一键复制的返工单
+**不含**它们(见 split_src)。
+
+[v28.76] 术语入口: 本件只报不改,**也不负责裁决** —— 但裁决完得有个落点。④ 报出
+「术语」存疑之后, 面板可就地填「原词 + 译名」写进术语表(见 append_terms): 两份表
+(1.x 的 terms.csv 与 BabelDOC 的 terms.babeldoc.csv, 格式不同)一次写齐。此前这一步
+全靠人工开 csv, 而"漏同步第二份"是**静默失效**(换引擎那个词就不生效, 无处报错)。
+
 密钥: 环境变量 SILICON_API_KEY / SILICON_MODEL / SILICON_BASE_URL 优先,
 否则读 server/config/config.json 的 translators[silicon].envs(与 strategist.py 同一口径)。
 零依赖: urllib 直连 OpenAI 兼容端点, 不引 openai 包 —— 本件要被零依赖的 panel.py 直接 import。
@@ -50,13 +62,36 @@ MAX_NOTE = 300           # 单条说明截断
 MAX_QUOTE = 120          # 原文片段截断
 MAX_ITEMS = 200          # 存疑条数上限(超过只留前 N 条, 免得面板被淹)
 
-KINDS = ("漏译", "错译", "数字", "术语", "指代", "表达")
-_KIND_HINT = (("漏", "漏译"), ("错", "错译"), ("数字", "数字"), ("数值", "数字"),
+# 「源文缺陷」(v28.75): 错的**根不在译文**而在原文自己 —— 老扫描件的文本层形近混淆
+# (`011`=on / `110`=no / `III`=in / `IS`=15 / `340/00`=34‰)、缺字(`nutnt~vely`)、
+# 断字(`lao mellae`=lamellae)、双空格断词(`essen  tially`)。译者被载荷规则硬性要求
+# **逐字符照抄**原文的数字与字母(机检按字形落点验收), 所以"译者没把原文的笔误改对"
+# 不是译者的错; 把它报成「数字」「错译」会让用户拿着返工单去找翻译方改一个**改不动**
+# 的东西(改了反而破坏字形回锚)。单列一类, 与译文侧的存疑分开呈现。
+SRC_DEFECT = "源文缺陷"
+KINDS = ("漏译", "错译", "数字", "术语", "指代", "表达", SRC_DEFECT)
+# 源文缺陷的线索词排在最前: 模型常写「原文数字笔误」「源文漏字」这种复合标签, 若让
+# ("数字",…) 先命中就会把它退回「译文侧数字错」—— 正是本类要治的错归因。
+_KIND_HINT = (("源文", SRC_DEFECT), ("笔误", SRC_DEFECT),
+              ("印刷", SRC_DEFECT), ("扫描", SRC_DEFECT), ("OCR", SRC_DEFECT),
+              ("ocr", SRC_DEFECT),
+              ("漏", "漏译"), ("错", "错译"), ("数字", "数字"), ("数值", "数字"),
               ("单位", "数字"), ("术语", "术语"), ("指代", "指代"), ("代词", "指代"),
               ("表达", "表达"), ("病句", "表达"), ("流畅", "表达"))
 
 _RULES = """你是学术论文译文的独立审核者。下面按 #S 编号逐段给出「原文 -> 译文」。
-任务: 找出译文里的**语义性错误**。只报问题, **绝对不要改写或重译任何一句**。
+任务: 找出**译文引入的**语义性错误。只报问题, **绝对不要改写或重译任何一句**。
+
+[先分清责任: 错在译文, 还是错在原文]
+本管线的译者被**硬性要求逐字符照抄**原文里的数字/字母/符号(机检按字形落点验收)。
+所以"译文与原文一字不差、但这个错是原文自己就有的"**不是译文错误** —— 那是扫描/排版
+留下的**源文文本层缺陷**: 形近字母数字混淆、缺字、断字。
+- 判据只有一个: 把译文与原文逐字比 —— **这个错在原文里已经存在**就是源文缺陷;
+  只有"原文正确而译文走样"才算译文的错。
+- 这类归到 kind = 源文缺陷, 并在说明里写清你**推测的原意**(如某个数字串疑似应为
+  哪个数值、某个字母串疑似应为哪个词), 供人在**原文侧**校勘。
+- 不要因为"译者没把原文的笔误改对"而指责译者; 更不要建议按推测原意改写译文
+  (那会破坏字形回锚, 是硬门禁不允许的)。
 
 [审这些]
 1. 漏译: 原文有完整语义而译文明显缺失(不是"更简略", 是半句/整句没落地)。
@@ -65,15 +100,22 @@ _RULES = """你是学术论文译文的独立审核者。下面按 #S 编号逐�
 4. 术语: 同一原文术语在本篇里译法不统一, 或与下面给出的术语表冲突。
 5. 指代: 代词/连接词指错对象, 或原句主语被译没了导致歧义。
 6. 表达: 病句/机翻腔严重到影响理解(只在这种程度才报)。
+7. 源文缺陷: 错的根在原文自身(见上面一节)。这类只报给**人**做原文校勘,
+   不会变成译者的返工单。
 
 [不要报]
 - 编号是否齐全、占位符/特殊字形是否原样、⋮ 断点在不在、半角还是全角标点 —— 一律不报,
   这些由本机机械门禁负责, 报了纯属噪音。
+- **文后参考文献表**的条目: 按载荷规则整条照抄, 作者名/年份/刊名/卷期页码一律不汉化、
+  不改拼写。因此"作者名照抄没音译"、"与正文里对同一文献的汉化称呼不一致"
+  都**不算问题**。
+- 原文用「作者(年份)」代指被提到的研究对象, 是该体例的固有写法(意为"据该作者某年报道,
+  该对象是…"): 译文照搬这个体例不算错译, 别报主语错。
 - "还可以更通顺/更优雅/建议加主语"这类改进意见一律不报。
 - 不要凑数: 没问题的段不要出现在结果里; 整篇没问题就直接输出 []。
 
 [输出] 只输出 JSON 数组, 不要解释文字、不要 markdown 代码围栏。每项形如:
-{"id":"S12","kind":"漏译|错译|数字|术语|指代|表达","level":"高|中","note":"一句话说清错在哪(中文)","quote":"原文中出问题的那一小段原文(照抄, 便于定位)"}
+{"id":"S12","kind":"漏译|错译|数字|术语|指代|表达|源文缺陷","level":"高|中","note":"一句话说清错在哪(中文)","quote":"原文中出问题的那一小段原文(照抄, 便于定位)"}
 level: 高 = 事实错误或影响理解; 中 = 局部瑕疵。
 """
 
@@ -152,6 +194,105 @@ def load_terms(path=None):
     except OSError:
         return []
     return out
+
+
+# ------------------------------------------------------- 术语裁决入表 (v28.76)
+# ④ 报出「术语」存疑之后的落点。此前这一段**全是手工**: 跑 term_verify 取证 -> 人裁决 ->
+# 打开 terms.csv 追加一行 -> **再记得同步 terms.babeldoc.csv**。最后一步是静默陷阱: 两表
+# 格式不同(见 terms_files), 漏写那份不报任何错, 换个引擎那个词就不生效了(实测没人会记得)。
+TERMS_BABELDOC = os.path.join(PROJ, "server", "glossary", "terms.babeldoc.csv")
+TERM_EN_MAX = 120        # 表里存的是**词/短语**; 上限用来拦住"把整句原文粘进来" ——
+TERM_ZH_MAX = 60         # 长的匹配不上, 写进去等于白记, 还会污染审核者的术语判据。
+
+
+def terms_files():
+    """要同步写入的术语表 —— 两件**格式不同**, 各按自己的格式写(见 append_terms):
+      terms.csv          'english,chinese' 无表头; '#' 注释行是来源/判据, 读取端一律跳过
+      terms.babeldoc.csv 'source,target' **带表头**, 不能掺注释行(BabelDOC 的解析器)
+    1.x 侧读前者(POLISH_GLOSSARY / seg_export 默认); next/BabelDOC 侧读后者。"""
+    return [TERMS_CSV, TERMS_BABELDOC]
+
+
+def _append_lines(path, lines):
+    """按文件**自己**的换行与结尾形态追加 —— 混用 CRLF/LF 会让整文件 diff 变脏(实测
+    terms.csv 是 LF、terms.babeldoc.csv 是 CRLF); 少个结尾换行会把两行粘成一条, 而术语表
+    读取端按行解析, 粘了就**丢一条**(还不报错)。"""
+    with open(path, "rb") as f:
+        raw = f.read()
+    nl = "\r\n" if b"\r\n" in raw else "\n"
+    head = "" if (not raw or raw.endswith((b"\n", b"\r"))) else nl
+    with open(path, "a", encoding="utf-8", newline="") as f:
+        f.write(head + nl.join(lines) + nl)
+
+
+def _same_source_tail(path, note, day):
+    """terms.csv 里**最近一条注释**是否就是同来源同日的 `# 来源`(同一次审核连着加词只写一次)。
+
+    看的是「最近一条注释」而不是「最后一行」: 注释是写在它那批词条**前面**的, 追加完
+    第一条词之后最后一行就变成词条了 —— 若按最后一行判, 这条判据永远不成立, 每加一个词
+    都会再写一遍来源注释(实测拦到)。
+    """
+    try:
+        with io.open(path, encoding="utf-8") as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        return False
+    last = next((ln for ln in reversed(lines) if ln.startswith("#")), None)
+    return bool(last and last.startswith("# 来源:") and day in last and note in last)
+
+
+def append_terms(en, zh, src="", day=None, paths=None):
+    """录入一条术语裁决 -> (status, msg); status ∈ written / exists / error。
+
+    [v28.76] 去重以**第一份表**(terms.csv)为准: en 已存在即拒绝, 并报出表里的译名 ——
+    同一个原词给两个中文名, 会自己触发审核者的术语一致性判据(terms.csv 抬头那条)。
+    比对按小写: `Ovigerous lamellae` 与 `ovigerous lamellae` 是同一个词。
+    """
+    en, zh = (en or "").strip(), (zh or "").strip()
+    if not en or not zh:
+        return "error", "原词与译名都要填。"
+    if "," in en or "," in zh:
+        return "error", "原词/译名里不能有半角逗号 —— csv 就是用逗号分列的。"
+    if any(c in en + zh for c in "\r\n"):
+        return "error", "原词/译名不能换行。"
+    if len(en) > TERM_EN_MAX or len(zh) > TERM_ZH_MAX:
+        return "error", ("太长了(原词 %d 字符 / 译名 %d 字符): 术语表存的是**词或短语**, "
+                         "整句原文匹配不上 —— 写进去等于白记, 还会污染审核者的术语判据。"
+                         % (len(en), len(zh)))
+    files = list(paths or terms_files())
+    have = next((z for e, z in load_terms(files[0]) if e.lower() == en.lower()), None)
+    if have is not None:
+        if have == zh:
+            return "exists", "表里已有「%s = %s」, 未重复写入。" % (en, have)
+        return "error", ("表里「%s」的译名是「%s」—— 一个原词两个中文名会自己触发术语"
+                         "一致性判据; 要改请直接改表(或先删旧行)。" % (en, have))
+
+    day = day or time.strftime("%Y-%m-%d")
+    note = re.sub(r"[,，]", " ", (src or "").strip()) or "篇名未记"   # 注释里不能有逗号
+    done, missed = [], []
+    for p in files:
+        if not os.path.exists(p):
+            missed.append(os.path.basename(p))
+            continue
+        try:
+            if os.path.basename(p).startswith("terms.babeldoc"):
+                _append_lines(p, ["%s,%s" % (en, zh)])
+            else:
+                lines = []
+                if not _same_source_tail(p, note, day):
+                    lines.append("# 来源: %s —— %s ④ 语义审核术语裁决" % (note, day))
+                lines.append("%s,%s" % (en, zh))
+                _append_lines(p, lines)
+            done.append(os.path.basename(p))
+        except OSError as e:
+            missed.append("%s(%s)" % (os.path.basename(p), e))
+    if not done:
+        return "error", "一个文件都没写成: %s。" % ", ".join(missed)
+    msg = "已写入 %s: %s = %s。" % (" + ".join(done), en, zh)
+    if missed:
+        msg += "⚠️ 未写: %s —— 那份表读不到, 它那边的词不会生效。" % ", ".join(missed)
+    msg += "含该词的段会失效重译; 走豆包这条路要把载荷重新导出(第 4 条术语表变了)再送那几段。"
+    return "written", msg
 
 
 def split_chunks(pairs, budget=CHUNK_CHARS):
@@ -313,12 +454,29 @@ def audit(pairs, doc="", terms=None, cfg=None, workers=WORKERS, log=None):
     return r
 
 
+def split_src(items):
+    """(译文侧存疑, 源文缺陷) —— 两者呈现与去向都不同, 由这里统一切一次。
+
+    译文侧 -> 可作返工单发给翻译方; 源文缺陷 -> 错的根在原文, 发给翻译方是要人改一个
+    **改不动**的东西(改了破坏字形回锚), 只能在原文侧校勘。
+    """
+    items = list(items or [])
+    return ([x for x in items if x[1] != SRC_DEFECT],
+            [x for x in items if x[1] == SRC_DEFECT])
+
+
 def report_md(r, doc="", stem=""):
     """存疑清单落盘文本(与体检/质检报告同目录, 便于事后翻查)。
 
     审核者与**翻译方**都写进抬头: 换家之后同一篇会有多份报告, 不写清"谁译的、谁审的",
     事后翻出来分不出是哪一版(r["vendor"] 由面板给, 单跑本模块时为空)。
+
+    [v28.75] 两类分节落盘: 译文侧存疑 + 原文文本层缺陷(不由译者承担)。
     """
+    trans, src = split_src(r["items"])
+    n = len(trans) + len(src)
+    concl = "无存疑" if not n else "存疑 %d 条%s" % (
+        n, ("(其中源文缺陷 %d 条, 不由译者承担)" % len(src)) if src else "")
     head = ["# 语义审核 (硅基流动 %s)" % r["model"], "",
             "- 时间: %s" % time.strftime("%Y-%m-%d %H:%M:%S"),
             "- 任务: %s" % (stem or "(未标注)"),
@@ -328,17 +486,28 @@ def report_md(r, doc="", stem=""):
                ("(%d 块未完成)" % r["n_failed"]) if r["n_failed"] else "",
                (", %s" % doc) if doc else ""),
             "- 耗时: %s 秒" % r["secs"],
-            "- 结论: %s" % ("无存疑" if not r["items"]
-                            else "存疑 %d 条" % len(r["items"])),
+            "- 结论: %s" % concl,
             "", "> 只审不改: 本报告只列问题, 未产出任何改写稿。是否返工由人裁决。", ""]
-    if not r["items"]:
+    if not n:
         return "\n".join(head + ["(硅基流动未报出语义问题)"]) + "\n"
-    body = []
-    for uid, kind, level, note, quote in r["items"]:
-        body.append("- **#%s** [%s·%s] %s" % (uid, kind, level, note))
-        if quote:
-            body.append("  - 原文片段: `%s`" % quote.replace("`", "'"))
-    return "\n".join(head + ["## 存疑清单"] + body) + "\n"
+
+    def lines(rows):
+        out = []
+        for uid, kind, level, note, quote in rows:
+            out.append("- **#%s** [%s·%s] %s" % (uid, kind, level, note))
+            if quote:
+                out.append("  - 原文片段: `%s`" % quote.replace("`", "'"))
+        return out
+
+    body = head + ["## 存疑清单(译文侧)"]
+    body += lines(trans) if trans else ["(无 —— 译文侧没有报出语义问题)"]
+    if src:
+        body += ["", "## 原文文本层缺陷(不由译者承担, 供原文校勘)",
+                 "> 这些「错」在**原文**里就存在(老扫描件的形近混淆/缺字/断字)。管线要求译者",
+                 "> 逐字符照抄原文数字与字母(机检按字形落点验收), 故**不要**把本节当返工单",
+                 "> 发给翻译方 —— 要改只能改原文, 或另作校勘注。"]
+        body += lines(src)
+    return "\n".join(body) + "\n"
 
 
 def write_report(text, stem=""):

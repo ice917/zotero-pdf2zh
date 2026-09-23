@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""seg_export 文档抬头/术语表参数化单元测试 (v28.1→v28.8, 2026-09-19)
+"""seg_export 文档抬头/术语表参数化单元测试 (v28.1→v28.74, 2026-09-19→23)
 
 被锁死的缺陷: RULES 抬头硬编码 "[文档] Reproductive Biology of Cactaceae
 (Desert Plants, 2009) 第{pages}页", 术语第 4 条也写死仙人掌科那 5 条。
@@ -8,7 +8,7 @@
 修法: RULES 变模板({doc}/{terms}); 抬头缺省只写页码(不撒谎); 术语默认取
 server/glossary/terms.csv, 空表/缺文件退化为"按学科惯例统一译名"(不误导向)。
 
-本测试锁十条语义:
+本测试锁十二条语义:
   ① 抬头可参数化, 且缺省时不再残留任何具体论文名
   ② 术语可从任意 csv 注入, 格式 en=zh 以 ；连接
   ③ 术语源缺失/置空 -> 退化句, 绝不泄出别的领域的术语
@@ -34,6 +34,12 @@ server/glossary/terms.csv, 空表/缺文件退化为"按学科惯例统一译名
      定名并首次括注原文, 禁止凭直觉生造 —— 见 ⑭ 节。两条分支(有表/退化)都要带上,
      且子项**不动编号**(仍是第 4 条, 不另起第 9 条); 子项开头须点名"下述 (a)(b)(c)
      三步" —— 规则 2/3/4 各有一组 (a)(b)(c), 不点名的话"(b)"会串到上一条去。
+  ⑪ [v28.80] 不可见字符(零宽/bidi/tag 类)在**载荷侧**被剥掉, 且与回锚侧走同一份
+     tools/text_clean.py —— 只剥一侧 = 自造 str.find 落空, 反而把好段判 FAIL。
+     剥离须发生在**断词正则之前**; 变体选择符(U+FE00)与特殊空格不剥 —— 见 ⑯ 节。
+  ⑫ [v28.81] Cf 剥离集按**全码点普查**补齐 23 个纯零宽码点(118/170 -> 141/170); 而
+     **有视觉含义**的那批(阿拉伯数字符号 / 叙利亚缩略号 / 埃及象形连接符)**明令不剥** ——
+     它们不是零宽字符, 剥了等于删内容。未被剥的 Cf 必须恰是那张白名单 —— 见 ⑰ 节。
 
 运行: venv python test_seg_export.py, 退出码 0=全过
 """
@@ -46,6 +52,10 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOOLS = os.path.dirname(HERE)
 SCRIPT = os.path.join(TOOLS, "seg_export.py")
+
+# [v28.80] 零宽空格: 人眼看不见, 但会让回锚的字形定位(str.find)落空。夹具里一律用
+# 转义写 —— 直接敲字符的话, 判"有没有"时自己也看不见自己敲的是不是它。
+ZWSP = "\u200b"
 
 # 两页合成侧车: p2 段尾无句末标点 + p3 段首小写 -> 必合并(⋮); p2 的纯字形段被过滤
 SIDECAR = [
@@ -383,6 +393,160 @@ def main():
               len(merged57) == 1
               and [p["true_page"] for p in merged57[0]["parts"]] == [6, 7],
               man57["items"])
+
+        # ---- ⑮ [v28.74] B 类: 跨段断词续接(同页非邻 / 隔页非邻 / 不吞独立段) ----
+        # 战例(Johnson): 侧车把被 PDF 分栏/分页截断的一个词切成两段, 而这两段在段表里
+        # **不一定相邻** —— S6(p1#7 尾 `water par-`)与 S9(p1#12 头 `tially…`)中间夹着
+        # 致谢与误命名段; S13(p1#16 尾 `Infection was reo`)与 S18(p2#7 头 `corded…`)
+        # 中间夹着 Fig.1 图注。旧的"只比对相邻两项 + 页码必须相邻"两条判据都够不着, 于是
+        # 半个词被两家各自照译, 渲染拼接处重复(规则 8 想防的正是这件事)。
+        # 放宽为"允许跳过不构成续接的项"后, 靠两件事防误吞独立段:
+        #   A 侧须有断词证据(尾 `词-` 或 尾 `…xxo`); B 侧首词须"从未出现在正常词位"。
+        # 本夹具把四条要锁的语义各摆一处:
+        #   ① 同页非邻(跳 1 项独立段)      -> 合
+        #   ② 隔页非邻(跳 2 项, 其中一项段首小写但是正常词 `but`) -> 合。A 在页末,
+        #      这是跨页续接的物理前提(半词在页末被切断, 下页开头续上)
+        #   ③ 真续接是大写专名(`Grounded-` + `SAM2`)时**不许**退而接远端小写段 -> 不合 + 告警;
+        #      同时锁"A 不在页末就不许跨页接"(不然它会去抢下页的 `seco`)
+        #   ④ 同页相邻(`seco` + `nd-best`)也合(档二不限跨页)
+        #   ⑤ `essen  tially` 这种**双空格**断词不算"正常词位"(算进去就会把自己那处
+        #      真续接挡住 —— 这是实测踩过的坑, 见 normal_words 节头)
+        break_side = [
+            {"page": 1, "pageid": 0, "vars": {}, "segs": [
+                {"raw": "Growth was observed in water par-"},                   # A1 硬证据
+                {"raw": "Received for publication in 1959."},                   # 独立段(大写头)
+                {"raw": "tially depleted of oxygen in the agar, but the host survived."},  # B1
+                {"raw": "The fungus, where the host grew well, was isolated."}, # 供 `, where`/`but` 进正常词
+                {"raw": "Infection was reo"},                                   # A2 软证据(**页1 末项**)
+            ]},
+            {"page": 2, "pageid": 1, "vars": {}, "segs": [
+                {"raw": "Fig. 1. Percentage of infected hosts."},               # 图注(大写头): 跳过
+                {"raw": "but decreased when the water was warm."},              # 段首小写但是正常词: 跳过
+                {"raw": "corded as the number of pairs observed."},             # B2(跨页跳 2 项)
+                {"raw": "masks with Grounded-"},                                # A3 真续接是大写专名
+                {"raw": "where kij are the stiffness values."},                 # 首词是正常词 -> 不接
+                {"raw": "The remaining text ends here."},                       # 独立段
+            ]},
+            {"page": 3, "pageid": 2, "vars": {}, "segs": [
+                {"raw": "seco"},                                                # A4 同页相邻
+                {"raw": "nd-best results are reported."},                       # B4
+                {"raw": "The medium was essen  tially the same."},              # 双空格断词
+                {"raw": "growth was rapid on the agar of-"},                    # A5
+                {"raw": "tially treated cultures grew well."},                  # B5(残片, 不得被算成正常词)
+            ]},
+        ]
+        root = make_root(tmp)
+        bp = os.path.join(root, "break.jsonl")
+        with open(bp, "w", encoding="utf-8") as f:
+            for o in break_side:
+                f.write(json.dumps(o, ensure_ascii=False) + "\n")
+        rc, out, err = run(root, ["--pages", "1-3", "--name", "b", "--sidecar", bp, "--terms", ""])
+        tb = read_payload(root, "b") if rc == 0 else ""
+        check("⑮ 导出成功", rc == 0, (rc, out, err))
+        check("⑮ 同页非邻(跳过独立段)合并",
+              "Growth was observed in water par-⋮tially depleted of oxygen" in tb, tb[:400])
+        check("⑮ 隔页非邻(跳过图注+正常词段)合并",
+              "Infection was reo⋮corded as the number of pairs observed." in tb, tb[:400])
+        check("⑮ 同页相邻也合并(档二不限跨页)",
+              "seco⋮nd-best results are reported." in tb, tb[:400])
+        check("⑮ 双空格断词不污染正常词表(残片仍可接)",
+              "growth was rapid on the agar of-⋮tially treated cultures grew well." in tb, tb[:600])
+        check("⑮ 真续接是大写专名时不退而接远端小写段",
+              "Grounded-⋮" not in tb and "masks with Grounded-" in tb, tb[:600])
+        check("⑮ 独立段没被吞掉",
+              "Received for publication in 1959." in tb
+              and "Fig. 1. Percentage of infected hosts." in tb
+              and "but decreased when the water was warm." in tb, tb[:600])
+        check("⑮ 跳过的项数报出来(便于人工核)",
+              "合并(H, 跳1项)" in out and "合并(S, 跳2项)" in out, out)
+        check("⑮ 找不到另一半时出声(不硬接)",
+              "[警告] 跨段断词未配对(H)" in out and "Grounded-" in out, out)
+        with open(os.path.join(root, "inbox", "b.manifest.json"), encoding="utf-8") as f:
+            manb = json.load(f)
+        merged_b = [it for it in manb["items"] if it["merged"]]
+        check("⑮ manifest: 4 处合并、每处 2 个 part",
+              len(manb["items"]) == 12 and len(merged_b) == 4
+              and all(len(it["parts"]) == 2 for it in merged_b), manb["items"])
+
+        # ---- ⑯ [v28.80] 不可见字符: 载荷侧剥离(与回锚侧**同一份实现**) ----
+        # 缘起: 零宽/bidi/tag 类字符人眼看不见, 却会让回锚的字形定位(str.find)落空 ——
+        # 由它产生的 FAIL 事后无从解释。剥离落在**载荷组装**(本文件 restore)与**回锚**
+        # (seg_import.reanchor) 两侧, 且必须是同一个函数: 只剥一侧 = 自造落空, 反而把
+        # 好端端的段判成 FAIL。剥离属**归一化**, 不改任何判据(数据源仍是原文的字符)。
+        # 本夹具把三个位置各摆一处:
+        #   ① 断词缺口里夹 U+200B  -> 剥离须发生在断词正则**之前**(否则判据当场失明)
+        #   ② 字形值里夹 U+200B    -> 载荷里不得残留
+        #   ③ 变体选择符 U+FE00 与不换行空格 U+00A0 -> **不剥**(有呈现/排版含义)
+        invis_side = [
+            {"page": 1, "pageid": 0,
+             "vars": {"0": "u(s)" + ZWSP + "\u21920,", "1": "\u2211\ufe00"},
+             "segs": [
+                 {"raw": "the water par-" + ZWSP + " tially absorbed."},
+                 {"raw": "as seen in {v0} here."},
+                 {"raw": "the sum is {v1} over all, and A\u00a0B too."},
+             ]},
+        ]
+        root = make_root(tmp)
+        ip = os.path.join(root, "invis.jsonl")
+        with open(ip, "w", encoding="utf-8") as f:
+            for o in invis_side:
+                f.write(json.dumps(o, ensure_ascii=False) + "\n")
+        rc, out, err = run(root, ["--pages", "1", "--name", "iv", "--sidecar", ip, "--terms", ""])
+        ti = read_payload(root, "iv") if rc == 0 else ""
+        check("⑯ 导出成功", rc == 0, (rc, out, err))
+        check("⑯ 载荷里不留零宽字符", ZWSP not in ti, ti[:400])
+        check("⑯ 断词判据在剥离之后跑(par- | tially 合上)",
+              "the water partially absorbed." in ti, ti[:400])
+        check("⑯ 字形值里的零宽也被剥掉",
+              "as seen in u(s)\u21920, here." in ti, ti[:400])
+        check("⑯ 变体选择符不剥(∑︀ 仍是两个字位)",
+              "\u2211\ufe00" in ti, ti[:400])
+        check("⑯ 不换行空格不剥(A\\u00a0B 原样)",
+              "A\u00a0B too." in ti, ti[:400])
+        # 拦"照着抄一份剥离实现" —— 三处必须都是同一份 text_clean
+        for mod in ("seg_export.py", "seg_import.py", "seg_inject.py"):
+            with open(os.path.join(TOOLS, mod), encoding="utf-8") as f:
+                src = f.read()
+            check("⑯ %s 引用同一份 text_clean" % mod,
+                  "import text_clean as _TC" in src and "text_clean as" in src)
+
+        # ---- ⑰ [v28.81] Cf 缺口补齐: 全码点普查后补进 23 个纯零宽码点 ----
+        # 缘起: 按 Unicode 全码点(0x0-0x10FFFF)逐类枚举, 原剥离集只覆盖 118/170 个 Cf
+        # 码点。漏的这批同样是**纯零宽无视觉**的格式字符: bidi 的 ALM(U+061C)、蒙古文
+        # 元音分隔符(U+180E)、废弃格式符(U+206A-206F)、行间注释(U+FFF9-FFFB)、速记格式
+        # (U+1BCA0-1BCA3)、乐谱连接符(U+1D173-1D17A)。普查数据见改动记录 9.7。
+        # **这不是"全量 Cf"**: 有视觉含义的那批一律不剥 —— 它们不是零宽字符, 剥了等于
+        # 删内容。故下面不只测"新的被剥", 还把"剩的必须恰是白名单"整体锁死, 免得日后
+        # 有人照着 Cf 类别"顺手补全"。
+        if TOOLS not in sys.path:
+            sys.path.insert(0, TOOLS)
+        import unicodedata as _ud
+        import text_clean as _tc
+
+        NEW_CP = ([0x061C, 0x180E] + list(range(0x206A, 0x2070))
+                  + list(range(0xFFF9, 0xFFFC)) + list(range(0x1BCA0, 0x1BCA4))
+                  + list(range(0x1D173, 0x1D17B)))
+        bad = [c for c in NEW_CP if not _tc.has_invisible(chr(c))]
+        check("⑰ 普查补齐的 23 个零宽码点全部被剥", not bad, [hex(x) for x in bad])
+        check("⑰ 混排一串时 23 个一次清空",
+              _tc.strip("A" + "".join(chr(c) for c in NEW_CP) + "B") == "AB")
+
+        # 有视觉含义的 Cf 白名单: 阿拉伯数字符号 / 叙利亚缩略号 / 阿拉伯小额数字 /
+        # Kaithi 数字号 / 埃及象形连接符 —— 这些**必须仍然没被剥**。
+        VISIBLE_CF = (list(range(0x0600, 0x0606)) + [0x06DD, 0x070F, 0x0890, 0x0891, 0x08E2,
+                      0x110BD, 0x110CD] + list(range(0x13430, 0x13440)))
+        bad2 = [c for c in VISIBLE_CF if _tc.has_invisible(chr(c))]
+        check("⑰ 有视觉含义的 Cf 一律不剥", not bad2, [hex(x) for x in bad2])
+
+        # 整体口径: 未被剥的 Cf 必须**恰好**是白名单(多一个=漏剥, 少一个=多剥)。
+        # 注: 本断言随 Python 的 Unicode 版本走 —— 若将来 Unicode 新增 Cf 码点而测试变红,
+        # 那是提示"该重新普查了", 不是回归。
+        all_cf = {c for c in range(0x110000) if _ud.category(chr(c)) == "Cf"}
+        kept = {c for c in all_cf if not _tc.has_invisible(chr(c))}
+        check("⑰ 未剥的 Cf 全在'有视觉'白名单内", not (kept - set(VISIBLE_CF)),
+              sorted(hex(x) for x in kept - set(VISIBLE_CF)))
+        check("⑰ 白名单内的 Cf 一个不落(口径未漂)", not (set(VISIBLE_CF) - kept),
+              sorted(hex(x) for x in set(VISIBLE_CF) - kept))
 
     print("\n结果: %d passed, %d failed" % (passed, failed))
     return 1 if failed else 0

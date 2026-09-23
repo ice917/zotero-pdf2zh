@@ -1,0 +1,14 @@
+{
+  "_readme": [
+    "用户自定义概念链接: 把『选中的那段字』绑到你自己的网址, 由 tools/user_links.py 装进成品 PDF。",
+    "结构: global = 跨篇通用(不许带 page); tasks.<任务名> = 本篇(必须带 page, 1 基 mono 坐标)。",
+    "字段: anchor 锚文本(必填) / url(必填, http(s) 开头) / occurrence 第几次出现(命中多处时必填)",
+    "      term 术语表 key(可选, 术语译法一改就知道哪几条链接的锚失效了) / note 备注(可选)",
+    "occurrence 的含义: global 下是『全篇第几次出现』, tasks 下是『该页第几次出现』; 按阅读顺序数。",
+    "撞锚以本篇为准: tasks 里出现同一个 anchor, 该 anchor 的 global 条目自动跳过。",
+    "顺序: relink_pages -> resolve_links -> user_links -> style_links -> verify_links(不可换)。",
+    "本文件由面板『概念链接』区维护, 也可以直接手写 —— 改完先跑 user_links.py --check 看预检。"
+  ],
+  "global": [],
+  "tasks": {}
+}

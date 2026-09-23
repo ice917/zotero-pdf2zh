@@ -55,30 +55,39 @@ list_reports / get_report / list_results / get_result / submit_result / search_t
 旁路（不参与主流程）：`term_verify.py` 术语证据查证——卡在某个词的译法时取证据再裁决，
 详见 [术语查证](#术语查证先拿证据再裁决)。
 
-### 自动回路：一个任务内跑完两趟（v28.23，默认关）
+### 两趟制：先提字、后出稿（v28.23；**v28.79 起出稿权归人**）
 
-上面那套是手工多步（导出 → 网页 AI → import → inject → 渲染）。想让**服务端在一次任务里**
-把这条回路走完（第一趟只提字 → 停下来等交稿 → 交稿后回灌 → 第二趟重渲染），把运营开关打开：
+上面那套是手工多步（导出 → 网页 AI → import → inject → 渲染）。想让引擎**先把原文提出来**、
+再把稿子灌回去，把提字开关打开即可：
 
 ```powershell
-$env:PAUSE_TRANSLATE   = "1"    # 不设 = 行为与过去完全一致（开关默认关）
-$env:PAUSE_WAIT_MINUTES = "30"  # 可选：等交稿上限（默认 30 分钟）
+$env:PAUSE_TRANSLATE = "1"     # 不设 = 行为与过去完全一致（开关默认关）
 python server.py
 ```
 
-一个任务四个状态：`提字中 → 待译 → 回灌重渲染 → 完成`
+**三段是硬顺序**（v28.79 起的默认，`PAUSE_AUTO_ADOPT` 缺省 `0`）：
 
-1. **提字中**：引擎收到 `PAUSE_TRANSLATE=1`，只提字、不调翻译 LLM（这一趟零翻译调用），
-   跑出的侧车由 `adopt export` 裁成 `inbox/<任务名>.txt`；
-2. **待译**：worker 停住，每 5 秒看一次 `out/<任务名>.<族>*.txt`（族 = `doubao` / `webai`，两族同权）——网页 AI 用桥
-   `submit_result` 交件，或人工把译文另存成这个名字，判据相同。只认**本次任务开始之后**
-   落盘的最新一份（`out/` 里同一篇的历史交件不作数）；界面不卡，任务卡显示「待译」；
-3. **回灌重渲染**：`deliver → import → inject` 把这份稿子写进缓存（就地改写第一趟留下的骨架行），
-   服务端随后在同一任务里把开关还原成"关"重跑一遍 —— 全部命中缓存，零翻译调用；
-4. **完成**：产物就是「网页 AI 稿 + 原版面」的中文 PDF。
+1. **提字**：引擎收到 `PAUSE_TRANSLATE=1`，只提字、不调翻译 LLM（这一趟零翻译调用），
+   跑出的侧车由 `adopt export` 裁成 `inbox/<任务名>.txt` —— 秒级完成；
+2. **面板到台前**：载荷就绪 → **响两声** → 服务端**自己**把中继面板拉起来（已在跑就提到前台），
+   面板一收到就绪标记还会 `window.focus()` 往台前跳。任务卡停在「待译」；
+   服务端打出的地址是面板**自己报上来的实际端口**（60642 被占时面板会回落随机端口，此时报 60642
+   等于指错门）；若面板压根没起来，它会明说没起来并给排查方向，**不写"已启动"**；
+3. **确认出稿**：在面板里粘贴网页 AI 的回包 → ③ 检查 → ④ 审核 → **⑤ 确认出稿**，这才
+   `deliver → import → inject` 就地改写第一趟留下的骨架行并重渲染。**不点 ⑤ 永不渲染。**
+4. **面板收摊**：⑤ 成功**且这一篇该做的都出齐了** → 面板过 3 秒自己关停（横幅会说明），
+   成品已自动打开。还有块没出稿就留着，你接着做（最后一块出完稿才会收）。
 
-等不到交稿也不会卡死：到上限走 `abort()` —— 先 `adopt rollback` 撤掉骨架行，再回落成
-正常机器翻译，任务照样 `success`，产物是正常中文 PDF。
+> **出稿权只在第三段**（v28.79）。插件不会再自己等交稿、自己回灌、自己重渲染 —— 那条路
+> "一气呵成"，人还没看过就出稿了。要让插件像 v28.23 那样自己走完全程，显式加
+> `$env:PAUSE_AUTO_ADOPT = "1"`（旧代码一字未删），那时任务才有四个状态
+> `提字中 → 待译 → 回灌重渲染 → 完成`，也才用得上等交稿上限 `PAUSE_WAIT_MINUTES`（默认 30 分钟）；
+> 等不到就走 `abort()`（先 `adopt rollback` 撤骨架行，再回落机器翻译，任务照样 success）。
+
+> **半途停住时别直接渲染**：缓存里正压着 raw→raw **骨架行**（`seg_inject` 是 UPDATE-only，就等
+> 它来改），无脑渲染会整篇命中它们 → 出来一份**全英文 PDF**。所以"真渲染"的两条路都加了护栏：
+> 台账显示停在提字就**拒绝渲染**，并给出两条出路 —— 走面板 ⑤，或
+> `python tools/adopt.py rollback --name "<任务名>" --pdf <原文 PDF> --force`。
 
 **载荷就绪会响两声**（第一趟比机器翻译快一个量级，人一转头的功夫就过去了，而"该交给网页 AI 了"
 是这条链上唯一需要人立刻接手的时刻）：默认放随服务端自带的 `server/notify-complete.wav`，
@@ -275,6 +284,7 @@ New-Item -ItemType Directory -Force out\成品 | Out-Null   # backfill 不会自
 python tools\backfill_pages.py  --mono $mono --original $orig --out $out --sidecar $sc
 python tools\relink_pages.py    --target $out --original $orig --sidecar $sc --report out\_relink.txt
 python tools\resolve_links.py   --target $out --original $orig --report out\_resolve.txt
+python tools\user_links.py      --target $out --spec user_links.json --task "论文名"   # 没自定义就空跑
 python tools\style_links.py     --target $out --sidecar $sc
 python tools\verify_links.py    --target $out --report out\_links_bad.txt
 ```
@@ -289,8 +299,9 @@ python tools\verify_links.py    --target $out --report out\_links_bad.txt
 python tools\appendix_species.py --pdf $out --redraw
 ```
 
-**顺序不能换**：`relink` 要从「还没 relink 过」的成品取锚文本；`style_links` 必须最后
-（它给锚文本叠绘蓝色，文本层会多一份副本）。想重跑就从第一条重新开始。
+**顺序不能换**：`relink` 要从「还没 relink 过」的成品取锚文本；`user_links` 要夹在
+`resolve_links` 与 `style_links` 之间（新装的概念链接得跟着一起变蓝）；`style_links` 必须
+最后（它给锚文本叠绘蓝色，文本层会多一份副本）。想重跑就从第一条重新开始。
 
 ### 常见报错对照
 
@@ -325,6 +336,7 @@ python tools\appendix_species.py --pdf $out --redraw
 | `tools/backfill_pages.py` | 成品回填：整页表格等"零可译段页"用原版页替换 |
 | `tools/relink_pages.py` | 链接热区重定位：译文重排后把链接框搬到锚文本新位置 |
 | `tools/resolve_links.py` | NAMED→GOTO：阅读器兼容 + 落点语义定位（顺带修原版错目标） |
+| `tools/user_links.py` | 用户自定义概念链接：把「选中的那段字 → 你自己给的网址」装进成品（两层规格 + 六类门禁 + `--list-lines` 供面板选字） |
 | `tools/verify_links.py` | 链接落点语义校验：锚的"作者+年份" vs 落点附近条目 |
 | `tools/appendix_species.py` | 物种中文名附录页 + 正文学名荧光笔注释 |
 | `tools/style_links.py` | 链接可见性：锚文本原位叠绘为蓝色（无下划线） |
@@ -427,14 +439,17 @@ python tools/relink_pages.py --target $out --original $orig --sidecar $sc --repo
 # 3) NAMED 链接 -> 显式 GOTO, 并按"作者+年份"语义定位落点(顺带修原版错目标)
 python tools/resolve_links.py --target $out --original $orig --report out\_resolve.txt
 
-# 4) 落点校验(只读): 锚的"作者+年份" 是否出现在落点附近
-python tools/verify_links.py --target $out --report out\_links_bad.txt
+# 4) 你自定义的概念链接: 把点选的概念词绑到你自己的网址(规格为空则什么都不做)
+python tools\user_links.py --target $out --spec user_links.json --task "<书名>"
 
-# 5) 可选: 物种中文名附录页 + 正文学名荧光笔注释(就地修改, 建议先备份)
-python tools/appendix_species.py --pdf $out --data out\species_zh.json --redraw
+# 5) 落点校验(只读): 锚的"作者+年份" 是否出现在落点附近 + 自定义链接是否就位
+python tools\verify_links.py --target $out --report out\_links_bad.txt --spec user_links.json --task "<书名>"
 
-# 6) 链接可见性: 锚文本原位叠绘为蓝色(原版观感, 不加下划线)
-python tools/style_links.py --target $out --sidecar $sc
+# 6) 可选: 物种中文名附录页 + 正文学名荧光笔注释(就地修改, 建议先备份)
+python tools\appendix_species.py --pdf $out --data out\species_zh.json --redraw
+
+# 7) 链接可见性: 锚文本原位叠绘为蓝色(原版观感, 不加下划线)
+python tools\style_links.py --target $out --sidecar $sc
 ```
 
 **为什么顺序不能乱**
@@ -442,6 +457,10 @@ python tools/style_links.py --target $out --sidecar $sc
 - `relink` 的锚文本取自"原版同页同矩形"，所以它的输入必须是**还没 relink 过**的成品——
   重跑要从第 1 步开始，否则矩形已被搬移、锚文本取错。
 - `resolve` 负责把链接写死成"目标页+坐标"；此后阅读器才有得跳。
+- `user_links` 必须夹在 `resolve` 与 `style` 之间：新装的是 URI 链接，不参与
+  `resolve` 那步的 NAMED→GOTO；而它又必须在 `style` 之前，新锚才会跟着一起变蓝
+  （不然读者看不出能点，功能等于没做）。双语版不必另跑一遍，`dual_links` 会把译文侧的
+  URI 原样搬过去。
 - `style` 必须在最后：它给锚文本叠绘蓝色，文本层会出现一次重复（视觉无差异，
   但复制该年份会得到 `19901990`）。之所以不用 redaction 做"替换"，是因为
   `apply_redactions` 会清掉该页全部链接（实测 18 → 0），而它跑在挂链接之后。
@@ -455,6 +474,33 @@ python tools/style_links.py --target $out --sidecar $sc
 3. 原版目标树本身不可靠：实测原版 p13 有 4 条不同引文指向同一行，而那行是另一篇文献。
    所以 `resolve_links` 不信目标坐标，改用"锚的（作者姓，年份）"到成品参考文献区
    全书定位——这一步能反过来修正原版自己的错目标。
+
+### 把你自己的概念链接装进去
+
+原版超链接是**继承来的**——读者只能点原书给的那几个。而"读到这里我需要一点背景知识"
+这类需求原书不会替你想到，位置该由读者定：把**选中的那段字**绑到**你自己给的网址**。
+
+两种入口，改的是同一个规格文件 `user_links.json`：
+
+- **控制面板「概念链接」区**（推荐）：先从译文页点选一行文字当锚，再填网址；提交前自动跑
+  一次 `--check` 预检，装上与否先告诉你看不看得到。
+- **直接手写** `user_links.json`：`global` 放跨篇通用的阅读偏好（如"基因漂变 → 某百科"，
+  **不许带 `page`**），`tasks.<书名>` 放单篇的（**必须带 `page`**，1 基 mono 坐标）。
+  `occurrence` 是"第几次出现"（命中多处时必填）：`global` 下数全篇，`tasks` 下数该页。
+
+```powershell
+python tools\user_links.py --target $out --spec user_links.json --task "<书名>" --check   # 只预检, 不落盘
+python tools\user_links.py --target $out --spec user_links.json --task "<书名>"           # 真装
+python tools\user_links.py --target $out --page 3 --list-lines                            # 列本页文字(面板选字用)
+```
+
+口径：门禁全部判在**落盘之前**（锚空 / URL 非 http(s) / `global` 带 `page` / `tasks` 缺
+`page` / 0 命中 / `occurrence` 越界 / 两条新锚抢同一块矩形 —— 有一条不过就一个字都不写）；
+命中多处而没给 `occurrence` 时**不猜**，直接 FAIL；新锚压住原有链接时**用户优先**（删原条
+并记账）；撞锚时以 `tasks` 为准。
+
+⚠️ 锚要选在**译文页**上：整页回填的原版页被 `style_links` 整页跳过，落在那些页上的新锚
+装得上但**仍是黑字**（原书自带的锚本来就蓝，看不出差别，只有你新加的会露馅）。
 
 ## 术语查证：先拿证据再裁决
 
@@ -555,7 +601,8 @@ python tools\term_verify.py <清单.md> --source all               # 全源合�
 - 网页 AI 标点与字形标点并存处可能产生双重标点（吸收算法待改逐字符增量）
 - 纯拉丁段落不经过 CJK 清理规则
 - `seg_inject` 的文档指纹默认自动探测；若探测不到会回落到作者所用文献的兜底值，换文献使用时请显式传入 `--fp`
-- `style_links` 是"叠绘"而非"替换"：视觉上与原版蓝字一致，但锚文本在 PDF 文本层重复一次（复制年份会得到 `19901990`）
+- `style_links` 是"叠绘"而非"替换"：视觉上与原版蓝字一致，但锚文本在 PDF 文本层重复一次（复制年份会得到 `19901990`）。中文锚（`LXGW Neo ZhiSong` 这类，`get_fonts` 的字体名与 `rawdict` 的写法不同）与非嵌入的 Base-14 字体（Times/Helvetica/Courier）现在都靠归一化配对 + PyMuPDF 内置同名字体顶替来重绘，代价也随之覆盖到它们；旋转/竖排行（页边 arXiv 戳那种）**整行跳过**，重绘只会把这串字横铺过页
+- 整页回填的原版页被 `style_links` 整页跳过：落在那些页上的**新装**概念链接仍是黑字（原书自带的锚本来就蓝，看不出差别，只有 `user_links` 新加的那几条会露馅）——把锚选在译文页上就没事
 - 链接落点靠"（作者姓，年份）在成品文献区定位"修复；若原书引文与文献表本身就对不上（引用的年份在该作者名下不存在），则该条无法修复，只能保持原版落点。每次出成品后跑 `verify_links.py`，失配清单落在 `out\_links_bad.txt`
 - `term_verify` 的维基百科 / 维基数据两源解析**未对真实响应验证**（本机 DNS 污染 / SNI 阻断），待代理可用时复核；中文术语按设计跳过 `zotero` 源，若库里收藏了中文文献则查不到
 - OpenAlex 是**按 IP 限流**的：配额耗尽时（实测 `Retry-After` 给到 ≈15.8 小时）它会被自动剔除，

@@ -12,7 +12,7 @@
 REF_DENSITY 双密度阈值, 判据一律取**原文页**; 在此之上再补一道"行首 [n] 占比"
 闸门(体检可比门禁更敏感, 不可更宽)。
 
-本测试锁四点:
+本测试锁五点:
   ① 正则口径: 认行首条目, 不误吃正文行内引用 "(Olfati-Saber and Murray, 2004)"
   ② 密度阈值: 2.5 是闭区间下界, 稍低即不算
   ③ decide() 对两种体例都给得出跳页建议, 且旧的编号制行为原地不动
@@ -20,6 +20,9 @@ REF_DENSITY 双密度阈值, 判据一律取**原文页**; 在此之上再补一
      4 条、CLAP p2 行首 3 条, 两页没有一条真文献条目), 故补"行首占全部 [n]
      的比例 >= 0.5"; 反过来长条目文献页密度会掉到 2.5 以下(Jiang p7=2.18 /
      Kim p9=1.77 / Melhani p42=1.43)被 post_check 整页漏判, 也要救回
+  ⑤ [v28.80] 不可见字符记账: 零宽/bidi/tag 类逐页记账, **只报不拦**(级别"提示",
+     不给跳页建议)。剥除由 tools/text_clean.py 在载荷侧与回锚侧**走同一个函数**
+     做掉 —— 体检只记下"哪一页、什么码点、在第几个字符"供事后追查;
 
 运行: venv python test_pre_check.py, 退出码 0=全过
 """
@@ -32,6 +35,7 @@ if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
 import pre_check as PC  # noqa: E402  (本模块不重包 stdout, 可直接导入)
+import text_clean as TC  # noqa: E402 ⑤ 节要断言体检用的是同一份剥离实现
 
 AY_ENTRY = ("R. Olfati-Saber and R. M. Murray (2004). Consensus problems in networks "
             "of agents with switching topology and time-delays. IEEE TAC, 49(9):1520-1533.")
@@ -54,10 +58,26 @@ def page(idx, text, **over):
         "ref_ay_density": PC.ref_ay_density(text),
         "math": PC.count_math_symbols(text),
         "cjk_r": PC.cjk_ratio(text),
+        "invis": PC._TC.phrase(PC._TC.scan(text)),
         "error": None,
     }
     p.update(over)
     return p
+
+
+class FakePage:
+    def __init__(self, text):
+        self._t = text
+
+    def extract_text(self):
+        return self._t
+
+
+class FakeReader:
+    """只实现 analyze_page 用到的那一点接口（pages[idx].extract_text()）"""
+
+    def __init__(self, texts):
+        self.pages = [FakePage(t) for t in texts]
 
 
 def body(n=1800):
@@ -187,6 +207,45 @@ def main():
     check("④d 正文页不触发跳页", skip == 0, skip)
     check("④d 正文页无文献结论",
           not [f for f in findings if "参考文献" in f[2]], findings)
+
+    # ---- ⑤ [v28.80, 2026-09-23] 不可见字符记账（只报不拦）----
+    # 为什么记这一笔: 零宽/bidi/tag 类字符人眼看不见, 却会让回锚的字形定位(str.find)
+    # 落空 —— 由它产生的 FAIL 事后无从解释。剥除由 tools/text_clean.py 在载荷侧与回锚侧
+    # **走同一个函数**做掉; 体检这里只记账, 不改任何判据(既不给跳页建议, 也不拦翻译)。
+    ZWSP = "\u200b"
+    feat = PC.analyze_page(FakeReader(["Converges fast." + ZWSP + " See Fig." + ZWSP]), 0)
+    check("⑤a 走真路径记到命中", "U+200B" in feat["invis"], feat["invis"])
+    check("⑤a 点明次数与首次位置",
+          "×2" in feat["invis"] and "首次第" in feat["invis"], feat["invis"])
+    feat = PC.analyze_page(FakeReader(["plain ascii text"]), 0)
+    check("⑤a 无命中不报", feat["invis"] == "", feat["invis"])
+
+    # ⑤b 不剥的字符不得上报: 变体选择符(U+FE00) 与三种特殊空格有呈现/排版含义,
+    #     剥了等于改内容(见 text_clean 模块头) —— 报出来只会教人误删。
+    keep = "\u2211\ufe00 A\u00a0B\u202fC\u3000D"
+    check("⑤b 变体选择符与特殊空格不剥", PC._TC.strip(keep) == keep,
+          repr(PC._TC.strip(keep)))
+    check("⑤b 它们也不算命中", PC._TC.scan(keep) == [], PC._TC.scan(keep))
+    check("⑤b 体检与实现同源", PC._TC.strip is TC.strip)
+
+    # ⑤c 只报不拦: 级别只是"提示", 也不给跳页建议
+    pages = [page(0, body(), invis="U+200B ZERO WIDTH SPACE ×1(首次第 3 字符)"),
+             page(1, body())]
+    skip, findings = PC.decide(pages, len(pages))
+    check("⑤c 不给跳页建议", skip == 0, skip)
+    check("⑤c 级别只是提示",
+          [f[0] for f in findings if "不可见字符" in f[2]] == ["提示"], findings)
+
+    # ⑤d 报告单列一节, 并在页面特征表里点出该页
+    rep = PC.build_report("x.pdf", 2, pages, 0, findings, False)
+    check("⑤d 报告有「不可见字符」节", "## 不可见字符" in rep)
+    check("⑤d 页面特征表里标出该页", "| 不可见字符 |" in rep)
+    check("⑤d 记下码点与位置", "U+200B" in rep and "首次第 3 字符" in rep)
+    check("⑤d 明写只记账不拦", "只记账" in rep)
+
+    # ⑤e 没有命中就不许凭空加节(否则每篇报告都多一段噪声)
+    rep2 = PC.build_report("x.pdf", 1, [page(0, body())], 0, [], False)
+    check("⑤e 无命中不加节", "## 不可见字符" not in rep2)
 
     print("\n结果: %d passed, %d failed" % (passed, failed))
     return 1 if failed else 0

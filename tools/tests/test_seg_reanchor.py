@@ -12,6 +12,16 @@
 修法: 两阶段定位(长 core 唯一落点优先 / 语序推进) + 标点等价类 + 占用区间防重叠。
 本测试锁死这三条语义, 防止回退。
 
+㉑ 节 [v28.80] 另锁一条: 不可见字符(零宽/bidi/tag 类)的**剥离两侧必须同源**。
+它防的不是错译, 是"好端端的段被判 FAIL": 一个 U+200B 就能让字形定位(str.find)
+落空, 而它在人眼里不存在。只剥一侧(译文或字形值)等于自己制造落空 —— 比不剥更糟,
+故 ㉑a 把"值净/值脏 × 译文净/译文脏"四种组合全摆出来, 逐个都必须命中。
+
+㉒ 节 [v28.82] 锁回锚**埋点**: fails/drops 按字符家族(私用区/数学字母/组合标记/
+控制符)归档落盘, 且**只记账不判定** —— reanchor 是纯函数, 源码里不引用台账,
+开关台账不改它的任何返回值。私用区字形 `isalnum()` 为假 -> 走 drop 而非 fail,
+"只看 FAIL 数"会把它整个漏掉, 故两类都得记。
+
 运行: venv python test_seg_reanchor.py, 退出码 0=全过
 """
 import os
@@ -23,6 +33,7 @@ if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
 import seg_import as SI  # noqa: E402  (导入时已把 stdout 包成 utf-8, 勿再包)
+import text_clean as TC  # noqa: E402 ㉑ 节要断言"两侧同一个函数", 而非"各写一份"
 
 
 def main():
@@ -189,6 +200,110 @@ def main():
           not any(d[0] in ("1", "2", "3") for d in drops), drops)
     check("⑳ 逗号仍按设计丢弃", [d[0] for d in drops] == ["0"], drops)
     check("⑳ 无 FAIL", not fails, fails)
+
+    # ㉑ [v28.80, 2026-09-23] 不可见字符: 回锚侧剥离, 与载荷侧**走同一个函数**
+    #    零宽/bidi/tag 类字符人眼看不见, 却会让字形定位(str.find)落空 —— 由它产生的
+    #    FAIL 事后无从解释。它防的**不是错译**, 正是"好端端的段被判 FAIL"。
+    #    关键不在"要不要剥", 在**两侧必须同源**: 只剥译文不剥字形值(或反过来), 等于
+    #    自己制造落空 —— 比不剥更糟。故下面把四种组合全摆出来, 逐个都必须命中。
+    ZWSP = "\u200b"
+    UR = "u(s)" + ZWSP + "\u21920,"          # 字形值的"脏"写法(夹了零宽)
+    URC = "u(s)\u21920,"                     # 同值的干净写法
+    ZR = "见 u(s)" + ZWSP + "\u21920, 成立"   # 译文的"脏"写法
+    ZC = "见 u(s)\u21920, 成立"               # 同译文的干净写法
+
+    #    先证明价值: 不剥的话, 这条**确实**会落空(str.find 的口径, 与 _core_pattern 同源)
+    check("㉑ 不剥确实会落空(它在防的就是这个)",
+          SI._core_pattern(URC).search(ZR) is None)
+
+    # ㉑a 四种组合(值净/值脏 × 译文净/译文脏)全部必须命中
+    for vname, val in (("值净", URC), ("值脏", UR)):
+        for zname, zh in (("译文净", ZC), ("译文脏", ZR)):
+            res, fails, _d, _n = run("{v0}", {"0": val}, zh)
+            check("㉑a %s + %s -> 命中" % (vname, zname),
+                  not fails and res == "见 {v0} 成立", (res, fails))
+
+    # ㉑b 剥下来的字符不许进译文: 零宽字符排到纸上就是豆腐块/CID 0
+    res, _f, _d, _n = run("{v0}", {"0": UR}, ZR + ZWSP)
+    check("㉑b 译文里的零宽不残留", ZWSP not in res, repr(res))
+
+    # ㉑c 不改判据: 真缺的字形仍然 FAIL —— 剥离是归一化, 不是放宽
+    _res, fails, _d, _n = run("{v0} and {v1}", {"0": UR, "1": "i6=j,"}, ZC)
+    check("㉑c 真缺的字形仍 FAIL", [f[0] for f in fails] == ["1"], fails)
+
+    # ㉑d 两侧真的是**同一个函数**(不是"各写一份差不多的正则")
+    check("㉑d 回锚用的是 text_clean.strip", SI._TC.strip is TC.strip)
+
+    # ㉒ [v28.82, 2026-09-23] 回锚埋点: fails/drops 按**字符家族**归档, 只记账不判定
+    #    它要回答的问题 —— "哪个字符家族真在真实翻译里捣乱" —— **不能从段表快照
+    #    反推**: 快照里的 trans 是回锚**之前**的模型输出(改动记录 9.7.1), 据此算的
+    #    FAIL 率会把大量好段算成坏的。唯一可信的口径就是在真实回锚现场记一笔。
+    #    本节锁三件事: 家族分得对(私用区走 drop 而非 fail —— 只看 FAIL 数会把它整个
+    #    漏掉) / 纯 ASCII 标点不入账 / **埋点与判据解耦**(台账开关不动 reanchor 结果)。
+    import inspect as _insp
+    import json as _json
+    import tempfile as _tf
+
+    PUA = "\uf0b3"                                  # 私用区: Symbol 字体字形常这么存
+    MATH = "\U0001D45B"                             # 数学斜体 n (U+1D45B)
+    COMB = "n\u0303"                                # n + 组合波浪线 (Mn)
+
+    check("㉒a 私用区归 pua", SI.char_families(PUA) == {"pua": PUA}, SI.char_families(PUA))
+    check("㉒b 数学字母归 math", SI.char_families(MATH) == {"math": MATH},
+          SI.char_families(MATH))
+    check("㉒c 组合标记归 combining", SI.char_families(COMB) == {"combining": "\u0303"},
+          SI.char_families(COMB))
+    check("㉒d 纯 ASCII 与汉字不入账", SI.char_families("A1 汉字 /") == {},
+          SI.char_families("A1 汉字 /"))
+
+    #    私用区的 isalnum() 为假 -> 它走的是 **drop**(按设计丢弃)而不是 fail。
+    #    这正是"只看 FAIL 数会把私用区整个漏掉"的现场, 故埋点必须两类都记。
+    _res, fails, drops, _n = run("见 {v0} 与 {v1}", {"0": PUA, "1": "x"}, "见 与 x")
+    check("㉒e 私用区字形落 drops 而非 fails",
+          [d[0] for d in drops] == ["0"] and not fails, (fails, drops))
+    rows = SI.ledger_rows("demo", "#S1（第1页）", 1, 0, "drop", drops)
+    check("㉒f drop 也被埋点记下(家族=pua, kind=drop)",
+          len(rows) == 1 and rows[0]["fams"] == ["pua"] and rows[0]["kind"] == "drop", rows)
+    check("㉒g 纯标点丢弃不入账(别让噪声淹掉真信号)",
+          SI.ledger_rows("demo", "loc", 1, 0, "drop", [("2", "/")]) == [])
+
+    # ㉒l 分类总账(每次必记一条): 四类家族 + 「其余」那一桶(= 纯标点丢弃 / OCR 碎片)。
+    #     这一桶最值得盯: 实测 Johnson 篇 7 处 FAIL **全是** ASCII 的 OCR 碎片
+    #     (`011`/`III`/`340/00Ill`), 没有一处是这些异体字符家族。
+    _summ = SI.ledger_summary("demo", [("9", "0i1")], drops, rows)
+    check("㉒l 总账把未回锚与丢弃分开计数",
+          _summ["n_fail"] == 1 and _summ["n_drop"] == 1, _summ)
+    check("㉒l 有家族的那部分单独归到 pua", _summ["fam_drop"] == {"pua": 1}
+          and _summ["n_plain_drop"] == 0, _summ)
+    check("㉒l 「其余」那一桶收 ASCII 碎片", _summ["n_plain_fail"] == 1
+          and _summ["fam_fail"] == {}, _summ)
+
+    old_led = SI.LEDGER
+    try:
+        SI.LEDGER = os.path.join(_tf.mkdtemp(prefix="reanchor_led_"), "led.jsonl")
+        p1 = SI.append_ledger(rows)
+        p2 = SI.append_ledger(rows)
+        with open(p1, encoding="utf-8") as _f:
+            lines = [ln for ln in _f.read().splitlines() if ln]
+        check("㉒h 落盘返回台账路径", p1 == SI.LEDGER and p2 == p1, (p1, p2))
+        check("㉒i 追加而非覆盖(记两次 -> 两行)",
+              len(lines) == 2 and _json.loads(lines[0])["fams"] == ["pua"], lines)
+        check("㉒j 一条都没记就不建文件", SI.append_ledger([]) == "")
+
+        # ㉒m 但**总账**必须每次都落: 否则"埋点没触发"与"这次确实干净"分不出来
+        check("㉒m 干净的回锚也留一条总账",
+              SI.append_ledger([SI.ledger_summary("demo", [], [], [])]) == SI.LEDGER)
+
+        # ㉒k 台账是**纯记账**: reanchor 自己不写盘, 也不引用埋点(判据与埋点解耦)
+        ghost = os.path.join(os.path.dirname(SI.LEDGER), "ghost.jsonl")
+        SI.LEDGER = ghost
+        run("{v0}", {"0": "x"}, "见 x")
+        check("㉒k reanchor 不落盘(台账文件没被创建)", not os.path.exists(ghost))
+        _re_src = _insp.getsource(SI.reanchor)
+        check("㉒k reanchor 源码里不出现埋点", "LEDGER" not in _re_src
+              and "ledger_rows" not in _re_src)
+    finally:
+        SI.LEDGER = old_led
 
     print(f"\n结果: {passed} passed, {failed} failed")
     return 1 if failed else 0

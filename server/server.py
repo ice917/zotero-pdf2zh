@@ -31,6 +31,7 @@ import io
 import glob    # [v28.23] 等网页 AI 交件落盘(out/<name>.<族>*.txt, 族=doubao|webai)
 import hashlib  # [v28.26] 按 PDF 内容散列定位本轮的归档侧车(提字进度源)
 import socket  # 用于端口检查
+import tempfile  # [v28.79+] 面板端口握手文件(临时目录: 本机一次运行的状态, 不进项目)
 import time    # 用于 SSE 推送间隔
 import threading
 import uuid    # 用于生成任务唯一标识
@@ -65,6 +66,23 @@ def _two_pass_enabled():
     return str(os.environ.get("PAUSE_TRANSLATE", "1")).strip().lower() in ("1", "true", "on", "yes")
 
 
+def _auto_adopt_enabled():
+    """[v28.79] 提字之后**插件要不要自己把回路走完**。
+
+    缺省 **0 = 不走**(也就是关了)—— 提字 → 响铃 → 任务收尾在「待译」, 剩下的
+    (等交件 / 回灌 / 重渲染) 全部由人在中继面板里确认后触发(面板 ⑤ 的正文工序:
+    adopt deliver → import → inject → force_rerender)。设 1 才回到 v28.23/v28.53
+    那套无人值守的自动回路。
+
+    为什么默认改成"停": 出稿是这条链上**回不了头**的一步(产物一落 server/translated,
+    插件与面板的"已出稿"判据就都只看磁盘 mtime 了), 而"人在场看过回包再放行"是唯一
+    拦得住"末行被吃掉一截但编号齐全"这类缺陷的环节 —— watch_clip 模块头实测过:
+    那种回包 G1-G5 全过, 判据够不到, 只能把人放回回路里。开关留着是为了可回退:
+    新流程若出问题, 设 PAUSE_AUTO_ADOPT=1 即恢复旧行为, v28.23 的代码一字未删。
+    """
+    return str(os.environ.get("PAUSE_AUTO_ADOPT", "0")).strip().lower() in ("1", "true", "on", "yes")
+
+
 class TwoPassGateRejected(RuntimeError):
     """[v28.28] 豆包交件被内容门禁拒收 —— 两趟回路**显式失败**的专用类型。
 
@@ -76,12 +94,58 @@ class TwoPassGateRejected(RuntimeError):
 
 
 def _two_pass_wait_minutes():
-    """等豆包交稿的上限(分钟), 可用 PAUSE_WAIT_MINUTES 覆盖; 超时回落成正常翻译。"""
+    """等豆包交稿的上限(分钟), 可用 PAUSE_WAIT_MINUTES 覆盖; 超时回落成正常翻译。
+
+    [v28.79] 只在 `_auto_adopt_enabled()` 为真(旧自动回路)时才用得上 —— 新口径下
+    提字完就收尾, 不在这里等。
+    """
     try:
         v = float(os.environ.get("PAUSE_WAIT_MINUTES", "") or 30)
     except ValueError:
         v = 30.0
     return max(0.0, v)
+
+
+def _adopt_ledger(name):
+    """读这一篇的 adopt 台账(权威记录, 会自己变对); 读不到返回 None。
+
+    路径约定与 tools/adopt.py 的 LEDGER_DIR 一致: <P2Z_PROJ>/logs/adopt/<name>.json。
+    只读、不建目录 —— 台账不存在就是"这篇没走过提字", 是个正常答案。
+    """
+    proj = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
+    try:
+        with open(os.path.join(proj, "logs", "adopt", name + ".json"), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _skeleton_pending(name):
+    """[v28.79] 这一篇的缓存里是不是还压着 raw→raw **骨架行**(提了字、还没回灌)。
+    返回 "" 表示"没有, 可以渲染"; 否则返回一句给人看的理由。
+
+    判据全在 adopt 台账上: `export` 已 ok 而 `inject` 还没 ok = 骨架行还活着 ——
+    暂停档第一趟为了让 seg_inject(UPDATE-only)有行可改, 按最终键形态落了一批
+    raw→raw 行(adopt.py 的 rollback 就是为它们准备的)。这时候渲染跑出去, 命中的
+    **全是**这些行, 产物是一份全英文 PDF —— 而它看起来与正常那份无异, 用户会以为
+    是自己的稿渲染出来的(SILAGE 那晚就是这么排查了一整夜)。
+
+    为什么用台账当判据而不是另立标记: 它会**自己变对** —— 面板 ⑤ 的正文工序跑完
+    deliver/import/inject, 台账里 inject 就成了 ok, 这道闸自动放行, 不需要谁来清标记。
+    """
+    led = _adopt_ledger(name)
+    if not led:
+        return ""
+    stages = led.get("stages") or {}
+    if (stages.get("export") or {}).get("state") != "ok":
+        return ""
+    if (stages.get("inject") or {}).get("state") == "ok":
+        return ""
+    return ("这篇的 adopt 回路停在「提字」：缓存里还有 raw→raw 骨架行，现在渲染会整篇"
+            "命中它们，出来的是一份**全英文 PDF**。两条出路：① 走中继面板 ⑤ 把豆包"
+            "回包 deliver → import → inject 回来，再渲染（正常路径）；② 放弃这一轮："
+            "跑 `python tools/adopt.py rollback --name \"%s\" --pdf <原文 PDF> --force` "
+            "撤掉骨架行。" % name)
 
 
 def _inbox_dir():
@@ -187,6 +251,144 @@ def _play_notify_sound():
         pass
 
 
+# ---------------------------------------------------------- 铃响 → 面板到台前 (v28.79)
+# 为什么要有这一段: 载荷就绪是这条链上唯一要人**立刻**接手的时刻, 而 v28.78 之前
+# 全仓库**没有任何代码启动或唤起 panel.py** —— 铃是响了, 面板却要人自己去找、自己去开,
+# 于是"响铃 → 面板 → 确认 → 出稿"这四步里, 第一步到第二步是断的。
+#
+# [v28.79+] 同日补掉这一段的三个薄弱点(都在本段里握手解决):
+#   ① **起完要回头看它到底起没起**: 拉起的是分离进程, 不等退出码; 而面板会因为环境里
+#      没有 P2Z_TABLE_DIR/P2Z_PROJ、找不到任何 manifest 就自己退(退出码 2)。那会儿最不
+#      该做的就是报一句"已启动", 让人对着空桌面找窗口。
+#   ② **地址要报真的**: 60642 被别的程序占着时面板会回落随机端口, 这时再说 60642 等于
+#      指错门。真端口由面板自己写出来(--announce, 见 _PANEL_ANNOUNCE)。
+#   ③ **自动回路不弹窗**: PAUSE_AUTO_ADOPT=1 那条路是无人值守的, 没人要看面板; 只有
+#      "停在待译、等人在面板里点头"这条路才需要面板到台前。
+PANEL_PORT = 60642
+_PANEL_LAUNCH = {"at": 0.0}     # 上次起面板的时刻(防同一批载荷把面板起两次)
+# 面板起来后会把自己的**真实端口**写在这里(panel.py --announce)。放临时目录 —— 它是
+# 本机一次运行的状态, 不该进项目目录。这一个文件办两件事: 报真地址; 以及认出"已经跑着、
+# 只是不在 60642 上"的那一份(认不出的话, 每次提字都会再弹一扇窗)。
+_PANEL_ANNOUNCE = os.path.join(tempfile.gettempdir(), "p2z_panel_running.json")
+
+
+def _panel_state(port, timeout=0.6):
+    """某端口上若是**自家面板**在跑就返回它的 /api/state, 否则 None。
+
+    判据只认 `jobs`: 面板 /api/state 的字段**会随版本变**(v28.79 就把 `idle` 换成了
+    `build`/`ready`), 拿任一版本都在的 `jobs` 当旗子才不会因为面板升了版就认不出
+    —— 认不出的后果不是报错, 而是每次提字都去多起一个面板实例(旧实例还占着端口,
+    新实例只能落随机端口, 用户眼前凭空多出一扇窗)。
+
+    不能只看端口有没有人监听: 被别的程序占着时, 我们会以为"面板已在跑"而什么都不做,
+    用户等半天等不到窗口。探不对就当没有, 起一个新的(新实例自己会回落随机端口,
+    不会去抢别人的)。
+    """
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://127.0.0.1:%d/api/state" % port,
+                                   timeout=timeout) as r:
+            d = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+    return d if isinstance(d, dict) and "jobs" in d else None
+
+
+def _announced_port():
+    """面板自己报上来的端口(它可能不在 60642 上); 没报过 / 读不动 -> 0。"""
+    try:
+        with open(_PANEL_ANNOUNCE, encoding="utf-8") as f:
+            return int(json.load(f).get("port") or 0)
+    except Exception:                           # noqa: BLE001 —— 文件不存在是常态
+        return 0
+
+
+def _panel_running_port():
+    """**已经跑着**的自家面板在哪个端口; 没有则 0。
+
+    先看它自己报的(面板端口被占时会回落随机端口, 那份不在 60642 上), 再看固定的 60642。
+    报上来的那份要**探一下才算数** —— 文件可能是上一次运行留下的(进程没了文件还在),
+    也可能是端口已经被别人接管了。
+    """
+    for cand in (_announced_port(), PANEL_PORT):
+        if cand and _panel_state(cand):
+            return cand
+    return 0
+
+
+def _wait_panel_port(timeout=4.0):
+    """等新起的那个面板把端口报出来。文件在启动前刚删过, 所以出来的就是它写的;
+    报不出来 -> 0: 多半是它自己退了(见 _open_panel 里那段说明)。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        p = _announced_port()
+        if p:
+            return p
+        time.sleep(0.25)
+    return 0
+
+
+def _panel_script():
+    """panel.py 的位置: 本文件在 server/(或 patches/)下, 面板在它与 tools/table_pipe/ 平级处。"""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, "..", "tools", "table_pipe", "panel.py"),
+                 os.path.join(here, "tools", "table_pipe", "panel.py")):
+        cand = os.path.normpath(cand)
+        if os.path.exists(cand):
+            return cand
+    return ""
+
+
+def _open_panel():
+    """[v28.79] 把中继面板叫到台前。返回一句人话(给日志/卡片用), **绝不抛异常**。
+
+    只做**没跑时起新的**这一件事; 已经在跑就只报出它在哪个端口(_panel_running_port)
+    —— 隔进程把窗口提到前台没有可靠办法(硬用 Win32 SetForegroundWindow 得绑死窗口标题,
+    标题一改就失效), 而"把决定权交给会失效的代码"比"少做一步"更糟。已在跑时改由**页面
+    自己**接手: 前端每 5s 打一次 /api/ping, 发现载荷是新一轮的(.ready.json 的 ready_at
+    变了)就 window.focus() —— 拿不准也不会有副作用, 浏览器不理它就只是没弹到最前。
+
+    **起完必须回头看一眼它到底起没起**(v28.79+): 拉起的是分离进程, 不等退出码, 而面板
+    会因为环境里没有 P2Z_TABLE_DIR/P2Z_PROJ 找不到 manifest 就自己退出(退出码 2)。所以
+    这里等它把端口报出来, 报不出来就**明说没起来**并给排查方向 —— 报一句"已启动"而其实
+    没起来, 是最坏的一种诚实(用户会对着空桌面找窗口)。
+    """
+    port = _panel_running_port()
+    if port:
+        return ("中继面板已在跑(127.0.0.1:%d), 载荷已就绪 —— 切到那个窗口即可。"
+                "(表头有「构建」时间; 若那扇窗连的是旧进程、吃不到最新改动, "
+                "关掉它重跑, 或 `python tools/table_pipe/panel.py --takeover`。)" % port)
+    panel = _panel_script()
+    if not panel:
+        return "⚠️ 找不到 tools/table_pipe/panel.py —— 面板没起成, 请手动打开。"
+    if time.time() - _PANEL_LAUNCH["at"] < 10:
+        return "面板刚起过(10s 内), 不再重复启动。"
+    try:                                        # 先清掉上一轮的端口文件, 免得把旧的当新的
+        os.remove(_PANEL_ANNOUNCE)
+    except OSError:
+        pass
+    creation = 0
+    for flag in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
+        creation |= getattr(subprocess, flag, 0)
+    try:
+        subprocess.Popen([sys.executable, panel, "--announce", _PANEL_ANNOUNCE],
+                         cwd=os.path.dirname(panel),
+                         env=os.environ.copy(), creationflags=creation,
+                         stdin=subprocess.DEVNULL, close_fds=True)
+        _PANEL_LAUNCH["at"] = time.time()
+    except Exception as e:                      # noqa: BLE001 —— 面板起不来不能连累翻译
+        return "⚠️ 面板没起成(%r) —— 请手动打开 tools/table_pipe/panel.py。" % e
+    port = _wait_panel_port()
+    if not port:
+        return ("⚠️ 面板没起来(等了 4 秒没见它报出端口): 它多半自己退了 —— 常见原因是启动"
+                "服务器的环境里没有 P2Z_TABLE_DIR(表格数据) 或 P2Z_PROJ(正文), 面板找不到"
+                "任何任务。手动跑一次 tools/table_pipe/panel.py 就能看到它说什么。")
+    if port == PANEL_PORT:
+        return "已启动中继面板(127.0.0.1:%d) —— 载荷就绪, 粘贴豆包回包并 ⑤ 确认出稿。" % port
+    return ("已启动中继面板, 但它**不在 60642**(那个端口被别的程序占着): 实际地址 "
+            "127.0.0.1:%d —— 认准这个地址。" % port)
+
+
 def _notify_payload_ready(task_id, name, pages_str):
     """[v28.26] 载荷就绪 → 响铃 + 醒目横幅 + ready 标记 + 卡片落到「待译」。
 
@@ -214,10 +416,18 @@ def _notify_payload_ready(task_id, name, pages_str):
     print("        下一步：把这份载荷交给豆包定稿 (豆包可用桥的 get_payload 直接取)")
     print("=" * 68 + "\n")
     _play_notify_sound()
+    # [v28.79] 铃响 → 面板到台前。这一步以前是断的(全仓库没有代码起 panel.py):
+    # 铃响了, 面板还得人自己去找。见 _open_panel 的注释(已在跑则交给页面自己 focus)。
+    # [v28.79+] 只在"要人点头"那条路上做: 自动回路(PAUSE_AUTO_ADOPT=1)是无人值守的,
+    # 那条路没人要看面板 —— 不该往人眼前弹窗。
+    panel_note = "" if _auto_adopt_enabled() else _open_panel()
+    if panel_note:
+        print("🪟 [两趟] %s" % panel_note)
     task_manager.update_task(task_id, {
         'status': '待译',
         'message': '待译：载荷已就绪（%d 段 / 覆盖 %s 页），等待豆包交稿' % (n_items, pages_str),
     })
+    return {"segments": n_items, "pages": pages_str, "panel": panel_note}
 
 
 def _adopt_run_name(pdf_path):
@@ -1348,7 +1558,20 @@ class PDFTranslator:
             return abort_fallback(f"载荷导出失败(rc={rc})：{out[-400:]}")
         # [v28.26] 「待译」搬到 export **成功之后**再置: 以前是引擎一跑完就报待译,
         # 而那份"待译"可能对应一次失败的导出 —— 卡片会撒谎(载荷还没落盘就叫人来交稿)。
-        _notify_payload_ready(task_id, name, f"1-{total_pages}" if total_pages else "1")
+        ready = _notify_payload_ready(task_id, name, f"1-{total_pages}" if total_pages else "1")
+
+        # ---- [v28.79] 到此为止: 出稿权交回人手里 ----
+        # 提字这趟是零 LLM 的, 载荷已落盘、铃已响、面板已叫到台前; 再往下走的三步
+        # (等交件 / 回灌 / 重渲染) 就是"出稿"了 —— 而它是这条链上唯一回不了头的一步。
+        # 新口径下这里**收尾**, 等人在面板里粘回包、看过门禁、点 ⑤, 由面板的正文工序
+        # (adopt deliver→import→inject→force_rerender)把剩下的走完。
+        # 为什么不能顺手回落成机翻: 缓存里此刻压着 raw→raw 骨架行(见 _skeleton_pending),
+        # 机翻会整篇命中它们 -> 一份全英文 PDF。所以这里是"停", 不是"失败"也不是"回落"。
+        if not _auto_adopt_enabled():
+            msg = ("待译：载荷已就绪（%d 段 / 覆盖 %s 页）—— 打开中继面板粘贴豆包回包，"
+                   "看过 ③ 检查 / ④ 审核，再点 ⑤ 确认出稿。" % (ready["segments"], ready["pages"]))
+            print("⏸️ [两趟] 停在「待译」(PAUSE_AUTO_ADOPT=0): 出稿等面板 ⑤ 确认 —— %s" % msg)
+            return {"paused": True, "message": msg, "name": name}
 
         # ---- 等豆包交稿 ----
         delivered = self._wait_for_doubao_delivery(task_id, name, wait_min, t_start)
@@ -1399,11 +1622,28 @@ class PDFTranslator:
 
         if engine == pdf2zh:
             print("🔍 [Zotero PDF2zh Server] PDF2zh 开始翻译文件...")
+            # [v28.79] 骨架行护栏 —— 要**真渲染**的这两条路(force 重渲染 / 关了两趟
+            # 的机翻), 先问一句"这篇是不是提了字还没回灌"。是新口径下最要紧的一道闸:
+            # 提字完就收尾, 缓存里那批 raw→raw 骨架行会一直躺着等人回灌; 此时从任何
+            # 别的地方发起渲染(走投无路时重跑、别的工具 force、Zotero 里点重试), 命中的
+            # 全是骨架行 -> 一份全英文 PDF, 且看起来与正常产物无异。判据在
+            # _skeleton_pending(取自 adopt 台账, 会自己变对: 面板 ⑤ 跑完 inject 就放行)。
+            if force or not _two_pass_enabled():
+                why = _skeleton_pending(_adopt_run_name(input_path))
+                if why:
+                    print("🛑 [v28.79] 拒绝渲染: %s" % why)
+                    raise RuntimeError(why)
             # [v28.23] 两趟采纳回路: 开着开关才走「提字 → 待译 → 重渲染」;
             # [v28.53] 默认开(零 LLM 提字), force 请求旁路 —— force_rerender 提交的
             # 是"译文已回灌"的重渲染, 直接走渲染, 不能被卷进"提字 → 等交件"。
+            # [v28.79] 提字完默认**停在待译**(PAUSE_AUTO_ADOPT=0), 由面板 ⑤ 接棒。
             if _two_pass_enabled() and not force:
                 fileList = self._two_pass_run(task_id, input_path, config, engine)
+                if isinstance(fileList, dict) and fileList.get("paused"):
+                    # 提字完成、出稿权已交面板 —— 正常收尾, **不是失败**(判失败会让
+                    # 历史成功率失真, 也会引得用户回去重跑, 而重跑只会再落一层骨架行)。
+                    task_manager.complete_task(task_id, 'success', fileList["message"])
+                    return {'status': 'success', 'message': fileList["message"]}
             else:
                 fileList = self.translate_pdf(input_path, config, task_id)
             mono_path, dual_path = fileList[0], fileList[1]

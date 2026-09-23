@@ -1,15 +1,24 @@
 # -*- coding: utf-8 -*-
-"""seg_import.py — 收豆包译文: 解析/对账/回锚 (M1 工具, 与 seg_export.py 配对)
+"""seg_import.py — 收译者译文: 解析/对账/回锚 (M1 工具, 与 seg_export.py 配对)
+
+"译者"= 网页版 AI 在浏览器里做的整篇翻译(本项目当前用的是 **DeepSeek 网页版**;
+`豆包`/`doubao*` 只是桥与交件文件名的**历史代号**, 不是译者本身)。它与门禁是**两个
+不同的 AI 供应商**(服务端强制), 返工单就是发给它的合同。
 
 两条路线(由引擎画像决定, 见 engine.py):
   pdf2zh 1.x  侧车路线
-  1. 取译文: --clip 读剪贴板, 或 --text 指定文件 (豆包回复的全文)
+  1. 取译文: --clip 读剪贴板, 或 --text 指定文件 (译者回复的全文)
   2. 解析: 按 #S编号 行切块 (容忍 markdown 加粗/代码围栏)
   3. 对账 manifest: 编号集合一致; 合并段 ⋮ 恰好 1 个且两侧非空; 普通段禁止 ⋮
   4. 回锚: 对每段按侧车 raw 的 {vN} 原序, 在译文中定位字形值 -> 还原为 {vN}
      高价值字形 (含字母/数字) 找不到 -> FAIL; 纯标点找不到 -> 丢弃并记提示
      (定位口径: 标点半/全角等价 + 上标数字·OHM 号等 NFKC 同字写法 + 译文自己补的空格)
   5. 产出 out/<name>.imported.json: {(page,seg): 带{vN}的译文} + 校验报告
+  6. 埋点(v28.82): 每次回锚的 fails/drops 按**字符家族**(私用区/数学字母/组合标记/
+     控制符)追加到 logs/reanchor_ledger.jsonl(P2Z_LEDGER 可改), 并**每次**另留一条
+     分类总账(四类家族计数 + 「纯标点·OCR 碎片」那一桶), 控制台同时报一句。**只记账**,
+     不改判据、不参与 PASS/FAIL —— 用来回答"哪个字符家族真在真实翻译里捣乱", 这个
+     问题从段表快照反推不出来(见 改动记录.md 9.7.1)。
 
   next / BabelDOC  tracking 路线 (v28.41)
   1. 取译文 / 解析 / 编号对账 —— 与上面同 (共用同一份实现)
@@ -20,7 +29,7 @@
   4. 产出 out/<name>.imported.json: {"S5": "译文"} (按 #S 编号; 段身份由 manifest
      与段表共同确定, inject 侧再解析)
 
-  两条路线 FAIL 时都落一份**给豆包的返工单**到 inbox/<name>.rework.md(桥的
+  两条路线 FAIL 时都落一份**给译者的返工单**到 inbox/<name>.rework.md(桥的
   list_inbox / get_payload 直接读得到): 每条写明 真实页码 + #S编号 + 缺的字符 +
   原文上下文, 用户不必去理解控制台里的内部坐标; PASS 时把旧单子删掉, 免得读到
   过期结论。
@@ -45,6 +54,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 # pdf2zh 1.x —— 与引入本层之前逐字节一致。
 import engine as _ENG                                     # noqa: E402
 import result_naming as RN                                # noqa: E402  交件命名契约(后缀族)
+import text_clean as _TC                                  # noqa: E402  不可见字符剥离(两侧同源)
 _PROF = _ENG.active()
 SIDECAR = _PROF.sidecar or ""
 PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
@@ -56,7 +66,108 @@ V_TOKEN = re.compile(r"\{v(\d+)\}")
 
 REWORK_SUFFIX = ".rework.md"
 GLYPH_CTX = 60          # 返工单里原文上下文的半宽(按**还原后**字符数)
+PAYLOAD_TAIL = 90       # 返工单「段尾没译完」类里引用载荷末段的字数
 HINT_MAX = 20           # 「不必改」一节最多逐条列几条提示(超出只报计数)
+
+# ---- [v28.82] 回锚埋点: 把 fails / drops 按**字符家族**归档落盘 ------------------
+# 它存在的理由是一条方法论教训(改动记录 9.7.1): 「哪个字符家族在真实翻译里真的
+# 造成回锚失败」**不能从段表快照反推** —— ~/.cache/pdf2zh/segflow/*.jsonl 里的
+# trans 是回锚**之前**的模型输出, 拿它算 FAIL 率会把大量好段算成坏的(实测差 3 倍
+# 以上)。唯一可信的口径是**在真实回锚的现场记一笔**。
+#
+# 它只**记账**: 不动判据、不改 reanchor 的返回值、不参与任何 PASS/FAIL, 写盘失败
+# 也绝不拦流程(埋点把正常导入搞崩是最坏的结果)。
+LEDGER = os.environ.get("P2Z_LEDGER",
+                        os.path.join(PROJ, "logs", "reanchor_ledger.jsonl"))
+
+_MATH_RANGES = ((0x1D400, 0x1D7FF),)      # 数学字母数字符号(Mathematical Alphanumeric)
+
+
+def char_families(text):
+    """一串字符 -> {家族: "命中的字符"}, 只收**有家族**的字符(ASCII/汉字不入账)。
+
+    家族轴直接对应 9.7 那张体检表 —— 私用区(Co) / 数学字母(U+1D400 段) /
+    组合标记(Mn/Mc/Me) / 其余格式控制符(C*)。这四类正是"最可能让回锚定位落空、
+    又最不容易被校对的人眼发现"的那批(它们要么在人眼里不存在, 要么长得像正常字)。
+    """
+    fam = {}
+    for ch in text:
+        cp, cat = ord(ch), unicodedata.category(ch)
+        if cat == "Co":                                   # 私用区
+            k = "pua"
+        elif any(a <= cp <= b for a, b in _MATH_RANGES):
+            k = "math"
+        elif cat in ("Mn", "Mc", "Me"):                   # 组合标记
+            k = "combining"
+        elif cat.startswith("C"):                         # 其余控制/格式符
+            k = "control"
+        else:
+            continue
+        fam[k] = fam.get(k, "") + ch
+    return fam
+
+
+def ledger_rows(name, loc, pg, seg, kind, items):
+    """把一批 fails/drops 变成埋点行。**只记有家族的** —— 纯 ASCII 标点"按设计
+    丢弃"是正常行为, 记它只会往台账里灌噪声, 把真正要看的那几条淹掉。
+
+    kind: "fail"(高价值字形在译文里没有落点 -> 调用方判 FAIL) /
+          "drop"(纯符号字形, 设计上就不回锚)。
+    分清这两者是本埋点的要点之一: 私用区字符 `isalnum()` 为假, 会走 "drop" 而不是
+    "fail" —— 只看 FAIL 数会把私用区整个漏掉。
+    """
+    rows = []
+    for vn, val in items:
+        fam = char_families(val)
+        if not fam:
+            continue
+        rows.append({
+            "man": name, "loc": loc, "page": pg, "seg": seg, "kind": kind,
+            "vn": vn, "val": val, "cps": [hex(ord(c)) for c in val],
+            "fams": sorted(fam), "chars": fam,
+        })
+    return rows
+
+
+def ledger_summary(name, fails, drops, rows):
+    """一次 import 的**分类总账**(只此一条)。四类 = PUA / 数学字母 / 组合标记 / 其余控制符,
+    外加「都没有的」那一桶(= 纯标点丢弃 + OCR 碎片)。
+
+    为什么**纯标点**只进总数不逐条记: 一篇论文的"纯标点字形丢弃"动辄上百条(实测 Johnson
+    篇 44 条提示、单段最多 22 个), 逐条落盘会把真正要看的那几类淹掉。有家族的那几类逐条
+    记(见 ledger_rows), 这里只给计数。
+
+    家族计数**从 rows 统计**(只此一份口径): rows 已经是 ledger_rows 算好的"有家族"明细,
+    另起一遍分类就会漂。n_plain_* = 总数减掉有家族的那部分 —— 这一桶最值得盯: 实测 Johnson
+    篇的 7 处 FAIL **全是** ASCII 的 OCR 碎片(`011`/`III`/`340/00Ill`), 没有一处是这些
+    异体字符家族。
+    """
+    fam_fail = Counter(f for r in rows if r["kind"] == "fail" for f in r["fams"])
+    fam_drop = Counter(f for r in rows if r["kind"] == "drop" for f in r["fams"])
+    return {
+        "man": name, "kind": "summary",
+        "n_fail": len(fails), "n_drop": len(drops),
+        "fam_fail": dict(fam_fail), "fam_drop": dict(fam_drop),
+        "n_plain_fail": len(fails) - sum(fam_fail.values()),
+        "n_plain_drop": len(drops) - sum(fam_drop.values()),
+    }
+
+
+def append_ledger(rows):
+    """追加落盘(跨次翻译累积成一份台账)。返回台账路径; 一条没记则返回 ''。
+
+    追加而不是覆盖: 单篇论文的样本量太小, 判"PUA 到底有没有害"要靠多篇累积。
+    """
+    if not rows:
+        return ""
+    try:
+        os.makedirs(os.path.dirname(LEDGER), exist_ok=True)
+        with open(LEDGER, "a", encoding="utf-8") as f:
+            for r in rows:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+    except OSError:
+        return ""
+    return LEDGER
 
 
 def load_sidecar_pages(sidecar):
@@ -95,21 +206,24 @@ def restore_with_spans(raw, vv):
     """
     out, spans, cur, i = [], {}, 0, 0
     for m in V_TOKEN.finditer(raw):
-        out.append(raw[i:m.start()])
-        cur += m.start() - i
-        val = str((vv or {}).get(m.group(1), m.group(0)))
+        # [v28.80] 与 seg_export.restore 同源: 两侧都剥不可见字符。**逐片**剥而不是
+        # 末尾整串剥 —— spans 是按剥离后的文本算的, 整串剥会让下标全部漂掉。
+        head = _TC.strip(raw[i:m.start()])
+        out.append(head)
+        cur += len(head)
+        val = _TC.strip(str((vv or {}).get(m.group(1), m.group(0))))
         spans.setdefault(m.group(1), []).append((cur, cur + len(val)))
         out.append(val)
         cur += len(val)
         i = m.end()
-    out.append(raw[i:])
+    out.append(_TC.strip(raw[i:]))
     return "".join(out), spans
 
 
 def glyph_context(raw, vv, vn, width=GLYPH_CTX):
     """原文里字形 vn 所在处的前后文(字形已还原), 供返工单引用。
 
-    同一字形号在段里可能出现多次, 取第一处 —— 返工单是给人和豆包的**线索**,
+    同一字形号在段里可能出现多次, 取第一处 —— 返工单是给人和译者的**线索**,
     不是判据本身。
     """
     txt, spans = restore_with_spans(raw, vv)
@@ -121,7 +235,46 @@ def glyph_context(raw, vv, vn, width=GLYPH_CTX):
     return ("…" if lo > 0 else "") + txt[lo:hi] + ("…" if hi < len(txt) else "")
 
 
-# 返工单的固定段落。放在模块级是为了让 test 能直接断言措辞(它是**给豆包看的合同**)。
+def fail_where(raw, vv, fixed, zh, vn):
+    """本字形"为什么没回锚"的处境 -> ((其后整片没译?, 位置%, 交付/载荷%), 载荷末段)。
+
+    判据: 载荷里本字形**之后**还有没有别的字形**成功回了锚** —— 回锚只在译文里能定位到
+    该字形时才成功, 所以"后面一个锚点都没有"就等于"本字形之后那半句在交付里没有落点"。
+    这是**直接信号**, 不是"位置%"或"长度比"那类代理指标(那两个都会把已验证的案例分错,
+    实测见 改动记录 9.7.3)。
+
+    用 9 篇真译文的 26 处真 FAIL 逐条对账验证过: 20/21 例与人工判读一致。唯一一例
+    (#S595 的第二个 `PŁ` —— 整句都译了, 只有这个字母没写出来)按"补译"处理**同样能改对**:
+    译者回载荷对一眼就看出缺的是那半句里的 `PŁ`。反过来把 #S491/#S520/#S694 那类
+    "整片没译"当"写回一串字符"处理则**改不动** —— 所以信号偏向"没译完"这一侧。
+    """
+    if not raw or not fixed:
+        return None, ""
+    try:
+        res, spans = restore_with_spans(raw, vv)
+        own = spans.get(str(vn)) or []
+        if not own:
+            return None, ""
+        k = own[0][0]
+        last_anchor = -1
+        for m in V_TOKEN.finditer(raw):
+            g = m.group(1)
+            _p, core, _q = split_value(_TC.strip((vv or {}).get(g) or ""))
+            # 与 reanchor 同一口径: 纯符号字形按设计丢弃, 不算落点; 没锚上的也不算。
+            if not (core and has_alnum(core)) or ("{v%s}" % g) not in fixed:
+                continue
+            sp = spans.get(g) or []
+            if sp:
+                last_anchor = max(last_anchor, sp[0][0])
+        tail = res[-PAYLOAD_TAIL:]
+        return ((last_anchor <= k), 100.0 * k / max(1, len(res)),
+                100.0 * len(zh) / max(1, len(res))), \
+            ("…" if len(res) > PAYLOAD_TAIL else "") + tail
+    except Exception:
+        return None, ""
+
+
+# 返工单的固定段落。放在模块级是为了让 test 能直接断言措辞(它是**给译者看的合同**)。
 REWORK_INTRO = """# 返工单 —— {name}
 
 这份单子是 `tools/seg_import.py` 自动生成的, 用来替代门禁控制台里的原始报错:
@@ -135,19 +288,28 @@ REWORK_INTRO = """# 返工单 —— {name}
 
 REWORK_WHY = """## 一、必须改
 
-**共同原因**：版面里这些字符是独立的字形对象，译文里不出现它就**没有落点**，
-渲染这一处会出错，所以门禁直接判 FAIL。
-**共同修法**：把它**原样写回**（数字/字母照抄，不要改写成「三维」「二维」这类中文说法）；
-紧邻的字母/数字一起照抄；公式片段整块照抄、中文放在块外（见任务包规则 2、7）。
+**共同原因**：这些段里的字符是版面里**独立的字形对象**，译文里不出现它就**没有落点**，
+渲染这一处会出错。但"为什么没出现"分两类，修法不一样，下面分开列了，照着做：
+
+- **甲、载荷这一段没译完**（这批里最常见）：整句/从句/段尾那半截压根没进交付。
+  回载荷把缺的部分**补译完** —— 包括段尾那个"看起来没写完"的公式残块，它属于原文，照译，
+  不要因为"看着不完整"就丢掉（任务包规则 9）。
+- **乙、句子译了，只是这一串字符没写出来**：把它**原样写回**（数字/字母照抄，不要改写成
+  「三维」「二维」这类中文说法）；紧邻的字母/数字一起照抄；公式片段整块照抄、中文放在块外
+  （任务包规则 2、7）。
 """
 
 
 def write_rework_note(man, src, report, detail):
-    """FAIL 时写"给豆包的返工单" -> inbox/<name>.rework.md, 返回路径(不写返回 "")。
+    """FAIL 时写"给译者的返工单" -> inbox/<name>.rework.md, 返回路径(不写返回 "")。
 
     `report` 是控制台那串校验行(FAIL/提示), `detail` 是回锚失败的结构化明细。
-    两类分开渲染: 回锚失败能给出"缺哪个字符 + 原文哪一处"(豆包看不见字形占位符
-    背后的东西, 这正是它需要的线索); 其余 FAIL 原样转述。
+    两类分开渲染: 回锚失败能给出"缺哪个字符 + 原文哪一处"(译者看不见字形占位符背后的
+    东西, 这正是它需要的线索); 其余 FAIL 原样转述。
+
+    回锚失败再按**修法**分两栏(见 REWORK_WHY, 判据见 fail_where): 甲"段尾没译完 -> 补译" /
+    乙"句子译了 -> 把这串写回"。混在一栏里点名"缺的字符: `3`"会把人引到"补一个字符"上去,
+    而实测这批 FAIL 里绝大多数是整句没译 —— 补一个字符根本改不动(见 改动记录 9.7.3)。
     """
     name = man.get("name") or os.path.basename(src).replace(".manifest.json", "")
     if not name:
@@ -169,20 +331,41 @@ def write_rework_note(man, src, report, detail):
     if detail:
         L.append("")
         L.append(REWORK_WHY.rstrip())
+        # 逐段归栏: 一段里只要有一处属于"段尾没译完", 就整段按甲处理 —— 甲那句
+        # "把缺的补译完"对乙那种"只差一串字符"也成立, 反过来不成立。
+        grp = {"甲": [], "乙": []}
         for d in detail:
+            infos = [(fail_where(d["raw"], d.get("vv"), d.get("fixed"), d.get("zh"), vn), vn, val)
+                     for vn, val in d["fails"]]
+            grp["甲" if any(w and w[0] and w[0][0] for w, _vn, _v in infos) else "乙"].append((d, infos))
+        for tag, title in (("甲", "载荷这一段没译完 —— 回载荷把缺的补译完"),
+                           ("乙", "句子译了，只是这一串字符没写出来 —— 原样写回")):
+            if not grp[tag]:
+                continue
             L.append("")
-            L.append("### #S%d（第 %d 页）" % (d["key"], d["tp"]))
-            L.append("- 缺的字符: %s" % "、".join("`%s`" % v for _vn, v in d["fails"][:8]))
-            for vn, _val in d["fails"][:4]:
-                ctx = glyph_context(d["raw"], d["vv"], vn)
-                if ctx:
-                    L.append("- 原文里它在哪: %s" % ctx)
-            if d.get("moved"):
-                L.append("- **这一处的修法不同**: 上面这些字符的译文被写到了 ⋮ 的**另一侧**。"
-                         "本段是「跨页续接」合并来的（⋮ 左右各对应原 PDF 的一页），"
-                         "版面上这些字符属于那一页。请把 ⋮ 摆回原文那一处："
-                         "⋮ 左边只写 ⋮ 左边原文的译文，右边只写右边原文的译文，"
-                         "**不要把某一侧的短语提到另一侧去**（同侧内部可以按中文习惯调语序）。")
+            L.append("**%s栏（%d 段）· %s**" % (tag, len(grp[tag]), title))
+            for d, infos in grp[tag]:
+                L.append("")
+                L.append("### #S%d（第 %d 页）" % (d["key"], d["tp"]))
+                L.append("- 缺的字符: %s" % "、".join("`%s`" % v for _vn, v in d["fails"][:8]))
+                w = next((w for w, _vn, _v in infos if w), None)
+                if tag == "甲" and w:
+                    # 位置/长度是**给人核对的旁证**, 不是判据: 交付明显短于载荷时它印证
+                    # "没译完"; 但长度比正常也不能反证(实测 #S400 比值 50% 仍整句没译)。
+                    L.append("- 位置对照: 本字形在载荷 %d%% 处，交付只写到载荷的 %d%%"
+                             % (round(w[0][1]), round(w[0][2])))
+                    if w[1]:
+                        L.append("- 载荷这一段的后半（照它把没译的补齐）: %s" % w[1])
+                for vn, _val in d["fails"][:4]:
+                    ctx = glyph_context(d["raw"], d["vv"], vn)
+                    if ctx:
+                        L.append("- 原文里它在哪: %s" % ctx)
+                if d.get("moved"):
+                    L.append("- **这一处的修法不同**: 上面这些字符的译文被写到了 ⋮ 的**另一侧**。"
+                             "本段是「跨页续接」合并来的（⋮ 左右各对应原 PDF 的一页），"
+                             "版面上这些字符属于那一页。请把 ⋮ 摆回原文那一处："
+                             "⋮ 左边只写 ⋮ 左边原文的译文，右边只写右边原文的译文，"
+                             "**不要把某一侧的短语提到另一侧去**（同侧内部可以按中文习惯调语序）。")
     # 小节编号随实际出现的小节走: 只写"一、必须改"和"三、不必改"、中间空着"二"，
     # 读的人会以为单子缺了一节。
     sections = []
@@ -217,7 +400,7 @@ def write_rework_note(man, src, report, detail):
         f.write("\n".join(L))
 
     # [v28.58] 把这次踩的坑记进教训台账 -> 下一篇导出的提示词自动带上(见 lessons.py)。
-    # 只记**该原样出现的字形串**(门禁的 ground truth), 不记豆包写成的样子 —— 见模块头。
+    # 只记**该原样出现的字形串**(门禁的 ground truth), 不记译者写成的样子 —— 见模块头。
     try:
         import lessons as _LES
         for d in detail:
@@ -365,7 +548,7 @@ def _char_pattern(ch):
 def _core_pattern(core):
     """core -> 正则。三条放宽都只是**定位**口径, 命中后仍写回字形原值:
       ① 标点等价类: 半/全角等价 (2.1,(20) -> 2.1，(20)); 数字间的逗号额外允许
-         整块消失(豆包把 2,000 写成 2000 时仍能命中);
+         整块消失(译者把 2,000 写成 2000 时仍能命中);
       ② 兼容等价类: 上标数字 / OHM SIGN / 全角数字等 NFKC 同字写法;
       ③ 空白弹性: 字与字之间允许译文自己补的空格。"""
     parts = []
@@ -469,12 +652,18 @@ def reanchor(seg_zh, raw, vars_):
       notes -- (vn, val, 候选数) 歧义锚定台账, 供人工复查
     """
     fails, drops, notes = [], [], []
+    # [v28.80] 不可见字符体检 —— 回锚是**唯一**做字符串定位的地方, 所以剥离必须成对
+    # 落在这里: 搜索串(字形值 val) 与 被搜索串(译文 seg_zh) **走同一个 text_clean.strip**。
+    # 只剥一侧 = 自己制造 str.find 落空 —— 那反而会把好端端的段判成 FAIL。
+    # 剥离属**归一化**(与 `_eq_class` 那套定位口径同级), 不参与任何 PASS/FAIL 判定。
+    seg_zh = _TC.strip(seg_zh)
     toks = []
     for m in V_TOKEN.finditer(raw):
         vn = m.group(1)
         val = vars_.get(vn)
         if val is None:
             continue
+        val = _TC.strip(val)
         pre, core, post = split_value(val)
         if not core or not has_alnum(core):
             # 纯标点/纯符号字形(/ 等)按设计丢弃, 不参与搜索
@@ -577,7 +766,7 @@ def _tag_ms(s):
 
 
 def import_next(args, man, blocks):
-    """next 路线: 收豆包译文 -> 守恒校验 -> out/<name>.imported.json (**无回锚**)。
+    """next 路线: 收译者译文 -> 守恒校验 -> out/<name>.imported.json (**无回锚**)。
 
     与 1.x 的**本质差别**: 载荷正文本来就是引擎原生形态({vN}/<style>), 收回来直接
     就能写回缓存 —— 不需要把"显示字形"回锚成 {vN}(那是 1.x 专有的: 它把还原过的
@@ -600,7 +789,7 @@ def import_next(args, man, blocks):
 
     # 源正文从**载荷本身**取 —— next 的 manifest 只落坐标不落正文(正文与载荷逐字相同,
     # 再存一份只是重复), 而载荷正文就是 {vN}/<style> 原生形态, 与段表 input 同值。
-    # 拿载荷当判据还多一层好处: 豆包改的就是它, 两边是同一件东西。
+    # 拿载荷当判据还多一层好处: 译者改的就是它, 两边是同一件东西。
     pay = os.path.join(os.path.dirname(os.path.abspath(args.manifest)),
                        (man.get("name") or "") + ".txt")
     if not os.path.isfile(pay):
@@ -623,7 +812,10 @@ def import_next(args, man, blocks):
     imported = {}
     for key_s, it in sorted(want.items(), key=lambda kv: int(str(kv[0]).lstrip("S"))):
         key = int(str(key_s).lstrip("S"))
-        zh = (got.get(key) or "").strip()
+        # [v28.80] 不可见字符体检: 只剥**译文**。本路线的载荷原文是引擎自己的 prompt
+        # (它就是缓存主键 original_text, manifest.fp 也是按它算的) —— 动载荷 = 自造
+        # fp 对不上, 当场被判"这份载荷不是从当前段表导出的"。译文侧没有这个约束。
+        zh = _TC.strip((got.get(key) or "").strip())
         pg = (it.get("parts") or [{}])[0].get("page")
         loc = "#S%d（第%d页%s）" % (key, pg, "·跨页" if it["pool"] == "cross_page" else "")
         if not zh:
@@ -683,7 +875,7 @@ def import_next(args, man, blocks):
     print("产出: %s" % out_json)
     if not ok:
         print("返工单: %s" % note)
-        print("        (给豆包的: 让它 list_inbox / get_payload 读这个文件, 按上面点到的段改)")
+        print("        (给译者的: 让它 list_inbox / get_payload 读这个文件, 按上面点到的段改)")
     print("结论: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 
@@ -739,10 +931,14 @@ def main():
         report.append("FAIL 多段: %s" % extra)
 
     pages = load_sidecar_pages(args.sidecar)
-    imported = {}
+    name = man.get("name") or os.path.basename(args.manifest).replace(".manifest.json", "")
+    imported, led, all_fails, all_drops = {}, [], [], []
     for key_s, it in sorted(want.items()):
         key = int(str(key_s).lstrip("S"))
-        zh = got.get(key, "")
+        # [v28.80] 与回锚同源: 先剥不可见字符再拆 ⋮ —— 否则 parts_zh(要喂给
+        # sibling_hits 做 pattern.search)是原串, 而 pattern 来自剥过的字形值,
+        # 又是一次"两侧不同源"。剥离属归一化, 不参与 PASS/FAIL 判定。
+        zh = _TC.strip(got.get(key, ""))
         n_parts = len(it["parts"])
         parts_zh = zh.split("⋮")
         # ⋮ 对账
@@ -774,6 +970,12 @@ def main():
                 continue
             fixed, fails, drops, notes = reanchor(seg_zh, raw, vv)
             imported["%d#%d" % (pg, seg)] = fixed
+            # [v28.82] 埋点: 把两类"异常字形"按字符家族记下来(模块头 LEDGER 一节)。
+            # **只记不判** —— 下面那几行 report/ok 才是判据, 这里一个字节都不动它们。
+            led += ledger_rows(name, loc, pg, seg, "fail", fails)
+            led += ledger_rows(name, loc, pg, seg, "drop", drops)
+            all_fails += fails
+            all_drops += drops
             if fails:
                 ok = False
                 moved = sibling_hits(fails, parts_zh, i) if it["merged"] else {}
@@ -786,7 +988,11 @@ def main():
                         loc, ["{v%s}=%r" % f for f in fails[:8]])
                 report.append(line)
                 detail.append({"key": key, "tp": part_true_page(p, o), "line": line,
-                               "raw": raw, "vv": vv, "fails": fails, "moved": moved})
+                               "raw": raw, "vv": vv, "fails": fails, "moved": moved,
+                               # 返工单要按修法分栏(见 write_rework_note): 分栏判据要看
+                               # "这一处字形之后有没有别的字形锚上了", 得把回锚结果与
+                               # 交付原文都带上。
+                               "fixed": fixed, "zh": seg_zh})
             if drops:
                 report.append("提示 %s 纯标点字形丢弃 %d 个: %s" % (
                     loc, len(drops), [d[1] for d in drops[:6]]))
@@ -795,14 +1001,27 @@ def main():
                     loc, len(notes),
                     ["{v%s}=%r x%d" % n for n in notes[:6]]))
 
+    # [v28.82] 埋点落盘 + 当场报一句(用户跑真实翻译时就能看见, 不必回头翻文件)。
+    # 这一步**在判据之外**: 台账写不进去也不改退出码、不改 ok。总账**每次都记**(哪怕一个
+    # 异常都没有)—— 否则"埋点没触发"和"这次真的干净"分不出来。
+    summ = ledger_summary(name, all_fails, all_drops, led)
+    led_file = append_ledger([summ] + led)
+    _fam = sorted(set(list(summ["fam_fail"]) + list(summ["fam_drop"])))
+    print("埋点: 回锚异常 %d 处 (未回锚 %d, 纯符号丢弃 %d) -> %s"
+          % (summ["n_fail"] + summ["n_drop"], summ["n_fail"], summ["n_drop"],
+             led_file or "(写盘失败)"))
+    print("      字符家族 未回锚/丢弃: %s; 其余(纯标点·OCR 碎片): %d/%d"
+          % (", ".join("%s %d/%d" % (k, summ["fam_fail"].get(k, 0),
+                                     summ["fam_drop"].get(k, 0)) for k in _fam) or "无",
+             summ["n_plain_fail"], summ["n_plain_drop"]))
+
     os.makedirs(OUTDIR, exist_ok=True)
     out_json = os.path.join(OUTDIR, os.path.basename(args.manifest).replace(".manifest.json", "") + ".imported.json")
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(imported, f, ensure_ascii=False, indent=1)
 
-    # 返工单: FAIL 时写一份给豆包(桥读得到), PASS 时把旧单子删掉 ——
-    # 留着过期单子比没有更糟: 豆包会照它改已经改好的段。
-    name = man.get("name") or os.path.basename(args.manifest).replace(".manifest.json", "")
+    # 返工单: FAIL 时写一份给译者(桥读得到), PASS 时把旧单子删掉 ——
+    # 留着过期单子比没有更糟: 译者会照它改已经改好的段。
     note = os.path.join(INBOX, name + REWORK_SUFFIX)
     if ok:
         if os.path.exists(note):
@@ -817,7 +1036,7 @@ def main():
     print("产出: %s" % out_json)
     if not ok:
         print("返工单: %s" % note)
-        print("        (给豆包的: 让它 list_inbox / get_payload 读这个文件, 按上面点到的段改)")
+        print("        (给译者的: 让它 list_inbox / get_payload 读这个文件, 按上面点到的段改)")
     print("结论: %s" % ("PASS" if ok else "FAIL"))
     return 0 if ok else 1
 

@@ -8,7 +8,10 @@
       图形对象也各占一行, 那行的 pageid 就是它所在的真实页)
   2. 过滤纯字形段 (页眉/页码/整页表格 = {vN} 组成, 无可译文字)
   3. 还原字形: {vN} -> vars[str(N)], 让豆包看到真实数字/拉丁名
-  4. 检测跨页续接 (上段尾无句末标点 + 下段首小写) -> 合并为一条, 原断点插 ⋮
+  4. 检测跨页续接 -> 合并为一条, 原断点插 ⋮。两档判据(详见文件头 B 类判据):
+     档一 紧邻项: 上段尾无句末标点 + 下段首小写且页码紧邻;
+     档二 非邻项: 上段尾有**断词证据**(硬 `词-` / 软 `…xxo`)时, 允许跳过图注/致谢等
+          不构成续接的项去找真正的另一半(下段首小写 + 首词"从未在正常词位出现")。
   5. 输出 payload 文件 (#S 编号行) + manifest.json (编号 -> 页/段映射;
      每条 part 同时记 page=侧车内部坐标 与 true_page=真实 PDF 页码)
 
@@ -54,6 +57,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 # pdf2zh 1.x —— 与引入本层之前逐字节一致。next 画像不产侧车, 此时为 ""(下面 main 会拦)。
 import engine as _ENG                                     # noqa: E402
 import lessons as _LES                                    # noqa: E402
+import text_clean as _TC                                  # noqa: E402 不可见字符剥离(两侧同源)
 _PROF = _ENG.active()
 SIDECAR = _PROF.sidecar or ""
 PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
@@ -193,7 +197,7 @@ def true_page(o):
 
 
 def load_pages(pages_want, sidecar):
-    """按**真实 PDF 页码**选页 -> (记录表, 缺页列表)。
+    """按**真实 PDF 页码**选页 -> (记录表, 缺页列表, 全量记录)。
 
     为什么按真实页码: 质检/体检报告说的都是真实页码, 用户在报告里读到
     "第43,44页"再照抄到 `--pages` 上是最自然的用法。而 v28.10 之前这里按回调
@@ -204,14 +208,19 @@ def load_pages(pages_want, sidecar):
     返回的记录表仍以侧车原 `page` 为键 —— 那是**载荷内部坐标**
     (manifest / imported.json / seg_inject 沿用它), 不随本函数改变;
     `pageid` 缺失的老侧车退化为按 `page` 匹配(与旧行为一致, 不误伤归档件)。
+
+    第三个返回值是**全量**解析结果: 跨段断词续接要拿整篇的"正常词位"词表
+    (见 normal_words)。只看所选页的话, "这个词在本篇别页正常出现过"就看不见,
+    会把独立段的段首词误判成"从未出现"的残片, 于是把它当续接吞掉。
     """
-    got, seen = {}, set()
+    got, seen, all_recs = {}, set(), []
     with open(sidecar, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
             o = json.loads(line)
+            all_recs.append(o)
             tp = true_page(o)
             if tp is None:                      # 老侧车没有 pageid
                 if o["page"] in pages_want:
@@ -221,19 +230,89 @@ def load_pages(pages_want, sidecar):
             if tp in pages_want:
                 got[o["page"]] = o
                 seen.add(tp)
-    return got, [p for p in sorted(pages_want) if p not in seen]
+    return got, [p for p in sorted(pages_want) if p not in seen], all_recs
 
 
 def restore(raw, vars_):
     def sub(m):
         return vars_.get(m.group(1), m.group(0))
-    text = V_TOKEN.sub(sub, raw).strip()
+    # [v28.80] 不可见字符体检: 剥离**必须在**下面的断词正则**之前** —— 夹在 `-` 与空格
+    # 之间的 U+200B 会让断词判据当场失明(`obser-<ZWSP> vation` 认不出该接)。
+    # 剥的是**还原后的整串**, 藏在字形值里的不可见字符同批去掉 —— 回锚侧拿字形值
+    # 建 pattern 时走同一个 text_clean.strip, 两侧同源; 只剥一侧 = 自造 str.find 落空。
+    text = _TC.strip(V_TOKEN.sub(sub, raw)).strip()
     # PDF 换行断词, 两种情况区分处理:
     #   音节断词 (后随小写): "obser- vation" -> "observation", "Astera- ceae" -> "Asteraceae"
     #   复合名断词 (后随大写): "Lovett- Doust" -> "Lovett-Doust", 保留连字符只删空格
     text = re.sub(r"([A-Za-z])- (?=[a-z])", r"\1", text)
     text = re.sub(r"([A-Za-z])- (?=[A-Z])", r"\1-", text)
     return text
+
+
+# ---- [v28.74] B 类: 跨段断词续接的判据 ----
+# 缘起(实测 Johnson): 侧车把被 PDF 分栏/分页截断的一个词切成两段, 但这两段在段表里
+# **不一定相邻** —— 中间可能夹着图注、致谢、误命名段。旧判据只比对 items[i] 与
+# items[i+1], 于是 S6(p1#7 尾 `water par-`)→S9(p1#12 头 `tially…`, 中间夹两段) 与
+# S13(p1#16 尾 `Infection was reo`)→S18(p2#7 头 `corded…`, 中间夹 Fig.1 图注)
+# 永远合不上: 半个词被两家各自照译, 渲染拼接处重复、与原文对不上号(规则 8 想防的
+# 正是这件事, 但导出端根本没把碎片标出来)。
+#
+# 修法: 允许**跳过**不构成续接的项去找 B, 但两侧都要有硬证据, 否则会把独立段吞掉:
+#   A 侧(断词证据)
+#     H 段尾 `词-`             连字符断词("water par-")
+#     S 段尾 `…xxo` 且末词≤4字符 —— 本类 PDF 的字形图层把连字符抽成了字母 'o':
+#                    "Infection was reo" 实为 "…was re-" + "corded…"(源文缺陷)
+#     不放宽成"任何非句末标点结尾": `…of` / `…the` 这类完整收尾满篇都是, 一放宽整篇连坐。
+#   B 侧(三条同时成立)
+#     1 与 A **同页或紧邻下一页** —— 跨页续接的物理前提(与 v28.10 的页码口径一致)
+#     2 段首小写字母      —— 半词续接不会以大写开头(大写只可能是新句子/专名)
+#     3 首词"在整篇从未出现在正常词位" —— 防误吞独立段的关键, 见 normal_words
+BREAK_HARD = re.compile(r"[A-Za-z]-$")
+BREAK_SOFT = re.compile(r"[a-z]{2,3}o$")
+WORD_RE = re.compile(r"[A-Za-z]{2,}")
+
+
+def normal_words(records):
+    """整篇里在"正常词位"出现过的词集(小写)。
+
+    正常词位 = 词前面是**单个**空白(空白前一字符不是空白), 即它是由正常字距分开的
+    独立词。断词残片不会落在这种位置:
+      - 后半截(tially/corded/nd-best)必然是某个框/行的**段首**, 前面没东西;
+      - 被版面断开的半个词, 前半截与后半截之间是**双空格**(源文缺陷: 实测本篇
+        p1#2 里 "essen  tially" 就是这么来的), 故"空白前还是空白"要排除掉。
+    两个条件缺一不可 —— 实测教训:
+      - 只要求"空格前是字母"(早先的写法): `, where` / `(3) fouled` 这类**跟在标点
+        后**的常用词全被算成"从未出现", 于是 pdf-31e0fcbb 的 `Grounded-` 跳到 4 项
+        之外的 `where kij…` 上合出一个假续接;
+      - 只要求"前面是空白": 又把 `essen  tially` 的 `tially` 收进来, 于是 Johnson
+        S6(`water par-`)那个**真**续接反倒被自己的"残片"判据挡住了。
+    """
+    good = set()
+    for o in records:
+        vv = o.get("vars") or {}
+        for s in o["segs"]:
+            t = restore(s.get("raw") or "", vv)
+            for m in WORD_RE.finditer(t):
+                st = m.start()
+                if st >= 2 and t[st - 1] in " \t" and t[st - 2] not in " \t":
+                    good.add(m.group(0).lower())
+    return good
+
+
+def break_hint(text):
+    """A 侧断词证据: 'H' 连字符断词 / 'S' 字形缺陷断词 / '' 无。"""
+    if BREAK_HARD.search(text):
+        return "H"
+    if BREAK_SOFT.search(text):
+        m = re.search(r"([A-Za-z][A-Za-z\-]*)$", text)
+        if m and len(m.group(1)) <= 4:
+            return "S"
+    return ""
+
+
+def first_word(text):
+    m = re.match(r"([A-Za-z][A-Za-z\-]*)", text)
+    return m.group(1) if m else ""
 
 
 def _emit(args, items, merged_log, warnings, pages_str, source=None):
@@ -366,7 +445,7 @@ def export_next(args, pages_want):
 
 def export_sidecar(args, pages_want):
     """1.x 画像: 侧车 -> 载荷条目(逐页 + 跨页续接合并) -> _emit。"""
-    pages, missing = load_pages(pages_want, args.sidecar)
+    pages, missing, all_recs = load_pages(pages_want, args.sidecar)
     if missing:
         print("侧车缺页: %s" % missing)
         return 1
@@ -397,22 +476,69 @@ def export_sidecar(args, pages_want):
     def head(t):
         return t[0]
 
+    # 整篇的"正常词位"词表: B 侧判据 3 用它把独立段的段首词与断词残片分开
+    # (只用所选页算会漏掉"该词在别页正常出现过", 见 load_pages 节头)
+    good_words = normal_words(all_recs)
+
+    def continuation(k):
+        """a=items[k] 之后**第一个**可续接项的下标; 无则 None。
+
+        中间的项只有"本身不构成候选"才允许被跳过(超窗/段首非小写/首词是正常词);
+        否则说明 A 的断词在下游没有对应物, 不该硬接一个。
+        """
+        a = items[k]
+        pa = a["parts"][-1][3]
+        # 跨页续接只在"A 是该页最后一项"时允许: 紧随其后的一项若还在 A 自己这页, 说明
+        # A 不在页末, 真正的续接只可能在同一页里(多栏版面上就是隔壁那栏, 见 Johnson
+        # p1#7→p1#12)。不设这条就会跨到下一页去抢别人的残片 —— 实测合成夹具里
+        # `masks with Grounded-`(p2)去接了下页的 `seco`, 而 `seco` 自己还等着 `nd-best`。
+        same_page_only = items[k + 1]["parts"][0][3] == pa
+        for j in range(k + 1, len(items)):
+            pb = items[j]["parts"][0][3]
+            if pb not in (pa, pa + 1) or (same_page_only and pb != pa):
+                continue
+            tb = items[j]["parts"][0][2]
+            if not head(tb).islower():
+                continue
+            if first_word(tb).lower() in good_words:
+                continue
+            return j
+        return None
+
     merged_log = []
     i = 0
     while i < len(items) - 1:
-        a, b = items[i], items[i + 1]
+        a = items[i]
         ta = a["parts"][-1][2]
-        tb = b["parts"][0][2]
         # 相邻性按**真实页码**判: 侧车坐标页是回调计数, 用它判会把"同页的图形记录"
         # 当成隔页, 也会把"隔着一页"当成相邻。
-        pa, pb = a["parts"][-1][3], b["parts"][0][3]
-        # 页码必须物理相邻才可能跨页续接; 离散页集(如 1,21-22)不得跨空隙合并
-        if pb == pa + 1 and tail(ta) not in TERMINAL and (tb[0].islower() or tb[0].isdigit()):
+        pa = a["parts"][-1][3]
+        b = items[i + 1]
+        tb = b["parts"][0][2]
+        pb = b["parts"][0][3]
+        if pb == pa + 1 and tail(ta) not in TERMINAL and (head(tb).islower() or head(tb).isdigit()):
+            # 档一: 紧邻的下一项(v28.10 起的旧判据, 逐字节不动)
             a["parts"].append(b["parts"][0])
             a["merged"] = True
             items.pop(i + 1)
             merged_log.append("合并: p%d 段尾 + p%d 段头 (断点⋮)" % (pa, pb))
             continue
+        # 档二: 有断词证据时, 允许跳过不构成续接的项去找真正的另一半(见文件头 B 类判据)
+        hint = "" if tail(ta) in TERMINAL else break_hint(ta)
+        j = continuation(i) if hint else None
+        if j is not None:
+            pb2 = items[j]["parts"][0][3]
+            a["parts"].extend(items[j]["parts"])
+            a["merged"] = True
+            items.pop(j)
+            merged_log.append("合并(%s, 跳%d项): p%d 段尾 + p%d 段头 (断点⋮)"
+                              % (hint, j - i - 1, pa, pb2))
+            continue
+        if hint:
+            # 有证据却找不到另一半: 不硬接, 但要说出来 —— 否则这类漏合并(本次修的就是它)
+            # 只会在成品里表现为"半个词被译了两遍", 导出这一步看着毫无异常。
+            warnings.append("跨段断词未配对(%s): p%d#%d 尾 …%s"
+                            % (hint, pa, a["parts"][-1][1], ta[-24:]))
         i += 1
 
     return _emit(args, items, merged_log, warnings, args.pages)

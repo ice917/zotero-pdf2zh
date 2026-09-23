@@ -678,13 +678,59 @@ def _toks(t):
     return ", ".join(t) if t else "无"
 
 
+# [自研补丁 2026-09-23] "数词汉化"不算幻觉数字。
+# 载荷把数字**拼成英文单词**写(Four series / One hundred per cent), 译者写成阿拉伯数字
+# (4 个系列 / 100%) —— 同一个数字的两种写法。老判据只看签名, 于是这个多出来的 token 被
+# 判成"冒出载荷里没有的数字", 报告让译者去改**本来是对的**段落。实测 Johnson 那篇:
+# #S22(One hundred per cent -> 100%)、#S25(Four -> 4) 连拒两轮, 两份拒收报告都把
+# 改法指向数字, 而真相是这两段的数字一个没丢。
+# 边界: 只豁免**载荷里拼得出该数值**的那些 token(见 spelt_numbers), 凭空多出来的数字
+# 照旧拦 —— 放宽的是写法, 不是"不幻觉"这条。
+_WORD_NUM = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7,
+    "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+    "fourteen": 14, "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+    "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    "hundred": 100, "thousand": 1000, "million": 1000000,
+}
+_WORD_SPLIT = re.compile(r"[^A-Za-z]+")
+
+
+def spelt_numbers(text):
+    """载荷里**用英文单词拼出来**的数字值(字符串集合), 供"数词汉化"豁免用。
+
+    只做"相邻数词连读"这一层: four -> "4"、one hundred -> "100"、twenty five -> "25"
+    (连字符在 _WORD_SPLIT 里已断开)。孤立的 hundred 也按 100 记 —— 载荷写 "a hundred",
+    译者写 "100" 是同一个数。只产整数: 拼不出整数的写法(three point five)不进集合,
+    那种照旧当幻觉判 —— 豁免要窄, 宁可漏放不可错放。
+    """
+    vals, cur, total = set(), 0, 0
+    for w in _WORD_SPLIT.split((text or "").lower()):
+        v = _WORD_NUM.get(w)
+        if v is None:                     # 非数词 = 一个数词连读到此为止
+            if cur or total:
+                vals.add(str(total + cur))
+            cur = total = 0
+            continue
+        if v >= 100:                      # 百/千/百万: 做进位(one hundred -> 100)
+            cur = (cur or 1) * v
+            if v >= 1000:
+                total, cur = total + cur, 0
+        else:
+            cur += v
+    if cur or total:
+        vals.add(str(total + cur))
+    return vals
+
+
 def _inv_missing(src_toks, dst_toks):
     """载荷有、交付**缺**的 token(多重集差) —— 这才是"数字被改掉"。"""
     from collections import Counter
     return sorted((Counter(src_toks) - Counter(dst_toks)).elements())
 
 
-def _inv_hallucinated(src_toks, dst_toks):
+def _inv_hallucinated(src_toks, dst_toks, src_text=None):
     """交付里出现、但载荷**根本没有**的 token —— 凭空多出来的数字。
 
     与上面合起来, 判据就是"不漏 + 不幻觉"。
@@ -693,9 +739,15 @@ def _inv_hallucinated(src_toks, dst_toks):
     "…时 𝛿1 小, …时 𝛿1 大"), 数字跟着复述一遍是通顺的必然结果。逐个计数相等的老判据
     会把它判成"增了数字", 让译者去改**本来是对的**段落(2026-09-20 SILAGE: #S699 属这类,
     #S348 更早为绕它白改过一轮)。要看的是载荷的数字还在不在、有没有冒出新的。
+
+    [2026-09-23] src_text 给"数词汉化"豁免用: 载荷写成英文单词的数(Four / One hundred)
+    被译成阿拉伯数字(4 / 100%)不算"冒出" —— 同一个数字的两种写法, 详见 spelt_numbers。
     """
     seen = set(src_toks)
-    return sorted({x for x in dst_toks if x not in seen})
+    extra = {x for x in dst_toks if x not in seen}
+    if src_text:
+        extra -= spelt_numbers(src_text)
+    return sorted(extra)
 
 
 def diff_invariants(src_text, dst_text):
@@ -706,7 +758,7 @@ def diff_invariants(src_text, dst_text):
     """
     a, b = inv_sig(src_text), inv_sig(dst_text)
     out = []
-    if _inv_missing(a[0], b[0]) or _inv_hallucinated(a[0], b[0]):
+    if _inv_missing(a[0], b[0]) or _inv_hallucinated(a[0], b[0], src_text):
         out.append(("数字", _toks(a[0]), _toks(b[0])))
     if _inv_missing(a[1], b[1]) or _inv_hallucinated(a[1], b[1]):
         out.append(("[n]引用", _toks(a[1]), _toks(b[1])))
@@ -831,6 +883,8 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
     L.append("判据: 数字 / [n] 引用号 / 𝒪( 记号按载荷**原样** —— 不改、不减、不增、不换位"
              "（上标·下标数字如 `⁴` 与 `4` 视为同一个数字，算过；载荷里的数字在译文中"
              "**多出现几次**也算过 —— 中文要把英文省略的主语补出来, 数字会跟着复述。"
+             "载荷把数字**拼成英文单词**的（`Four series`、`One hundred per cent`）译成"
+             "阿拉伯数字（4、100%）同样算过 —— 同一个数字的两种写法。"
              "这一节只抓两件事: **载荷有的数字不见了**、**冒出载荷里没有的数字**）。")
     L.append("")
     L.append("每条都附**载荷原文 ↔ 你的译文**并排（长的留头尾）。改之前先把并排读一遍，"

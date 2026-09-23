@@ -10,6 +10,8 @@ tools/pre_check.py —— PDF 翻译前体检器（零 API 成本，零侵入）
     - 公式密集页预警   → 数学符号密度高的页列入"重点核对"名单
     - 字体/结构风险    → Type3 字体、复合字体缺 ToUnicode、生产者指纹(dvips/iText)
     - 加密/损坏预检    → 提前发现无法解析的文件
+    - 不可见字符记账   → 零宽/bidi/tag 类逐页记账（只报不拦；剥离由 tools/text_clean.py
+                          在载荷侧与回锚侧**走同一个函数**做掉，见该模块头）
   检查结论写入 server/translated/review/翻译前体检报告_*.md，
   与审校报告/存疑清单共用同一目录，形成"翻前体检 → 翻后质检"闭环。
 
@@ -52,6 +54,8 @@ import sys
 import warnings
 
 from pypdf import PdfReader
+
+import text_clean as _TC   # [v28.80] 不可见字符的**单一剥离函数**(与导出/回锚两侧同源)
 
 # 老 PDF 常见字体表(CMap)损坏会刷屏大量解析警告，对体检结论无贡献，静音处理
 logging.getLogger("pypdf").setLevel(logging.ERROR)
@@ -212,7 +216,7 @@ def analyze_page(reader, idx):
     """
     feat = {"page": idx + 1, "chars": 0, "ref_markers": 0, "ref_entries": 0,
             "ref_density": 0.0, "ref_ay": 0, "ref_ay_density": 0.0,
-            "math": 0, "cjk_r": 0.0, "error": None}
+            "math": 0, "cjk_r": 0.0, "invis": "", "error": None}
     try:
         page = reader.pages[idx]
         text = page.extract_text() or ""
@@ -224,6 +228,8 @@ def analyze_page(reader, idx):
         feat["ref_ay_density"] = ref_ay_density(text)
         feat["math"] = count_math_symbols(text)
         feat["cjk_r"] = cjk_ratio(text)
+        # [v28.80] 不可见字符记账(只报不拦) —— 详见 invis_section 的说明
+        feat["invis"] = _TC.phrase(_TC.scan(text))
     except Exception as exc:  # 单页损坏/字体异常
         feat["error"] = str(exc)[:120]
     return feat
@@ -387,6 +393,20 @@ def decide(pages, total, docrisk=None):
             "页面解析抛错（加密/字体表损坏），pdf2zh 大概率同样失败，"
             "建议先修复 PDF 或跳过这些页"))
 
+    # --- 不可见字符（零宽/格式/bidi/tag 类）---
+    # [v28.80] 只报不拦。它们在正文里**看不见**, 但会让回锚的字形定位(str.find)落空
+    # —— 报出来的 FAIL 人眼复核时无从解释。剥除由 tools/text_clean.py 在**两侧同时**
+    # 做掉(载荷侧 restore / 回锚侧 seg_zh 与字形值), 故不影响本次翻译的正确性;
+    # 这里记账是为了事后能按码点追查它的来源(网页粘贴 / OCR 残留 / 引擎写入)。
+    invis_pages = [p["page"] for p in pages if p.get("invis")]
+    if invis_pages:
+        pages_str = ",".join(str(x) for x in invis_pages)
+        findings.append((
+            "提示", f"第{pages_str}页",
+            "正文里检出不可见字符（零宽 / 格式 / bidi / tag 类）：它人眼看不见，却会让"
+            "回锚的字形定位落空。导出与回锚两侧已用**同一个** tools/text_clean.py 同时"
+            "剥离，不影响本次翻译；码点与位置见报告「不可见字符」节，可据此追查来源"))
+
     # --- 字体/结构风险（闸门 1 → 是否必须跑闸门 2）---
     findings += _font_findings(docrisk)
 
@@ -464,10 +484,13 @@ def build_report(pdf_path, total, pages, recommend_skip, findings, encrypted,
             note = "文献页"
         else:
             note = ""
+        if p.get("invis"):
+            note = (note + "; " if note else "") + "不可见字符"
         lines.append(
             "| {page} | {chars} | {ref_markers} | {ref_entries} | {math} | {cjk_r:.0%} | {note} |".format(
                 note=note, **p))
     lines += font_section(docrisk)
+    lines += invis_section(pages)
     lines += ["", "## 结论与建议", ""]
     if not findings:
         lines.append("未发现高危因素，可正常提交翻译。")
@@ -479,6 +502,35 @@ def build_report(pdf_path, total, pages, recommend_skip, findings, encrypted,
               "> 本工具是**便宜筛子**（字体段用 PyMuPDF），只报线索；",
               "> 被判红时请跑 tools/parse_smoke.py —— 那才是走产线同一条路径的真判据。"]
     return "\n".join(lines)
+
+
+def invis_section(pages):
+    """不可见字符记账小节（无命中则返回空列表；**只记账，不拦翻译**）。
+
+    [v28.80] 为什么单列一节: 零宽/bidi/tag 类字符在正文里**看不见**, 但会让回锚的
+    字形定位(str.find)落空 —— 由此产生的 FAIL 人眼复核时无从解释。剥除已由
+    tools/text_clean.py 在导出/回锚**两侧同时**做掉(归一化, 不改任何判据), 本节只把
+    "哪一页、什么码点、在第几个字符"记下来, 便于事后追查来源。
+
+    它测的是**原文页**(pypdf 提取出来的文本), 而不是译文 —— 译文侧没有体检时机
+    (译文是豆包给的), 那边靠剥离兜住。
+    """
+    hits = [p for p in pages if p.get("invis")]
+    if not hits:
+        return []
+    out = ["", "## 不可见字符", "",
+           "本节**只记账、不拦翻译** —— 剥离由 tools/text_clean.py 在载荷侧与回锚侧"
+           "**走同一个函数**做掉，不改任何判据。",
+           "",
+           "| 页 | 命中（码点 · 次数 · 首次位置）|",
+           "|---|---|"]
+    for p in hits:
+        out.append("| {page} | {invis} |".format(page=p["page"], invis=p["invis"]))
+    out += ["",
+            "> 条目**人眼看不见是正常的**（零宽字符没有宽度），按码点核对即可。",
+            "> 变体选择符（`∑︀`、`⚠️`）与特殊空格（U+00A0/U+202F/U+3000）**不剥**，",
+            "> 它们有宽度或呈现含义 —— 若在这里看到它们，属正常，不是缺陷。"]
+    return out
 
 
 def font_section(docrisk):

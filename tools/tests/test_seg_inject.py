@@ -18,7 +18,7 @@
   ② 注入后自检: 回读该段 id 最大的那一行(`newest_row`), 译文没变就判 FAIL ——
      不再允许"报 OK 但渲染器读不到"。
 
-本测试锁 7 段语义 (内存 sqlite + 合成侧车结构, 不碰真实 cache.v1.db):
+本测试锁 8 段语义 (内存 sqlite + 合成侧车结构, 不碰真实 cache.v1.db):
   ① 平票 -> 取 id 大者 (旧写法取 id 小者 = 复现缺陷)
   ② 票数优先于行号 (覆盖更广的指纹不能被"更新"压过)
   ③ 判据是"最后写入"而非"名字看起来更新" —— 反向构造仍取 id 大者
@@ -26,6 +26,9 @@
   ⑤ 自检反例: 写进被遮蔽旧行 -> newest_row 译文未变 (注入静默失效被抓住)
   ⑥ 该段无行 -> newest_row 返回 None (调用方不误判)
   ⑦ 无票 / 段过短不参与投票 -> None (回落 Cactaceae 默认的行为不变)
+  ⑧ [v28.80] 不可见字符在**注入落盘前**被剥掉, 且剥在 renumber **之前** ——
+     夹在 `{v` 与数字之间的零宽字符会让重编号看不见这个占位符。缓存主键
+     (original_text) 两侧都不动: 它必须与引擎写下的逐字节相同。
 
 运行: venv python test_seg_inject.py, 退出码 0=全过
 """
@@ -40,6 +43,7 @@ if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
 import seg_inject as SJ  # noqa: E402  模块级只定义常量/正则, 导入不写库
+import text_clean as TC  # noqa: E402 ⑧ 节要断言注入用的是同一份剥离实现
 
 FP_OLD = "docsummary:38bc38bc38bc38bc:1111aaaa"
 FP_NEW = "docsummary:6c71c61ab046e9b9:f9ac3711"
@@ -147,6 +151,17 @@ def main():
     add_row(con, 1, SHORT, FP_OLD)
     check("⑦ 段短于 80 字不参与投票 -> None",
           SJ.detect_fp(con.cursor(), pages_of(SHORT), man_of(0)) is None)
+
+    # ---- ⑧ [v28.80] 不可见字符: 注入落盘前剥离, 且剥在 renumber **之前** ----
+    # 零宽字符排到纸上就是豆腐块/CID 0, 而它夹在 `{v` 与数字之间时还会让重编号
+    # (V_TOKEN 正则)看不见这个占位符 —— 那个占位符于是**从未**被映射成段内编号,
+    # 渲染契约的"占位符多重集 ⊆ raw"随之失守。顺序不能反。
+    ZWSP = "\u200b"
+    check("⑧ 注入用的是同一份 text_clean", SJ._TC.strip is TC.strip)
+    check("⑧ 先剥后重编号: 夹了零宽的 {v0} 仍认得出",
+          SJ.renumber(SJ._TC.strip("{v0" + ZWSP + "}"), "{v0}") == "{v0}")
+    check("⑧ 不先剥就会漏掉这个占位符(这就是顺序的理由)",
+          SJ.renumber("{v0" + ZWSP + "}", "{v0}") == "{v0" + ZWSP + "}")
 
     print("\nseg_inject 文档指纹探测 + 注入自检单元测试: %d PASS / %d FAIL" % (passed, failed))
     sys.stdout.flush()

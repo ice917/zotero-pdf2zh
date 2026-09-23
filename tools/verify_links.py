@@ -24,14 +24,30 @@ resolve_links 只保证"目标页+坐标写死"; 但坐标写错(如原点方向
 而页码本身完全合法 —— 只有这条能抓。同时做两侧条数对账, 并在原版侧还残留 NAMED
 (dual_links 没跑/没跑完)时点名。
 
+**第四条判据(用户自定义链接, 需 --spec)**: 引文锚的语义校验对 URI 锚一条都用不上 ——
+用户自定义的概念链接是"我让它在哪就在哪", 没有"作者+年份"可对。硬塞进失配清单只会制造
+假阳性, 而**假阳性会让人学会忽略整份报告**, 比漏抓一个洞更贵。故单列一段, 判据三条:
+锚文本在目标页存在 / 该位置真挂着规格里那条 URL / 矩形不退化。"第几次出现"直接复用
+user_links.plan_entry —— 两处各写一份, 迟早会分叉成两套口径。
+
 用法:
   python tools/verify_links.py --target <成品.pdf> [--original <原版.pdf>] \
-      [--tol 45] [--report <报告>]
+      [--tol 45] [--report <报告>] [--spec <user_links.json>] [--task <任务名>] [--dual]
+给 --spec 时, 自定义链接未就位会让本工具退 1(其余情况维持"只体检、退 0"的老契约)。
 """
-import argparse, io, re, sys, unicodedata, collections
+import argparse, io, os, re, sys, unicodedata, collections
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+# reconfigure 而非 `sys.stdout = io.TextIOWrapper(...)`: 本文件要 import user_links,
+# 而 user_links 又 import relink_pages —— 后者同样会重设 stdout。用"新建包装器"的写法时,
+# 被换掉的那层被回收会连带关掉底层 buffer, 链式 import 直接把 stdout 弄成 closed file。
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 import pymupdf
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import user_links as ul          # 复用"第几次出现"的定位口径, 不另起一份(单一口径)
 
 norm = lambda s: re.sub(r"\s+", "", s or "")
 
@@ -181,6 +197,38 @@ def cite_number_anchor(page, r, n_digits=4):
     return bool(size) and r.width < n_digits * size * 0.5 * 0.9
 
 
+def user_uri_consistency(doc, spec_path, task, dual, bad, stat):
+    """用户自定义链接端到端校验 (见模块头"第四条判据")。返回一句结论供打印。
+
+    判据三条, 缺一不可: ① 锚文本在目标页找得到(定位口径复用 user_links.plan_entry);
+    ② 该处**真挂着**规格里那条 URL(只验锚在不在, 会漏掉"忘了跑 user_links.py");
+    ③ 计划矩形与链接矩形相交(排除放错位置的野链接)。
+    """
+    entries, _ = ul.load_spec(spec_path, task)
+    pages = ul.doc_pages(len(doc), dual)
+    ok = miss_anchor = miss_link = 0
+    for e in entries:
+        stat["uri_checked"] += 1
+        p = ul.plan_entry(doc, pages, e, dual)
+        pg = (p["pno"] + 1) if p["pno"] is not None else -1
+        if p["status"] != "ok":
+            miss_anchor += 1
+            bad.append((pg, "『%s』" % p["anchor_n"], -1, "自定义锚未命中: %s" % p["detail"]))
+            continue
+        hit = any(l["kind"] == pymupdf.LINK_URI and (l.get("uri") or "") == p["url"]
+                  and pymupdf.Rect(l["from"]).intersects(p["rect"])
+                  for l in doc[p["pno"]].get_links())
+        if hit:
+            ok += 1
+        else:
+            miss_link += 1
+            bad.append((pg, "『%s』" % p["anchor_n"], -1,
+                        "锚在, 但该位置没挂着这条 URL —— 漏跑 user_links.py? %s" % p["url"]))
+    stat["uri_ok"] += ok
+    return ("用户自定义链接 %d 条 | 就位 %d | 锚未命中 %d | 缺链接 %d"
+            % (stat["uri_checked"], ok, miss_anchor, miss_link))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--target", required=True)
@@ -188,6 +236,10 @@ def main():
                     help="原版 PDF: 给出则加一道「落点页一致性」判据(与锚文本内容无关)")
     ap.add_argument("--tol", type=float, default=45)
     ap.add_argument("--report", default="")
+    ap.add_argument("--spec", default="",
+                    help="user_links.json: 给出则加一道「用户自定义链接」判据(单列一段)")
+    ap.add_argument("--task", default="", help="规格 tasks 段的键(本篇任务名)")
+    ap.add_argument("--dual", action="store_true", help="成品是双语版(自定义锚在译文侧)")
     args = ap.parse_args()
 
     doc = pymupdf.open(args.target)
@@ -264,6 +316,20 @@ def main():
         orig.close()
     elif stat["in_page"] and not stat["checked"]:
         print("落点页一致性: 未执行(缺 --original)")
+
+    # 用户自定义链接单列一段(见模块头"第四条判据"): 它的失配与上面三段的失配不是一回事,
+    # 混在一起看会让人以为"引文链乱跳", 其实只是规格里某条锚没写对。
+    uri_bad = 0
+    if args.spec:
+        try:
+            print("用户自定义链接: %s"
+                  % user_uri_consistency(doc, args.spec, args.task, args.dual, bad, stat))
+            uri_bad = stat["uri_checked"] - stat["uri_ok"]
+        except Exception as e:
+            uri_bad = 1
+            bad.append((-1, "自定义链接规格无法读取", -1, "%s: %s" % (args.spec, e)))
+            print("用户自定义链接: FAIL 规格无法读取 —— %s" % e)
+
     doc.close()
     for b in bad[:25]:
         print("  %s p%d %r -> p%d %s" % ("失配" if b[0] > 0 else "异常", b[0], b[1], b[2], b[3]))
@@ -272,7 +338,9 @@ def main():
             for b in bad:
                 f.write("p%d\t%s\tp%d\t%s\n" % b)
         print("失配清单:", args.report)
-    return 0
+    # 给了 --spec 就不再是"纯体检": 自定义链接没装到位是**动作没做完**, 必须拦住
+    # (面板/流水线靠这个退出码判断"要不要回头补跑 user_links.py")。
+    return 1 if uri_bad else 0
 
 
 if __name__ == "__main__":

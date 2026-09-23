@@ -4,10 +4,44 @@
 # 删掉某行即不再注入; 清空本文件即回到纯静态规则。
 GLYPH	C∈{2,4}	with Wcls∈R768×C and C∈{2,4} for rotation and sliding. Additive fusion…	2026-09-21
 GLYPH	(0.69/0.63	…slightly above it. GeoTLM keeps the two directions balanced (0.69/0.6…	2026-09-21
-OTHER	FAIL 缺段: [2]		2026-09-21
-OTHER	FAIL #S2 译文为空		2026-09-21
-GLYPH	3	Exciting 3D work - done.	2026-09-21
-OTHER	FAIL 缺段: [26]		2026-09-21
-OTHER	FAIL #S26 译文为空		2026-09-21
-GLYPH	{v1}	Tail of page one {v1} closes it.	2026-09-21
-OTHER	FAIL #S3（第1页·跨页） 占位符不守恒: 多了 {v1} x1（载荷里 {v1} x1；译文里 {v1} x2）		2026-09-21
+GLYPH	{v1}	Tail of page one {v1} closes it.	2026-09-22
+OTHER	FAIL #S3（第1页·跨页） 占位符不守恒: 多了 {v1} x1（载荷里 {v1} x1；译文里 {v1} x2）		2026-09-22
+GLYPH	110	There was 110 infection at 4° or 35°C. The fungus in the infected egg …	2026-09-23
+GLYPH	340/00Ill	…ties. From IS to 25°~., for example, infection occurring at 340/00Ill…	2026-09-23
+GLYPH	16,1959.	Received for publication September 16,1959. Financial support by the N…	2026-09-23
+OTHER	FAIL 缺段: [2]		2026-09-23
+OTHER	FAIL #S2 译文为空		2026-09-23
+OTHER	FAIL 缺段: [26]		2026-09-23
+OTHER	FAIL #S26 译文为空		2026-09-23
+GLYPH	3	Alpha ok done, and the tail carries 3 yet.	2026-09-23
+GLYPH	𝑛	x and 𝑛	2026-09-23
+GLYPH	𝑓𝑖,𝑗	…𝐿>0. Crucially, however, we do not require every individual 𝑓𝑖,𝑗 to b…	2026-09-23
+MOVE	⋮ 两侧译文互换		2026-09-23
+GLYPH	𝑖)	…given ℱ𝑡. Next, define the population mean drift (excluding 𝑖)	2026-09-23
+GLYPH	𝑠∈𝑆,	…ese events are mutually exclusive over different choices of 𝑠∈𝑆, henc…	2026-09-23
+GLYPH	𝑆∖{𝑠}	…ng all (︀𝑛−1𝑏grp−1)︀ subsets of [𝑛]∖{𝑠} of size 𝑏grp−1, and 𝑆∖{𝑠} is …	2026-09-23
+GLYPH	(𝑗𝑡𝑖′).	… third term captures the variance due to the inner sampling (𝑗𝑡𝑖′).	2026-09-23
+GLYPH	[𝑛]∖˜Ω𝑡),	… reset on 𝑖𝑡, recursive updates on Ω𝑡, and drift updates on [𝑛]∖˜Ω𝑡),…	2026-09-23
+GLYPH	{𝑗𝑡𝑖}𝑖∈Ω𝑡	…tic, while the randomness in 𝑁𝑡 comes only from the indices {𝑗𝑡𝑖}𝑖∈Ω𝑡…	2026-09-23
+GLYPH	𝑗𝑡𝑖𝑡.	… randomness in 𝑁𝑡 comes only from the indices {𝑗𝑡𝑖}𝑖∈Ω𝑡 and 𝑗𝑡𝑖𝑡.	2026-09-23
+GLYPH	𝑁𝑡	…tors 𝑅𝑡 and ¯∆𝑡𝑖 are deterministic, while the randomness in 𝑁𝑡 comes …	2026-09-23
+GLYPH	ℱ𝑡.	…, and (c) uses that 𝑖𝑡 is uniform on [𝑛] and independent of ℱ𝑡.	2026-09-23
+GLYPH	Ł	… the batch-size- dependent similarity terms that enter the PŁ Lyapuno…	2026-09-23
+GLYPH	𝑖∈[𝑛],	…riterion for choosing 𝑏grp. Assume that 𝑔0𝑖=∇𝑓𝑖(𝑥0) for all 𝑖∈[𝑛], so…	2026-09-23
+GLYPH	𝑞=𝐾/𝑇	…venly into 𝑇 macro-families, such that each family contains 𝑞=𝐾/𝑇 com…	2026-09-23
+GLYPH	𝑇	…odel. We define 𝐾 latent components partitioned evenly into 𝑇 macro-f…	2026-09-23
+GLYPH	𝛼𝑖,𝑗(𝑥)𝑎𝑖,𝑗𝑎⊤𝑖,𝑗.	… exclusively by the geometry of the rank-one logistic terms 𝛼𝑖,𝑗(𝑥)𝑎𝑖…	2026-09-23
+GLYPH	𝜋𝑖,	…g the common regularizer). Conditional on the group mixture 𝜋𝑖, the p…	2026-09-23
+GLYPH	𝑥(	…ogistic Hessian contribution of latent component 𝑘 at point 𝑥(excludi…	2026-09-23
+GLYPH	(𝑎𝑖,𝑗,𝑦𝑖,𝑗),	…ression instances used in the experiments. For a data point (𝑎𝑖,𝑗,𝑦𝑖,…	2026-09-23
+GLYPH	(𝑛>𝑚)	…atch-size tuning was performed for SILAGE (𝑚>𝑛). For SILAGE (𝑛>𝑚) in …	2026-09-23
+GLYPH	𝑛>𝑚	…ing was performed for SILAGE (𝑚>𝑛). For SILAGE (𝑛>𝑚) in the 𝑛>𝑚 setti…	2026-09-23
+GLYPH	𝑚>𝑛	…r. For D-ZeroSARAH, we used setting-dependent grids: in the 𝑚>𝑛 setti…	2026-09-23
+GLYPH	10.5×	… optimization loop. The smallest dense refinement budget is 10.5× slo…	2026-09-23
+GLYPH	59.0×	…efinement budget is 10.5× slower, and the largest budget is 59.0× slo…	2026-09-23
+GLYPH	(i,j),ˆ	…ere kij and lij are the stiffness and rest length of spring (i,j),ˆdi…	2026-09-23
+GLYPH	j,γ	…spring (i,j),ˆdij is the unit direction from node i to node j,γ is th…	2026-09-23
+GLYPH	TOLERANCE.-Lageni.	NUTRITION AND SALINITY TOLERANCE.-Lageni. diumchthamalophilum was prop…	2026-09-23
+GLYPH	011	…utrient source was ava~l~ble. Colony diameters were greater 011 the n…	2026-09-23
+GLYPH	III	…et of e;-  periments all origi~a.lly uninfected .egg masses III 25 an…	2026-09-23
+GLYPH	within	…inity are not necessarily the factors controlling infection within th…	2026-09-23

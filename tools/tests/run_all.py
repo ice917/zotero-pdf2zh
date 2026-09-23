@@ -21,14 +21,17 @@
     7. test_progress_log.py      v26.20 无控制台进度监视器 (27 例)
     8. test_failure_brief.py     v26.20 失败根因提取(闸门4) (32 例)
     9. test_post_check.py        v26.21 文献区禁汉化门禁(第四断言) + v28.17 渲染残渣(第五断言) (69 例)
-   10. test_seg_reanchor.py      v26.22 回锚匹配器(语序重排/标点全角化/长core优先) (19 例)
+   10. test_seg_reanchor.py      v26.22 回锚匹配器(语序重排/标点全角化/长core优先)
+                                 + v28.80 不可见字符两侧同源剥离 + v28.82 回锚埋点
+                                 (字符家族归档, 只记账不判定) (57 例)
    11. test_adopt.py             v28 采纳管线「必经」入口: 顺序门禁/段号守恒/指纹固定 + v28.22 --expect 累加 (46 例)
-   12. test_seg_export.py        v28.1 导出抬头/术语表参数化 + v28.10 真实页码选页 + v28.22 规则 2 块内空格/标点 (52 例)
+   12. test_seg_export.py        v28.1 导出抬头/术语表参数化 + v28.10 真实页码选页 + v28.22 规则 2 块内空格/标点 + v28.74 跨段断词续接 (87 例)
    13. test_pre_check.py         v28.2 翻前体检文献页判据(两体例+两道闸门) (30 例)
    14. test_doubao_bridge.py     v28.3 豆包 MCP 桥契约(路径可移植+交件命名对齐+读报告) (40 例)
    15. test_pre_render_check.py  v28.5 渲染前预检(判据与 post_check 同源) (24 例)
    16. test_segflow_archive.py   v28.9 侧车按文档归档(写入端与认领端同一口径) (12 例)
-   17. test_seg_rework.py        v28.13 import 失败自动落「给豆包的返工单」 (32 例)
+   17. test_seg_rework.py        v28.13 import 失败自动落「给豆包的返工单」
+                                 + v28.82 回锚埋点端到端(真入口落台账/追加/不改退出码) (45 例)
    18. test_backfill_pages.py    v28.15 零可译段页判定(真实页码+按页聚合) (9 例)
    19. test_seg_inject.py        v28.21+ 文档指纹探测平票取最新世代 + 注入后自检 (9 例)
    20. test_seg_merge.py         v28.30 按段号合稿: 未动段字节不变 + 回读校验哨兵 (18 例)
@@ -38,8 +41,10 @@
                                  + 定位键对账(不重推段表比坐标) (89 例)
    22. test_reviewer.py         v28.59 ④ 语义审核(硅基流动第三方只审不改): 密钥回落/
                                  切块保序/回包宽容解析/多块并发聚合/报告落盘/面板接线
-   23. test_panel_idle.py       v28.60 面板兜底退出可暂停: 倒计时由服务器给/暂停只停
-                                 闲置腿(告别腿照走)/继续时时钟归零/HTTP 契约
+   23. test_panel_idle.py       v28.79 面板退出两条腿(30 分钟心跳兜底整条删; ⑤ 出稿且整篇
+                                 出齐 -> 自己收摊)/载荷就绪 -> 自动拉起面板并 focus (真实端口
+                                 写进 --announce 回话文件)/表头「构建」时间/
+                                 60642 旧实例只识别不代杀(--takeover 走它的告别腿)
    24. test_webai.py            v28.62 翻译方可换(剪贴板这条路不绑豆包): 回包包装清洗
                                  (围栏/尾部客套/编号行清单化; 误吃译文的反例也在)/同源
                                  拒审(拦在联网之前)/溯源台账与报错明细归因/前端接线
@@ -64,6 +69,26 @@
                                  v28.71 判据换成「这一篇该做的都做了吗」: 产物判据 done/stale/
                                  todo 不落内存 + 篇名归属(foreign/unlabeled) + 缺了只提醒不拦
                                  (台账「已出稿(缺: X)」), 逃生门那条线整条删除
+  33. test_user_links.py       v28.73 用户自定义概念链接: 用户 > 原有(压住即删原条且记账)/
+                                 六类门禁全判在落盘之前(md5 不动)/多命中无 occurrence 不猜/
+                                 撞锚以本篇为准 + --task 缺席要 NOTICE/新锚互撞两条都 FAIL/
+                                 dual 页码按 mono 坐标落译文侧/verify_links 第四判据退 1 口径/
+                                 带空格的锚按原样搜(整行点选是常态)/style_links 变蓝:
+                                 非嵌入 Base-14 能重绘 + 旋转行必须跳过
+   34. test_watch_clip_sidecar.py v28.75 正文侧车身份判据: 采样只取第一个 #S 之后(不采装配
+                                 前言)/比对前还原 {vN} 并去空白/身份优先于页覆盖度/前两档
+                                 全平时以 mtime 破平局 (20 例)
+   35. test_panel_health.py    v28.77 面板体检: 术语双表对账(漏的那份静默失效)/坏行与表头
+                                 口径/config Ital 吞斜体/8890·60642 新旧实例共存/④·ledger
+                                 可写探针/解析口径与 load_terms 一致/面板接线 (20 例)
+   36. test_panel_heal.py      v28.78 面板结构自愈: 成品/工具双重入口守卫/--target·--original·
+                                 --report 由面板补齐/dry 退出码 1 不算失败/报告落成品旁边
+                                 且一字不改读回/透明红线写在代码里 (25 例)
+  37. test_pause_adopt.py     v28.79 提字→面板确认→才出稿: PAUSE_AUTO_ADOPT 缺省停/
+                                 骨架行护栏(台账判据, inject ok 自动放行)/服务端收尾在
+                                 「待译」/面板正文工序改走 adopt(deliver·import·inject,
+                                 不带 --waive; 第二道门判退就不存底片)/③ 只跑第一道门的提示
+                                 (42 例)
 
 设计约定:
     - 全部 stdlib + venv 内 pdf2zh, 不需要 pytest
@@ -89,7 +114,7 @@ SUITES = [
     "test_progress_log.py",       # v26.20 无控制台进度监视器
     "test_failure_brief.py",      # v26.20 失败根因提取(闸门4)
     "test_post_check.py",         # v26.21 文献区禁汉化门禁(第四断言) + v28.17 渲染残渣(第五断言)
-    "test_seg_reanchor.py",       # v26.22 回锚匹配器(语序重排/标点全角化)
+    "test_seg_reanchor.py",       # v26.22 回锚匹配器 + v28.80 不可见字符同源剥离 + v28.82 埋点
     "test_adopt.py",              # v28 采纳管线「必经」入口
     "test_seg_export.py",         # v28.1 导出抬头/术语表参数化
     "test_pre_check.py",          # v28.2 翻前体检文献页判据(两体例+两道闸门)
@@ -102,7 +127,7 @@ SUITES = [
     "test_seg_merge.py",          # v28.30 按段号合稿(未动段字节不变 + 回读校验哨兵)
     "test_engine.py",             # 引擎接缝(画像/接线/段表契约)
     "test_reviewer.py",           # v28.59 ④ 语义审核(硅基流动第三方只审不改)
-    "test_panel_idle.py",         # v28.60 面板兜底退出可暂停(倒计时/暂停/时钟归零)
+    "test_panel_idle.py",         # v28.79 面板退出两条腿(告别 + ⑤ 出稿整篇齐了收摊) + 60642 接管
     "test_webai.py",              # v28.62 翻译方可换: 回包包装清洗/同源拒审/溯源台账
     "test_heal_render.py",        # v28.63 渲染残渣治伤: 干跑体检/擦盖同框/链接补回/dual 映射
     "test_dual_links.py",         # v28.64 dual 双侧链接: 落点映射/两侧门禁/URI 活下来
@@ -112,6 +137,11 @@ SUITES = [
     "test_polish_paths.py",       # v28.67 润色路径(P4): example 不带本机盘符 + 缺路径响亮报错
     "test_result_naming.py",    # v28.68 交件命名契约: 两侧一致/新旧互认/两族同权/接线守卫
     "test_pre_render_ledger.py",  # v28.69 渲染前保底底片 / v28.70 底片失败即停 / v28.71 本篇待办只提醒
+    "test_user_links.py",         # v28.72 用户自定义概念链接: 门禁/覆盖/dual 映射/verify 第四判据
+    "test_watch_clip_sidecar.py",  # v28.75 侧车身份判据: 采样只取 #S 之后/还原占位符+去空白/全平取最新
+    "test_panel_health.py",       # v28.77 面板体检: 双表对账/坏行与表头口径/Ital 吞斜体/端口共存/可写探针
+    "test_panel_heal.py",         # v28.78 面板结构自愈: 路径守卫/组参数/报告落成品旁/一字不改转述
+    "test_pause_adopt.py",        # v28.79 提字→面板确认→才出稿: 开关默认停/骨架护栏/正文工序走 adopt
 ]
 
 # 套件 → 它的"被测对象"(相对项目根)。**只在对象不随包分发时才需要登记** ——

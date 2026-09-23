@@ -781,6 +781,49 @@ def main():
     check("㉗g 端到端: 真漏数字仍被拒收", rc == 1 and g10["n_inv"] == 1,
           (rc, g10, out[-300:]))
 
+    # ㉗h 单元: 数词汉化不算幻觉(Johnson 2026-09-23 两轮拒收的形状)
+    #      载荷写成英文单词的数(Four / One hundred per cent), 译者写成阿拉伯数字 ——
+    #      同一个数字的两种写法; 老判据只看签名, 会把它判成"冒出载荷里没有的数字",
+    #      报告让译者去改**本来是对的**段落(#S22/#S25 两段数字一个没丢)。
+    check("㉗h 数词连读拼得出数值(one hundred -> 100)",
+          AD.spelt_numbers("One hundred per cent of the egg masses") == {"100"},
+          AD.spelt_numbers("One hundred per cent of the egg masses"))
+    check("㉗h One hundred per cent -> 100% 不算幻觉数字",
+          AD.diff_invariants(
+              "One hundred per cent of the egg masses in 27 and 360/00 salinity water "
+              "were infected, but at 680/00, there was no infection.",
+              "27 和 360/00 盐度水中 100% 的卵块被感染，但在 680/00 时没有感染。") == [],
+          AD.diff_invariants(
+              "One hundred per cent of the egg masses in 27 and 360/00 salinity water "
+              "were infected, but at 680/00, there was no infection.",
+              "27 和 360/00 盐度水中 100% 的卵块被感染，但在 680/00 时没有感染。"))
+    check("㉗h Four series -> 4 个系列 不算幻觉数字",
+          AD.diff_invariants("Four series of experiments were performed",
+                             "进行了 4 个系列实验") == [],
+          AD.diff_invariants("Four series of experiments were performed",
+                             "进行了 4 个系列实验"))
+
+    # ㉗i 豁免要窄: 载荷拼不出的那个数照旧当幻觉拦(别让"数词汉化"变成万能挡箭牌)
+    check("㉗i 载荷只有 Four, 译文冒出 9 仍判不符",
+          len(AD.diff_invariants("Four series were performed",
+                                 "进行了 9 个系列实验")) == 1,
+          AD.diff_invariants("Four series were performed", "进行了 9 个系列实验"))
+
+    # ㉗j 同一段里真漏的数字不许被豁免盖住(Four 汉化放行, 但 2020 丢了仍要抓)
+    check("㉗j 数词汉化放行, 同一段的真漏数字仍判不符",
+          len(AD.diff_invariants("Four series were performed in 2020",
+                                 "进行了 4 个系列实验")) == 1,
+          AD.diff_invariants("Four series were performed in 2020", "进行了 4 个系列实验"))
+
+    # ㉗k 端到端: 数词汉化的段不再被门禁拒收(判据必须落到 deliver 上)
+    reset(mk_manifest("g11", [[(1, 0)]]))
+    run(["export", "--name", "g11", "--pages", "1"])
+    mk_payload("g11", [(1, "One hundred per cent were infected at 680/00 salinity")])
+    rc, out = deliver("g11", "#S1\n在 680/00 盐度下 100% 被感染\n")
+    g11 = AD.load_ledger("g11")["stages"]["deliver"]
+    check("㉗k 端到端: 数词汉化段不再被拒收", rc == 0 and g11["state"] == "ok",
+          (rc, g11, out[-200:]))
+
     # ---- 收尾 ----
     shutil.rmtree(ROOT, ignore_errors=True)
     print("\n结果: %d PASS / %d FAIL" % (passed, failed))

@@ -76,35 +76,65 @@ def body_payload():
     return os.path.join(INBOX, BODY_NAME + ".txt")
 
 
+_SEG_MARK = re.compile(r"^#S\d+")
+_PH = re.compile(r"\{v(\d+)\}")
+
+
 def _payload_samples(txt_path, n=8):
-    """从载荷 txt 采几行较长的段落原文(跳过 #S 编号行/[]【】规则行),
-    用于把载荷**按内容**锚定到侧车 —— 页码覆盖度会打平(2026-09-21 实测:
-    Lee 侧车 11 页对 Li manifest 1-7 页覆盖=7, 与 Li 自己的侧车 7=7 平局,
-    max 拿错文档, seg_import 回锚全错), 只有内容身份分得出。"""
-    samples = []
+    """从载荷 txt 采几行**正文段落**原文, 用于把载荷**按内容**锚定到侧车。
+
+    只采**第一个 #S 标记之后**的行。那之前是装配器写的前言([文档]/[任务]/[规则] 加上
+    编号规则正文, 见 seg_export.RULES), 它**任何侧车里都不会有** —— 采到前言 = 身份分
+    恒为 0, 这一档就等于没写(2026-09-23 实测: 旧口径把『1. 每段独立翻译…』『2. 数字、
+    拉丁学名…』当成"内容样本", 对全部 15 张侧车判 0; 于是退回"页覆盖平局 -> os.listdir
+    顺序", 把**新篇**判成了上一篇的侧车, 连带 BODY_PDF 指到上一篇的原文 PDF)。
+    页码覆盖度打平(2026-09-21 实测: Lee 侧车 11 页对 Li manifest 1-7 页覆盖=7, 与 Li
+    自己的侧车 7=7 平局, max 拿错文档, seg_import 回锚全错), 只有内容身份分得出。
+    """
+    out, started = [], False
     try:
         with io.open(txt_path, encoding="utf-8") as f:
             for ln in f:
                 ln = ln.strip()
-                if len(ln) > 25 and not ln.startswith(("#", "[", "【")):
-                    samples.append(ln[:120])
-                    if len(samples) >= n:
+                if _SEG_MARK.match(ln):
+                    started = True
+                    continue
+                if started and len(ln) > 25 and not ln.startswith(("#", "[", "【")):
+                    out.append(ln[:120])
+                    if len(out) >= n:
                         break
     except Exception:
         pass
-    return samples
+    return out
 
 
 def _sidecar_identity(path, samples):
-    """载荷采样行在侧车里的命中数(0=肯定不是这篇)。"""
+    """载荷采样行在侧车里的命中数(0=肯定不是这篇)。
+
+    比之前两侧都要"**还原占位符 + 去空白**":
+      * 侧车 segs[].raw 里数字/字母块被换成了 `{vN}` 占位符(原值在同行的 vars 里),
+        不还原就永远比不上 —— 实测 Johnson 的 8 条采样对**它自己**的侧车也是 0 命中;
+      * 载荷正文与侧车记录的空格/换行排版本就不同(载荷是重排过的), 去空白才稳。
+    两处都不做的话这一档恒为 0, 于是"内容身份优先"形同虚设(见 _payload_samples)。
+    """
     if not samples or not path or not os.path.exists(path):
         return 0
+    parts = []
     try:
         with io.open(path, encoding="utf-8") as f:
-            blob = f.read()
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                o = json.loads(ln)
+                vs = o.get("vars") or {}
+                for sg in o.get("segs") or []:
+                    parts.append(_PH.sub(lambda m: vs.get(m.group(1), ""),
+                                         sg.get("raw") or ""))
     except Exception:
         return 0
-    return sum(1 for s in samples if s in blob)
+    blob = re.sub(r"\s+", "", "".join(parts))
+    return sum(1 for s in samples if re.sub(r"\s+", "", s) in blob)
 
 
 def _pdf_for_sidecar(sidecar_path):
@@ -179,7 +209,14 @@ def body_sidecar():
     samples = _payload_samples(body_payload())
 
     def score(p):
-        return (_sidecar_identity(p, samples), len(pages_of(p) & want))
+        # 第三档用来**打破平局**: 前两档都平局时(身份全 0 = 这批候车里没有本篇的侧车,
+        # 或本载荷没有正文采样), max 原本按 os.listdir 的任意顺序定胜负 —— 2026-09-23
+        # 实测就是这样把新篇判给了上一篇。装配与侧车是同一刻落盘的, 取最新那份才对得上。
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            mt = 0.0
+        return (_sidecar_identity(p, samples), len(pages_of(p) & want), mt)
 
     return max(cands, key=score)
 
@@ -192,6 +229,84 @@ def body_imported():
 def body_out():
     """重渲染产物(1.x 服务端命名 <stem>-mono.pdf, 落 server/translated)。"""
     return os.path.splitext(BODY_PDF)[0] + "-mono.pdf"
+
+
+# ---------------------------------------------------------- 正文出稿: 走 adopt 还是老路
+
+def body_ledger():
+    """这一篇的 adopt 台账(PROJ/logs/adopt/<名>.json); 没有/读不动返回 None。
+    落点与判据都跟 adopt.py 同源(它就是这么写、这么读的), 不另起一套。"""
+    try:
+        with io.open(os.path.join(PROJ, "logs", "adopt", BODY_NAME + ".json"),
+                     encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:                       # noqa: BLE001 —— 台账不是本步的必需品
+        return None
+
+
+def body_use_adopt():
+    """正文出稿工序走不走 adopt 回路。
+
+    [v28.79] 提字 → 面板确认 → 出稿这条新动线上, 出稿那几步必须与服务器那条**自动**
+    回路跑同一套东西, 否则"改成人工确认"会顺手把门禁也削掉。差别是实打实的:
+      - 老路(seg_import)没有 adopt deliver 的三道内容门: ⋮ 断点对账、只译半截、
+        逐段不变量的错位带;
+      - 老路的 seg_inject **没给 --fp** -> 缺省静默回落到 Cactaceae 文档指纹 ->
+        UPDATE 命中 0 行 -> 注入"报成功"而渲染出来还是英文(seg_inject 自己的注释
+        点了这个坑)。adopt 的 inject 从台账取 fp, 不存在这条。
+    判据取台账里 export 那一步 ok: 只有服务器两趟回路导出的载荷才带台账; 手动
+    seg_export 出来的老载荷没有, 照旧走老路(不强行要求, 否则那些篇反而没法出稿)。
+    """
+    led = body_ledger()
+    return bool(led) and ((led.get("stages") or {}).get("export") or {}).get("state") == "ok"
+
+
+def body_gate_after():
+    """正文出稿的**第二道门**(在第一道 cmd 之后、存底片之前跑): adopt 的 deliver +
+    import —— 这两步只读交件、落 out/, **不写缓存库**。
+
+    多出来的正是老路(seg_import 单跑)没有的那三道内容门: ⋮ 断点对账、只译半截、
+    逐段不变量的错位带(src 为载荷时的整段错位)。**不带 --waive**: 面板上那个"确认"
+    是"我确认出稿", 不是"我放行门禁"。自动回路加 --waive 是为无人值守时别把整条动线
+    卡死(理由见 server_server _two_pass_run 的注释), 而这一步人就在跟前, 卡住了改稿
+    重交即可 —— 留个"无声放行"的口子与人守在跟前的设定正相反。
+
+    为什么不并进 cmd: cmd 会被 ③ 检查在临时沙箱里调一次(那时 P2Z_PROJ 指向 tmp),
+    而 adopt 的台账与载荷路径都挂在**真实**项目根下 —— 并进去要么在沙箱里读不到台账
+    (检查结论失真), 要么让"③ 检查"这个本该只读的动作去写真实台账, 还会把 deliver
+    记成指向沙箱里那份**随即被删掉**的回包, ⑤ 再跑 import 就找不到交件了。
+
+    没有台账(手动 seg_export 的老载荷)时返回空表 —— 照旧只跑 cmd 那一道。
+    """
+    if not body_use_adopt():
+        return []
+    return [[PY, os.path.join(TOOLS, "adopt.py"), "deliver",
+             "--name", BODY_NAME, "--text", BODY_NAME + "_response.tsv", "--force"],
+            [PY, os.path.join(TOOLS, "adopt.py"), "import", "--name", BODY_NAME, "--force"]]
+
+
+def body_after():
+    """确认之后的出稿工序(走完 gate_after 才轮到它)。有台账 -> adopt inject -> 重渲染;
+    没有 -> 老路 seg_inject -> 重渲染。
+
+    老路的 seg_inject 是**没给 --fp** 的, 缺省会静默回落到 Cactaceae 文档指纹 ->
+    UPDATE 命中 0 行 -> 注入"报成功"而渲染出来还是英文(seg_inject 自己的注释点了这个
+    坑)。adopt 的 inject 从台账取 fp, 不存在这条 —— 台账在时一律走 adopt 就是为了它。
+
+    最后一步仍是 force_rerender.py 而不是 `adopt.py render`: 后者多一道「文献区禁
+    汉化」的渲染前预检。没接它的理由是本步**不降级**只针对"与自动回路对齐"——服务器
+    自动回路的收尾是再走一遍 translate_pdf, 也不经 adopt render; 而 adopt render 会
+    让面板这条路多出一个"检查过了却出不了稿"的新卡点, 那是口径变更, 得单独说。
+    """
+    rerender = [PY, os.path.join(TOOLS, "force_rerender.py"),
+                "--pdf", BODY_PDF, "--timeout", "1800"]
+    if not body_use_adopt():
+        return [[PY, os.path.join(TOOLS, "seg_inject.py"),
+                 "--imported", body_imported(),
+                 "--manifest", body_manifest(),
+                 "--sidecar", body_sidecar()], rerender]
+    return [[PY, os.path.join(TOOLS, "adopt.py"), "inject", "--name", BODY_NAME, "--force"],
+            rerender]
 
 
 # 任务注册表: 装配器/待译文本/回包文件 -> 门禁 -> 出稿工序。panel.py 复用本表, 不要另起一份。
@@ -223,14 +338,8 @@ JOBS = [
                       "--manifest", body_manifest(),
                       "--text", BODY_NAME + "_response.tsv",
                       "--sidecar", body_sidecar()],
-         after=lambda: [
-             [PY, os.path.join(TOOLS, "seg_inject.py"),
-              "--imported", body_imported(),
-              "--manifest", body_manifest(),
-              "--sidecar", body_sidecar()],
-             [PY, os.path.join(TOOLS, "force_rerender.py"),
-              "--pdf", BODY_PDF, "--timeout", "1800"],
-         ],
+         gate_after=body_gate_after,
+         after=body_after,
          out=lambda: body_out(),
          outs=lambda: [body_out()],
          ins=lambda: [body_payload()]),
@@ -329,14 +438,7 @@ def refresh_body():
                                 "--manifest", body_manifest(),
                                 "--text", BODY_NAME + "_response.tsv",
                                 "--sidecar", body_sidecar()],
-                   after=lambda: [
-                       [PY, os.path.join(TOOLS, "seg_inject.py"),
-                        "--imported", body_imported(),
-                        "--manifest", body_manifest(),
-                        "--sidecar", body_sidecar()],
-                       [PY, os.path.join(TOOLS, "force_rerender.py"),
-                        "--pdf", BODY_PDF, "--timeout", "1800"],
-                   ],
+                   gate_after=body_gate_after, after=body_after,
                    out=lambda: body_out(),
                    outs=lambda: [body_out()],
                    ins=lambda: [body_payload()])
@@ -725,8 +827,13 @@ def _snapshot(log=print):
     return out
 
 
+def argv_list(x):
+    """工序表是 lambda(惰性求路径) 或现成的列表, 两种都收 —— 调用方别各写一遍。"""
+    return x() if callable(x) else (x or [])
+
+
 def run_job(job, ids, got, log=print):
-    """落盘 -> 门禁 -> 渲染前存底片 -> 出稿工序(表格=排附录; 正文=注入缓存+重渲染)。
+    """落盘 -> 门禁 -> 第二道门 -> 渲染前存底片 -> 出稿工序(表格=排附录; 正文=注入缓存+重渲染)。
     返回产物路径(出稿后由调用方打开); 未出稿返回 None。
     **底片做不出来则抛 LedgerFailed**(v28.70): 拦在渲染之前, 由调用方报错提醒 —— 渲染了
     也只会白多一份与正常无异的 PDF 等人去删(回包已落盘, 修好后重跑这一步即可)。"""
@@ -742,12 +849,22 @@ def run_job(job, ids, got, log=print):
         log("  ✗ 门禁未过, 未出稿。修正后重新粘贴即可。")
         return None
 
+    # [v28.79] 第二道门(gate_after): 只读/不写缓存库的收尾门禁。正文走 adopt 时是
+    # deliver + import —— 放在**存底片之前**, 判退就停: 底片是"这一版译稿的存档点",
+    # 给一份被门禁拒收的稿子存档只会让人误以为它是要出稿的那一版。
+    for i, argv in enumerate(argv_list(job.get("gate_after"))):
+        a = subprocess.run(argv, cwd=D, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace")
+        for ln in (a.stdout or "").splitlines():
+            log("  " + ln)
+        if a.returncode != 0:
+            log("  ✗ 出稿门禁 %d 未过, 未出稿:\n%s" % (i + 1, (a.stderr or "")[-800:]))
+            return None
+
     if job.get("render"):                      # 渲染前存底片(只读); 做不出来 -> 冒泡, 不渲染
         _snapshot(log)
 
-    after = job.get("after")               # 工序表也是 lambda(惰性求路径), 先调再遍历
-    after = after() if callable(after) else (after or [])
-    for i, argv in enumerate(after):
+    for i, argv in enumerate(argv_list(job.get("after"))):   # 工序表也是 lambda, 先调再遍历
         a = subprocess.run(argv, cwd=D, capture_output=True, text=True,
                            encoding="utf-8", errors="replace")
         for ln in (a.stdout or "").splitlines():

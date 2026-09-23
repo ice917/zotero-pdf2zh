@@ -44,6 +44,7 @@ _HOME = os.path.expanduser("~")
 # 而不是写死** —— CACHE 没有 CLI 覆盖口, 写死等于"父进程按 next 算、子进程往 1.x 库写",
 # 那是最难发现的一类静默错(更新报成功, 渲染器读的却是另一个库)。
 import engine as _ENG                                     # noqa: E402
+import text_clean as _TC                                  # noqa: E402  不可见字符剥离(两侧同源)
 _PROF = _ENG.active()
 SIDECAR = _PROF.sidecar or ""
 CACHE = _PROF.cache_db
@@ -415,7 +416,10 @@ def inject_next(args):
         key = "S%d" % i
         if key not in imported:
             continue
-        new = imported[key].strip()
+        # [v28.80] 不可见字符体检: 落盘前最后一道 —— 写进库的东西会被渲染器**原样排到
+        # 纸上**(零宽字符在 PDF 里是看不见的乱码/CID 0)。剥离属归一化, 不参与判定:
+        # 本路线不做字符串定位, 没有"两侧"问题。
+        new = _TC.strip(imported[key].strip())
         # 页号只用于**报错时指路**, 取自 manifest(段表侧的锚定参数可能已不同, 见上)。
         pg = (m.get("parts") or [{}])[0].get("page")
         loc = "#S%d（第%s页%s）" % (
@@ -608,8 +612,12 @@ def main():
             key = "%d#%d" % (pg, seg)
             seg_o = pages[pg]["segs"][seg]
             raw_page = seg_o["raw"]
+            # cache_raw 是**缓存主键**, 必须与引擎写下的逐字节相同 —— 两侧都不动它。
             cache_raw = renumber(raw_page, raw_page)
-            new_trans = renumber(imported[key], raw_page)
+            # [v28.80] 不可见字符体检(注入落盘前): 只剥**要写进去的译文**, 且剥在
+            # renumber **之前** —— 夹在 `{v` 与数字之间的零宽字符会让重编号看不见这个
+            # 占位符。前置断言用的 cur_trans 同样不动(它比的是库里既有的行)。
+            new_trans = renumber(_TC.strip(imported[key]), raw_page)
 
             # 渲染契约: 新译文的占位符多重集 ⊆ raw 的多重集
             need = set(V_TOKEN.findall(cache_raw))
