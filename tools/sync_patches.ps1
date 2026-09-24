@@ -1,6 +1,6 @@
-﻿# 镜像同步脚本: venv/server 运行侧 → patches/ (单向)
+# 镜像同步脚本: venv/server 运行侧 → patches/ (单向)
 # 用法: powershell -ExecutionPolicy Bypass -File tools\sync_patches.ps1
-# 行为: 复制 13 个补丁文件到 patches/, 复制后逐文件 MD5 断言, 任一失败退出码 1
+# 行为: 复制 14 个补丁文件到 patches/, 复制后逐文件 MD5 断言, 任一失败退出码 1
 # 配套: 同步后跑 tools\tests\run_all.py 回归(test_mirrors_sync 会再次核对)
 #
 # venv 侧 site-packages 从哪来(不焊死本机路径):
@@ -44,6 +44,7 @@ if ($nextSite) {
 $pairs = @(
     @{ src = Join-Path $venvSite 'pdf2zh\cache.py';                    dst = 'patches\pdf2zh_cache.py' },
     @{ src = Join-Path $venvSite 'pdf2zh\converter.py';                dst = 'patches\pdf2zh_converter.py' },
+    @{ src = Join-Path $venvSite 'pdf2zh\high_level.py';               dst = 'patches\pdf2zh_high_level.py' },
     @{ src = Join-Path $venvSite 'pdf2zh\translator.py';               dst = 'patches\pdf2zh_translator.py' },
     @{ src = Join-Path $venvSite 'pdfminer\encodingdb.py';             dst = 'patches\pdfminer_encodingdb.py' },
     @{ src = Join-Path $venvSite 'pdfminer\pdffont.py';                dst = 'patches\pdfminer_pdffont.py' },

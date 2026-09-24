@@ -11,7 +11,7 @@ from typing import Dict
 
 import numpy as np
 from pdfminer.converter import PDFConverter
-from pdfminer.layout import LTChar, LTFigure, LTLine, LTPage
+from pdfminer.layout import LTChar, LTFigure, LTImage, LTLine, LTPage
 from pdfminer.pdffont import PDFCIDFont, PDFUnicodeNotDefined
 from pdfminer.pdfinterp import PDFGraphicState, PDFResourceManager
 from pdfminer.utils import apply_matrix_pt, mult_matrix
@@ -245,10 +245,101 @@ class TranslateConverter(PDFConverterEx):
             self._segflow_doc_path = _doc
         return _latest, _doc
 
+    # [v29 扫描件清底] 判据与参数
+    RASTER_COVER_RATIO = 0.5   # 位图面积/页面积 ≥ 此值 → 视为「覆盖式位图」(扫描件)
+    WHITEN_PAD = 1.0           # 清底矩形外扩(磅), 兜住墨迹溢出行框
+    RUN_GAP_EM = 2.0           # 行内墨迹框合并的最大字间水平间隙(倍字号)
+    RUN_VOV_RATIO = 0.4        # 行内墨迹框合并所需的最小纵向重叠(占较矮框高度)
+
+    def _raster_covers_page(self, ltpage) -> bool:
+        """本页是否有「覆盖式位图」= 扫描件的整页墨迹。
+
+        为什么看位图: pdfinterp 组装成品页时是 `q {ops_base}Q ... cm {ops_new}` —— ops_base
+        为原页内容流**滤掉 T* 文字指令**后的产物(pdfinterp.py「过滤 T 系列文字指令」), 位图照留。
+        所以「某段底下有没有删不掉的墨迹」== 「本页有没有大幅位图」。有 → 重绘时先清底。
+
+        旁路: 环境变量 PDF2ZH_WHITEN_SCAN=0 关闭本特性(出问题可秒关, 也用于 A/B 对照)。
+        """
+        if os.environ.get("PDF2ZH_WHITEN_SCAN", "1") == "0":
+            return False
+        try:
+            (px0, py0, px1, py1) = ltpage.bbox
+            page_area = abs((px1 - px0) * (py1 - py0))
+            if page_area <= 0:
+                return False
+            for item in ltpage:
+                if isinstance(item, LTImage):
+                    imgs = [item]
+                elif isinstance(item, LTFigure):
+                    imgs = [c for c in item if isinstance(c, LTImage)]
+                else:
+                    continue
+                for im in imgs:
+                    (x0, y0, x1, y1) = im.bbox
+                    if abs((x1 - x0) * (y1 - y0)) / page_area >= self.RASTER_COVER_RATIO:
+                        return True
+        except Exception:
+            log.debug("raster cover 判定失败, 本页不清底", exc_info=True)
+        return False
+
+    def _push_ink(self, ink: list, run, child):
+        """把字符并进当前墨迹行框 `run`; 跨行或跨大间隙则另起一框, 返回新的 run。
+
+        合并条件(必须同时满足)才认定"同一行同一段连续文字":
+          · 与当前框纵向重叠 > RUN_VOV_RATIO × 较矮框高  → 排除换行
+          · 与当前框右缘水平间隙 ≤ RUN_GAP_EM × 字号      → 排除跨列/跨大块留白
+        于是「散布在一张图里的几个文字层字符」各自成框, 不会并成覆盖整图的大框。
+        """
+        b = [child.x0, child.y0, child.x1, child.y1]
+        if run is None:
+            ink[-1].append(b)
+            return b
+        vov = min(b[3], run[3]) - max(b[1], run[1])
+        hmin = min(b[3] - b[1], run[3] - run[1])
+        if vov > self.RUN_VOV_RATIO * hmin and (b[0] - run[2]) <= self.RUN_GAP_EM * child.size:
+            run[0] = min(run[0], b[0])
+            run[1] = min(run[1], b[1])
+            run[2] = max(run[2], b[2])
+            run[3] = max(run[3], b[3])
+            return run
+        ink[-1].append(b)
+        return b
+
+    def _whiten_ops(self, ink: list, news: list) -> str:
+        """为**被重绘的源文字行框**铺白 —— 底图墨迹先让位, 译文再压上。
+
+        与 BabelDOC `ocr_workaround` 同法(白矩形画在最底层), 差别在**范围**: 取逐行紧致
+        墨迹框(ink, 见 receive_layout 内 run 合并), 而非「段落包围盒 ∪ 版面区域框」。
+
+        为什么不用段落包围盒: pstk 的 x0..y1 是逐字符取并集得到的, 而**保留区域**
+        (layout 里 cls==0: abandon/figure/table/isolate_formula/formula_caption)内的
+        OCR 字符也会并进去 —— 一张图里若散布几个文字层字符, 段落盒就被撑到覆盖整张图,
+        铺白即抹图(实测 Johnson p2 右侧图区 8600 px 墨迹被一次抹掉)。逐行紧致框不会
+        跨越大间隙, 图区自然不被覆盖。
+
+        该段若没渲出任何东西(news 为空), 则不清底 —— 否则源文被抹而译文没来, 涂出空白。
+        """
+        parts = []
+        for i in range(min(len(ink), len(news))):
+            if not (news[i] or "").strip():
+                continue
+            for (x0, y0, x1, y1) in ink[i]:
+                w, h = x1 - x0, y1 - y0
+                if w <= 0 or h <= 0:
+                    continue
+                parts.append("%f %f %f %f re f " % (
+                    x0 - self.WHITEN_PAD, y0 - self.WHITEN_PAD,
+                    w + 2 * self.WHITEN_PAD, h + 2 * self.WHITEN_PAD))
+        if not parts:
+            return ""
+        return "q 1 1 1 rg " + "".join(parts) + "Q "
+
     def receive_layout(self, ltpage: LTPage):
         # 段落
         sstk: list[str] = []            # 段落文字栈
         pstk: list[Paragraph] = []      # 段落属性栈
+        ink: list[list[list[float]]] = []   # [v29] 与 pstk 平行: 每段的「紧致墨迹行框」组
+        run = None                      # [v29] 当前正在累积的行框(见 _push_ink)
         vbkt: int = 0                   # 段落公式括号计数
         # 公式组
         vstk: list[LTChar] = []         # 公式符号组
@@ -262,7 +353,8 @@ class TranslateConverter(PDFConverterEx):
         # 全局
         lstk: list[LTLine] = []         # 全局线条栈
         xt: LTChar = None               # 上一个字符
-        xt_cls: int = -1                # 上一个字符所属段落，保证无论第一个字符属于哪个类别都可以触发新段落
+        xt_cls: int = -2                # 上一个字符所属段落，保证无论第一个字符属于哪个类别都可以触发新段落
+                                        # [v29] 哨兵取 -2: high_level 现在用 -1 表示图/表区(见 graphic_cls)
         vmax: float = ltpage.width / 4  # 行内公式最大宽度
         ops: str = ""                   # 渲染结果
 
@@ -318,7 +410,7 @@ class TranslateConverter(PDFConverterEx):
                     cls = 0
                 # 判定当前字符是否属于公式
                 if (                                                                                        # 判定当前字符是否属于公式
-                    cls == 0                                                                                # 1. 类别为保留区域
+                    cls <= 0                                                                                # 1. 类别为保留区域(-1 图/表区, 0 页眉页脚/公式区)
                     or (cls == xt_cls and len(sstk[-1].strip()) > 1 and child.size < pstk[-1].size * 0.79)  # 2. 角标字体，有 0.76 的角标和 0.799 的大写，这里用 0.79 取中，同时考虑首字母放大的情况
                     or vflag(child.fontname, child.get_text())                                              # 3. 公式字体
                     or (child.matrix[0] == 0 and child.matrix[3] == 0)                                      # 4. 垂直字体
@@ -368,6 +460,8 @@ class TranslateConverter(PDFConverterEx):
                     else:                           # 根据当前字符构建一个新的段落
                         sstk.append("")
                         pstk.append(Paragraph(child.y0, child.x0, child.x0, child.x0, child.y0, child.y1, child.size, False))
+                        ink.append([])              # [v29] 段落的墨迹行框组
+                        run = None                  # [v29] 段落边界处必须断框
                 if not cur_v:                                               # 文字入栈
                     if (                                                    # 根据当前字符修正段落属性
                         child.size > pstk[-1].size                          # 1. 当前字符比段落字体大
@@ -389,6 +483,8 @@ class TranslateConverter(PDFConverterEx):
                 pstk[-1].x1 = max(pstk[-1].x1, child.x1)
                 pstk[-1].y0 = min(pstk[-1].y0, child.y0)
                 pstk[-1].y1 = max(pstk[-1].y1, child.y1)
+                if ink and cls >= 0:                            # [v29] 记录紧致墨迹行框(清底用)
+                    run = self._push_ink(ink, run, child)       #       cls<0 图/表区: 墨迹是图本身, 不入框
                 # 更新上一个字符
                 xt = child
                 xt_cls = cls
@@ -961,6 +1057,9 @@ class TranslateConverter(PDFConverterEx):
                 ops_list.append(gen_op_line(l.pts[0][0], l.pts[0][1], l.pts[1][0] - l.pts[0][0], l.pts[1][1] - l.pts[0][1], l.linewidth))
 
         ops = f"BT {''.join(ops_list)}ET "
+        # [v29 扫描件清底] 扫描页(覆盖式位图)在重绘前先清底; 只遮被重绘的源文字行框
+        if isinstance(ltpage, LTPage) and self._raster_covers_page(ltpage):
+            ops = self._whiten_ops(ink, news) + ops
         return ops
 
 

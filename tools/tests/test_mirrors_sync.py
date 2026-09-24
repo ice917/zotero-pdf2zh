@@ -14,6 +14,10 @@
 PDF2ZH_NEXT_VENV_SITE → PDF2ZH_NEXT_PYTHON 同级 → 同 envs 目录下的
 zotero-pdf2zh-next-venv; 都找不到则该两项 SKIP(公开克隆不该满屏红)。
 
+[v29] 清单 13 → 14: 补 pdf2zh/high_level.py —— 扫描件清底需要在版面产物里把
+**图/表区**从其余保留区(页眉页脚/公式)中分出来(记 -1 vs 0), 否则清底会把图抹白。
+此前该文件是上游原版、不在门禁内, 现在有改动就必须进清单。
+
 运行: 任意 python 均可 (不依赖 pdf2zh), 退出码 0=全部一致
 """
 import sys, os, hashlib
@@ -50,6 +54,7 @@ SITES = {"main": VENV_SITE, "next": NEXT_VENV_SITE, "repo": REPO}
 MIRRORS = {
     "pdf2zh_cache.py": ("main", os.path.join("pdf2zh", "cache.py")),
     "pdf2zh_converter.py": ("main", os.path.join("pdf2zh", "converter.py")),
+    "pdf2zh_high_level.py": ("main", os.path.join("pdf2zh", "high_level.py")),
     "pdf2zh_translator.py": ("main", os.path.join("pdf2zh", "translator.py")),
     "pdfminer_encodingdb.py": ("main", os.path.join("pdfminer", "encodingdb.py")),
     "pdfminer_pdffont.py": ("main", os.path.join("pdfminer", "pdffont.py")),
