@@ -20,8 +20,14 @@ manifest 的 true_page, 故本测试同时锁死 part_true_page 的三级退化�
 (subprocess) 的沙箱, 故埋点"到底会不会落盘、会不会改退出码"也在这里验 ——
 埋点若永不触发就等于没有。
 
-⑩ 节 [v28.83] 锁返工单「必须改」一节的**分栏**(甲"载荷没译完 -> 补译" / 乙"只差一串
-字符 -> 写回"): 判据 fail_where 用 9 篇真译文的 26 处真 FAIL 逐条对账验证过。
+⑩ 节 [v30.6] 锁返工单「必须改」一节的**分组**与**印行**: 分组只看 fail_where 的**证据**
+(「其后全未落地」-> 甲 / 「其后有落地」-> 乙 / 「无从判定」-> 甲, 拿不准就给安全的那条),
+且单子里**不出现任何百分数** —— 旧版那句"本字形在载荷 98% 处，交付只写到 53%"把"位置%"
+与"长度比"两个量纲并排, 实测 #S44 被它引着去"补一个字符"(见 改动记录 v30.6)。
+
+⑪ 节 [v30.6] 锁**同值字形**: 版面里同一个字常是好几个独立字形对象, 回锚只问"取值能否定位
+到", 故交付里少一个时报哪个字形号是任意的 —— 实测 #S44 报的正是**已经译对**的 `AtU6p` 那个
+`6`。于是「原文里它在哪」一栏把同值的几处**一起列**, 超过 SAME_VALUE_MAX 只报计数。
 
 运行: venv python test_seg_rework.py, 退出码 0=全过
 """
@@ -134,6 +140,35 @@ def main():
           SI.glyph_context(iv_raw, iv_vv, "0") == "AAxyBB",
           repr(SI.glyph_context(iv_raw, iv_vv, "0")))
 
+    # ---- ⑩0 [v30.6] fail_where 的**三态**: 直接调函数, 不绕单子 ----
+    # 载荷 {v0} / {v1} / {v2} 三个字形; "交付"用 fixed 串表示(含 {vN} 即落地)。
+    r5 = "Alpha {v0} done, the tail carries {v1} and {v2} yet."
+    v5 = {"0": "ok", "1": "3", "2": "7"}
+    k1, a1, l1, _t1 = SI.fail_where(r5, v5, "{v0} 完成，", "1")
+    check("⑩0 其后有占位符、一个都没落地 -> 全未落地",
+          k1 == SI.EV_ALL_MISSING and a1 == ["{v2}='7'"] and l1 == 0, (k1, a1, l1))
+    k2, a2, l2, _t2 = SI.fail_where(r5, v5, "{v0} 完成，", "2")
+    check("⑩0 其后没有可落地的占位符 -> 无从判定(不编理由)",
+          k2 == SI.EV_NONE and a2 == [] and l2 == 0, (k2, a2, l2))
+    k3, a3, l3, _t3 = SI.fail_where(r5, v5, "{v0} {v1} {v2}", "1")
+    check("⑩0 其后有占位符且落地 -> 其后有落地",
+          k3 == SI.EV_LANDED and a3 == [] and l3 == 1, (k3, a3, l3))
+    # 纯符号字形按设计丢弃、永远不落地 -> 不能当证据(否则"其后全未落地"会被标点灌水):
+    # 目标字形是 {v0}, 其后先有 {v1}='-'(纯符号), 再有 {v2}='7' -> 清单里只该有 {v2}。
+    r6, v6 = "Alpha {v0} done {v1} tail {v2}.", {"0": "ok", "1": "-", "2": "7"}
+    k4, a4, _l4, _t4 = SI.fail_where(r6, v6, "{v0} 完成", "0")
+    check("⑩0 纯符号字形不算证据", k4 == SI.EV_ALL_MISSING and a4 == ["{v2}='7'"], (k4, a4))
+
+    # ---- ⑪ [v30.6] 同值字形: **报错的那一处不一定是缺的那一处** ----
+    # 版面里同一个字常是多个独立字形对象(#S44: `AtU6p` 的 `6` 与 `Arabidopsis U6` 的 `6`),
+    # 而回锚只问"取值能否定位到" -> 交付里少一个 `6` 时报哪个字形号是任意的。所以返工单要把
+    # 同值的几处**一起列**, 否则会把译者指向一段已经译对的地方。
+    r7 = "An Arabidopsis U{v0} promoter using pICH{v1}p as the"
+    v7 = {"0": "6", "1": "6"}
+    check("⑪ 同值字形全找得到(含报错那一处)",
+          SI.same_value_glyphs(r7, v7, "6") == ["0", "1"], SI.same_value_glyphs(r7, v7, "6"))
+    check("⑪ 取值不同就不并入", SI.same_value_glyphs(r7, v7, "7") == [], None)
+
     with tempfile.TemporaryDirectory(prefix="p2z_seg_rework_") as tmp:
         # ---- ③ FAIL: 落返工单, 报真实页码 + 段号 + 缺的字符 + 原文线索 ----
         root, sp, mp = sandbox(tmp)
@@ -154,10 +189,12 @@ def main():
               "需返工 1 段 / 1 处字符没有落点" in note_txt, note_txt[:300])
         check("③ 没有别的小节时不空编号",
               "## 一、必须改" in note_txt and "## 二、" not in note_txt, note_txt)
-        # [v28.83] 分栏: 本段载荷里 {v29}(='3') 之后还有 {v0}(='alpha') 锚上了,
-        # 说明句子本身译了、只是这一串没写出来 -> 乙栏; 甲栏"回载荷补译"那套不该出现。
+        # [v30.6] 分组: 本段载荷里 {v29}(='3') 之后还有 {v0}(='alpha') 落了地 -> 证据是
+        # 「其后有落地」-> 乙栏; 甲栏那套不该出现。底线那句话永远附在乙栏末尾。
         check("③ 只差一串字符的段落落在「乙」栏",
               "**乙栏" in note_txt and "**甲栏" not in note_txt, note_txt[:900])
+        check("③ 乙栏附底线(原样写回仍不过就回载荷补齐)",
+              "若原样写回后这一处仍判 FAIL" in note_txt, note_txt[:1200])
         check("③ 控制台改成真实页口径",
               "第6页" in out and "p9#" not in out, out)
         check("③ 控制台点出返工单路径", "返工单:" in out and note in out, out)
@@ -221,25 +258,96 @@ def main():
         check("⑧ 截断不影响「必须改」分节",
               "## 一、其他门禁失败" in n4 and "## 二、不必改" in n4, n4[:300])
 
-        # ---- ⑩ [v28.83] 「必须改」按**修法**分栏: 段尾没译 -> 甲(补译) ----
-        # 判据见 seg_import.fail_where: 载荷里本字形**之后**还有没有别的字形锚上了。
-        # 用 9 篇真译文的 26 处真 FAIL 逐条对账验证过 -> 20/21 例与人工判读一致(见
-        # 改动记录 9.7.3); 这里锁的是"渲染出来确实分了栏、且甲栏带载荷后半句"。
+        # ---- ⑩ [v30.6] 三态在**真单子**上的印行, 以及"单子里不出现百分数"的全篇守卫 ----
+        # 段落分组: 只要有一处**不是**「其后有落地」就整段进甲(甲的指令是乙的超集);
+        # 没有证据时**什么理由都不写**, 只给安全的那条指令。
         man5 = {"name": NAME, "items": [
             {"key": "S1", "merged": False,
              "parts": [{"page": 9, "seg": 0, "true_page": 6}]}]}
-        side5 = [{"page": 9, "pageid": 5, "vars": {"0": "ok", "1": "3"},
-                  "segs": [{"raw": "Alpha {v0} done, and the tail carries {v1} yet."}]}]
+
+        # ⑩a 其后有占位符、一个都没落地 -> 甲栏, 并把没落地的那些列出来
+        side5 = [{"page": 9, "pageid": 5, "vars": {"0": "ok", "1": "3", "2": "7"},
+                  "segs": [{"raw":
+                            "Alpha {v0} done, the tail carries {v1} and {v2} yet."}]}]
         root5, sp5, mp5 = sandbox(tmp, manifest=man5, sidecar=side5)
-        # 交付只译了前半句: {v0} 锚上了, 段尾的 {v1} 落在没译的那半截里
+        # 交付只译了前半句: {v0} 落地, {v1}/{v2} 都落在没译的那半截里
         rc, out, err, note5 = run_import(root5, sp5, mp5, "#S1\nAlpha ok 完成，\n")
         n5 = read(note5) if os.path.exists(note5) else ""
-        check("⑩ 段尾没译的段落进「甲」栏(不混进乙栏)",
+        check("⑩a 全未落地的段落进「甲」栏(不混进乙栏)",
               rc == 1 and "**甲栏" in n5 and "**乙栏" not in n5, (rc, n5[:600]))
-        check("⑩ 甲栏附载荷后半句(照它把没译的补上)",
-              "载荷这一段的后半" in n5 and "the tail carries" in n5, n5)
-        check("⑩ 甲栏的旁证是位置/长度, 不是判据",
-              "位置对照" in n5 and "本字形在载荷" in n5, n5)
+        check("⑩a 印出「其后 N 个占位符均未落地」并列出它们",
+              "其后 1 个占位符**均未落地**" in n5 and "`{v2}='7'`" in n5, n5[:900])
+        check("⑩a 附载荷末段(照它把缺的补齐)",
+              "载荷末段" in n5 and "the tail carries" in n5, n5[:900])
+
+        # ⑩b 其后**没有**可落地的占位符(#S44 形状) -> 不编理由, 也不印任何读数
+        side6 = [{"page": 9, "pageid": 5, "vars": {"0": "ok", "1": "3"},
+                  "segs": [{"raw": "Alpha {v0} done at {v1}"}]}]
+        root6, sp6, mp6 = sandbox(tmp, manifest=man5, sidecar=side6)
+        rc, out, err, note6 = run_import(root6, sp6, mp6, "#S1\nAlpha ok 完成\n")
+        n6 = read(note6) if os.path.exists(note6) else ""
+        check("⑩b 无从判定的段落仍给安全指令(甲栏)",
+              rc == 1 and "**甲栏" in n6 and "**乙栏" not in n6, (rc, n6[:600]))
+        check("⑩b 没有证据就不写理由, 也不印位置对照",
+              "均未落地" not in n6 and "位置对照" not in n6
+              and "本字形在载荷" not in n6, n6[:900])
+        check("⑩b 单子里不出现「没译完」这种断言",
+              "没译完" not in n6, n6[:900])
+
+        # ⑩c 其后有占位符且落了地 -> 乙栏 + 底线那句告诫永远附上
+        side7 = [{"page": 9, "pageid": 5, "vars": {"0": "ok", "1": "3", "2": "7"},
+                  "segs": [{"raw": "Alpha {v0} done, {v1} skipped, tail {v2} here."}]}]
+        root7, sp7, mp7 = sandbox(tmp, manifest=man5, sidecar=side7)
+        rc, out, err, note7 = run_import(root7, sp7, mp7, "#S1\nAlpha ok 完成，tail 7 here\n")
+        n7 = read(note7) if os.path.exists(note7) else ""
+        check("⑩c 有落地证据的段落进「乙」栏(不混进甲栏)",
+              rc == 1 and "**乙栏" in n7 and "**甲栏" not in n7, (rc, n7[:600]))
+        check("⑩c 乙栏印出「已在译文中落点」这条证据",
+              "已在译文中落点" in n7, n7[:900])
+        check("⑩c 乙栏的底线永远附上", "原样写回后这一处仍判 FAIL" in n7, n7[:1200])
+
+        # ⑩d 全篇守卫: 返工单里**不出现任何百分数**(位置%/长度比这类读数已全部撤下)
+        check("⑩d 单子里不出现任何百分数",
+              all("%" not in x for x in (n5, n6, n7)),
+              [x[x.find("## 一"):][:300] for x in (n5, n6, n7)])
+        # 同值只有一处时保持单行(别把所有单处都撑成分栏)
+        check("⑩d 同值只一处时仍是单行",
+              "原文里它在哪: " in n7 and "共 2 处" not in n7, n7[:900])
+
+        # ---- ⑪ [v30.6] 同值字形: **报错的那一处不一定是缺的那一处** ----
+        # 版面里同一个字常是多个独立字形对象, 而回锚只问"取值能否定位到" -> 交付里少一个
+        # 时报哪个字形号是任意的(#S44 实测: 报 `AtU6p` 的 `6`, 真缺的是 `Arabidopsis U6`
+        # 的 `6`)。单子只列报错那一处 = 把译者指向一段**已经译对**的地方, 故同值的一起列。
+        GAP = "z" * (2 * SI.GLYPH_CTX + 40)      # 隔开 > 2*半宽 -> 上下文互不重叠
+
+        # ⑪a 同一个 `6` 在载荷里两处, 交付里少写一个 -> 两处上下文都列出来
+        raw8 = GAP.join(["An Arabidopsis U{v0} promoter fragment", "using pICH{v1}p as the"])
+        side8 = [{"page": 9, "pageid": 5, "vars": {"0": "6", "1": "6"},
+                  "segs": [{"raw": raw8}]}]
+        root8, sp8, mp8 = sandbox(tmp, manifest=man5, sidecar=side8)
+        rc, out, err, note8 = run_import(root8, sp8, mp8, "#S1\nU6\n")
+        n8 = read(note8) if os.path.exists(note8) else ""
+        check("⑪a 同值两处一起列(不再只指报错那一处)",
+              rc == 1 and "载荷里 `6` 共 2 处" in n8
+              and "An Arabidopsis U6 promoter fragment" in n8
+              and "pICH6p as the" in n8, n8[:1200])
+        check("⑪a 同值并列也不印百分数", "%" not in n8, n8[:1200])
+
+        # ⑪b 同值处数超上限: 只列前 SAME_VALUE_MAX 处 + 报总处数(免得被同一串刷屏)
+        raw9 = GAP.join("part%d U{v%d} end" % (i, i) for i in range(5))
+        side9 = [{"page": 9, "pageid": 5,
+                  "vars": {str(i): "6" for i in range(5)},
+                  "segs": [{"raw": raw9}]}]
+        root9, sp9, mp9 = sandbox(tmp, manifest=man5, sidecar=side9)
+        rc, out, err, note9 = run_import(root9, sp9, mp9, "#S1\nU6\n")
+        n9 = read(note9) if os.path.exists(note9) else ""
+        indented = [x for x in n9.splitlines() if x.startswith("    - ")]
+        check("⑪b 每处报总处数、只列前 %d 处" % SI.SAME_VALUE_MAX,
+              "载荷里 `6` 共 5 处" in n9
+              and "同值字形共 5 处，其余不再列出" in n9, n9[:1200])
+        check("⑪b 每处上下文条数 = %d 条 + 1 条计数"
+              % SI.SAME_VALUE_MAX,
+              len(indented) == 4 * (SI.SAME_VALUE_MAX + 1), len(indented))
 
     # ---- ⑦ 名单为空(取不到论文名)时不写文件、不抛异常 ----
     check("⑦ 取不到 name 就不写单子",

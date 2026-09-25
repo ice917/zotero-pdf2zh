@@ -724,6 +724,47 @@ def spelt_numbers(text):
     return vals
 
 
+# [自研补丁 2026-09-24] 月份名同属"同一个数的两种写法"。
+# 载荷 `Received: 24 February 2022` 译成「收到：2022年2月24日」—— 中文日期把月份写成**裸
+# 数字**, 交付于是比载荷多出一个 `2`; `13 October 2022` -> 「2022年10月13日」多出一个 `10`。
+# 这与上面那批数词汉化是同一件事(载荷用字母写数、译文用阿拉伯数字), 只是 "February" 不在
+# 数词表里。实测 Hagihara 那篇 #S10/#S11 因此被拒(留空/半截/错位带全 0, 只这 2 条), 报告
+# 把改法指向数字, 而两段一个数字没丢。
+#
+# 豁免要**窄**: 只在月份名附近(±_MONTH_NEAR 字符内)出现数字时才算日期 —— 否则
+# "may be true" 里的 may 会白白把数字 5 放进豁免表, 幻觉数字就从那儿溜过去。
+_MONTH_NUM = {
+    "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
+    "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
+    "december": 12,
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "jun": 6, "jul": 7, "aug": 8,
+    "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,     # PDF 日期行常写缩写
+}
+# 长的排前面: 否则 "march" 会先被 "mar" 吃掉一半(全文替换靠 \b 挡住 remarkable 这类)
+_MONTH_RE = re.compile(r"\b(?:%s)\b"
+                       % "|".join(sorted(_MONTH_NUM, key=len, reverse=True)))
+_MONTH_NEAR = 12        # 月名前后多少字符内有数字, 才算"日期里的月"
+
+
+def month_numbers(text):
+    """载荷里**字母写的月份名**对应的月号(字符串集合), 供"日期汉化"豁免用。
+
+    只折算**日期上下文里**的月名: 月名 ±_MONTH_NEAR 字符内得有数字(日或年) ——
+    "may be"、"March forward" 这类普通用词不算, 免得把 5 / 3 白白放进豁免表。
+    """
+    t = text or ""
+    low = t.lower()
+    out = set()
+    for m in _MONTH_RE.finditer(low):
+        v = _MONTH_NUM.get(m.group(0))
+        if v is None:
+            continue
+        lo, hi = max(0, m.start() - _MONTH_NEAR), min(len(low), m.end() + _MONTH_NEAR)
+        if NUM_TOK.search(low[lo:hi]):
+            out.add(str(v))
+    return out
+
+
 def _inv_missing(src_toks, dst_toks):
     """载荷有、交付**缺**的 token(多重集差) —— 这才是"数字被改掉"。"""
     from collections import Counter
@@ -742,11 +783,14 @@ def _inv_hallucinated(src_toks, dst_toks, src_text=None):
 
     [2026-09-23] src_text 给"数词汉化"豁免用: 载荷写成英文单词的数(Four / One hundred)
     被译成阿拉伯数字(4 / 100%)不算"冒出" —— 同一个数字的两种写法, 详见 spelt_numbers。
+    [2026-09-24] 同一豁免再加一层"日期汉化": 载荷的英文月份名(24 February 2022)在中译里
+    写成裸数字(2022年2月24日)也不算"冒出" —— 详见 month_numbers。
     """
     seen = set(src_toks)
     extra = {x for x in dst_toks if x not in seen}
     if src_text:
         extra -= spelt_numbers(src_text)
+        extra -= month_numbers(src_text)
     return sorted(extra)
 
 
@@ -884,7 +928,9 @@ def write_gate_report(name, text_path, src, got, bad_cut, bad_inv, bands, gaps=(
              "（上标·下标数字如 `⁴` 与 `4` 视为同一个数字，算过；载荷里的数字在译文中"
              "**多出现几次**也算过 —— 中文要把英文省略的主语补出来, 数字会跟着复述。"
              "载荷把数字**拼成英文单词**的（`Four series`、`One hundred per cent`）译成"
-             "阿拉伯数字（4、100%）同样算过 —— 同一个数字的两种写法。"
+             "阿拉伯数字（4、100%）同样算过 —— 同一个数字的两种写法。载荷日期里的**英文"
+             "月份名**（`24 February 2022`）译成中文日期（2022年2月24日）同样算过 ——"
+             "月份写成裸数字是中文日期的写法。"
              "这一节只抓两件事: **载荷有的数字不见了**、**冒出载荷里没有的数字**）。")
     L.append("")
     L.append("每条都附**载荷原文 ↔ 你的译文**并排（长的留头尾）。改之前先把并排读一遍，"

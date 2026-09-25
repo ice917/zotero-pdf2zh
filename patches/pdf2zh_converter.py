@@ -130,6 +130,7 @@ class Paragraph:
         self.y1: float = y1  # 下边界
         self.size: float = size  # 字体大小
         self.brk: bool = brk  # 换行标记
+        self.cont_indent = None  # [v32] 列表条目续行缩进 x(正文悬挂缩进位); None=普通段落
 
 
 # fmt: off
@@ -250,6 +251,9 @@ class TranslateConverter(PDFConverterEx):
     WHITEN_PAD = 1.0           # 清底矩形外扩(磅), 兜住墨迹溢出行框
     RUN_GAP_EM = 2.0           # 行内墨迹框合并的最大字间水平间隙(倍字号)
     RUN_VOV_RATIO = 0.4        # 行内墨迹框合并所需的最小纵向重叠(占较矮框高度)
+    # [v30 扫描件图/表区] 图/表区的类别值(与 high_level 的 graphic_cls 约定一致)。
+    # 该区字符在**扫描页**上不重绘: 可见内容本来就在位图里, 文字层是隐形 OCR 复本。
+    GRAPHIC_CLS = -1
 
     def _raster_covers_page(self, ltpage) -> bool:
         """本页是否有「覆盖式位图」= 扫描件的整页墨迹。
@@ -339,6 +343,9 @@ class TranslateConverter(PDFConverterEx):
         sstk: list[str] = []            # 段落文字栈
         pstk: list[Paragraph] = []      # 段落属性栈
         ink: list[list[list[float]]] = []   # [v29] 与 pstk 平行: 每段的「紧致墨迹行框」组
+        pcls: list[int] = []            # [v30] 与 pstk 平行: 每段的版面类别(见 GRAPHIC_CLS)
+        plines: list[list[tuple]] = []  # [v31] 与 pstk 平行: 每段原文换行点 [(str偏移, x, y), ...]
+        plboxes: list[list[list[float]]] = []  # [v32] 与 pstk 平行: 每段**每行一个盒**(行内字符并集), 供解析期切段精确回填几何
         run = None                      # [v29] 当前正在累积的行框(见 _push_ink)
         vbkt: int = 0                   # 段落公式括号计数
         # 公式组
@@ -350,6 +357,8 @@ class TranslateConverter(PDFConverterEx):
         varl: list[list[LTLine]] = []   # 公式线条组栈
         varf: list[float] = []          # 公式纵向偏移栈
         vlen: list[float] = []          # 公式宽度栈
+        varcls: list[int] = []          # [v30] 与 var 平行: 公式组的版面类别(组内 cls 一致)
+        vcls: int = 0                   # [v30] 当前正在累积的公式组的类别(首字符的 cls)
         # 全局
         lstk: list[LTLine] = []         # 全局线条栈
         xt: LTChar = None               # 上一个字符
@@ -357,6 +366,9 @@ class TranslateConverter(PDFConverterEx):
                                         # [v29] 哨兵取 -2: high_level 现在用 -1 表示图/表区(见 graphic_cls)
         vmax: float = ltpage.width / 4  # 行内公式最大宽度
         ops: str = ""                   # 渲染结果
+        # [v30 扫描件图/表区] 本页是否扫描件(覆盖式位图)。判定只做一次, 供
+        # 「图/表区段落不重绘」与「重绘前清底」两处共用(同一把尺子, 不会不一致)。
+        _scan_page: bool = isinstance(ltpage, LTPage) and self._raster_covers_page(ltpage)
 
         def vflag(font: str, char: str):    # 匹配公式（和角标）字体
             if isinstance(font, bytes):     # 不一定能 decode，直接转 str
@@ -424,6 +436,30 @@ class TranslateConverter(PDFConverterEx):
                     if vbkt and child.get_text() == ")":
                         cur_v = True
                         vbkt -= 1
+                # [v31] 换行可见性修复: 换行点(新行首字符完全落在上一字符左侧)若恰逢
+                # 公式组未闭(vstk 非空)且新行首字符本身被判为公式类(cur_v), 旧逻辑
+                # 会跳过换行处理直接把该字符并进组 —— 参考文献"上行尾标点+下行编号"
+                # 被焊进同一 {vN}(实测 v191=',1926).3.'), 条目边界在字符串层彻底消失,
+                # 渲染期只能把整段熔成一行连排(条目互相重叠, 编号叠字)。
+                # 此处先行闭组、补空格、记 brk 与行位(plines), 使条目起点成为独立
+                # token。散文不受影响: 普通换行的下一行首字符是文字(非 cur_v), 走
+                # 原有闭组路径, 字符串逐字节不变, 缓存键不动。
+                if (
+                    cls == xt_cls
+                    and vstk
+                    and cur_v
+                    and child.x1 < xt.x0
+                ):
+                    if sstk[-1] == "":
+                        xt_cls = -1 # 与下方既有纯公式段落哨兵同语义(见该处注释)
+                    sstk[-1] += f"{{v{len(var)}}}"
+                    var.append(vstk)
+                    varl.append(vlstk)
+                    varf.append(vfix)
+                    varcls.append(vcls)
+                    vstk = []
+                    vlstk = []
+                    vfix = 0
                 if (                                                        # 判定当前公式是否结束
                     not cur_v                                               # 1. 当前字符不属于公式
                     or cls != xt_cls                                        # 2. 当前字符与前一个字符不属于同一段落
@@ -442,10 +478,16 @@ class TranslateConverter(PDFConverterEx):
                             vfix = vstk[0].y0 - child.y0
                         if sstk[-1] == "":
                             xt_cls = -1 # 禁止纯公式段落（sstk[-1]=="{v*}"）的后续连接，但是要考虑新字符和后续字符的连接，所以这里修改的是上个字符的类别
+                                        # [v30] 注意: -1 已被 high_level 占用为图/表区, 故本行会让紧跟其后的
+                                        # cls=-1 字符被误判为"同段"、并进本段落的一个新公式组(且该组随后被
+                                        # 记成 {vN} 画到本段落的落位上)。**这里不能改成 -2**: 改哨兵会改变
+                                        # sstk 分段 -> 前瞻上下文变 -> 缓存键变 -> 触发重译(违反守则 #1)。
+                                        # 该并组场景改由渲染期 varcls 门禁消掉(图区组不重绘), 见渲染期注释。
                         sstk[-1] += f"{{v{len(var)}}}"
                         var.append(vstk)
                         varl.append(vlstk)
                         varf.append(vfix)
+                        varcls.append(vcls)         # [v30] 本组类别(取组内首字符的 cls)
                         vstk = []
                         vlstk = []
                         vfix = 0
@@ -457,10 +499,15 @@ class TranslateConverter(PDFConverterEx):
                         elif child.x1 < xt.x0:      # 添加换行空格并标记原文段落存在换行
                             sstk[-1] += " "
                             pstk[-1].brk = True
+                            plines[-1].append((len(sstk[-1]), child.x0, child.y0))  # [v31] 行位(偏移指向新行首 token)
+                            plboxes[-1].append([child.x0, child.y0, child.x1, child.y1])  # [v32] 新行盒
                     else:                           # 根据当前字符构建一个新的段落
                         sstk.append("")
                         pstk.append(Paragraph(child.y0, child.x0, child.x0, child.x0, child.y0, child.y1, child.size, False))
                         ink.append([])              # [v29] 段落的墨迹行框组
+                        pcls.append(cls)            # [v30] 段落版面类别(-1 图/表区)
+                        plines.append([])           # [v31] 段落换行点记录
+                        plboxes.append([[child.x0, child.y0, child.x1, child.y1]])  # [v32] 首行行盒
                         run = None                  # [v29] 段落边界处必须断框
                 if not cur_v:                                               # 文字入栈
                     if (                                                    # 根据当前字符修正段落属性
@@ -471,6 +518,8 @@ class TranslateConverter(PDFConverterEx):
                         pstk[-1].size = child.size
                     sstk[-1] += child.get_text()
                 else:                                                       # 公式入栈
+                    if not vstk:                                            # [v30] 本组首个字符: 记下本组类别
+                        vcls = cls
                     if (                                                    # 根据公式左侧的文字修正公式的纵向偏移
                         not vstk                                            # 1. 当前字符是公式的第一个字符
                         and cls == xt_cls                                   # 2. 当前字符与前一个字符属于同一段落
@@ -483,6 +532,11 @@ class TranslateConverter(PDFConverterEx):
                 pstk[-1].x1 = max(pstk[-1].x1, child.x1)
                 pstk[-1].y0 = min(pstk[-1].y0, child.y0)
                 pstk[-1].y1 = max(pstk[-1].y1, child.y1)
+                _lb = plboxes[-1][-1]                           # [v32] 当前行盒随字符扩张
+                if child.x0 < _lb[0]: _lb[0] = child.x0
+                if child.y0 < _lb[1]: _lb[1] = child.y0
+                if child.x1 > _lb[2]: _lb[2] = child.x1
+                if child.y1 > _lb[3]: _lb[3] = child.y1
                 if ink and cls >= 0:                            # [v29] 记录紧致墨迹行框(清底用)
                     run = self._push_ink(ink, run, child)       #       cls<0 图/表区: 墨迹是图本身, 不入框
                 # 更新上一个字符
@@ -509,11 +563,146 @@ class TranslateConverter(PDFConverterEx):
             var.append(vstk)
             varl.append(vlstk)
             varf.append(vfix)
+            varcls.append(vcls)                 # [v30] 本组类别(取组内首字符的 cls)
         log.debug("\n==========[VSTACK]==========\n")
         for id, v in enumerate(var):  # 计算公式宽度
             l = max([vch.x1 for vch in v]) - v[0].x0
             log.debug(f'< {l:.1f} {v[0].x0:.1f} {v[0].y0:.1f} {v[0].cid} {v[0].fontname} {len(varl[id])} > v{id} = {"".join([ch.get_text() for ch in v])}')
             vlen.append(l)
+
+        # [v32] 编号列表(参考文献)**解析期切段**。版面模型(doclayout)只有 title/plain text/
+        # figure/table… 十类, **没有 reference/list 类** -> 整栏参考文献被熔成一个 cls 区,
+        # 解析期就是一个巨型段落; 渲染期对巨段按右边界连续重排, 条目互相重叠、编号叠字
+        # (实测 Hagihara 2022 Nat Commun p8 文献区 18 条熔成一段)。
+        # v31 曾把分段放在**渲染期**(译文流里 startswith 命中锚 token 时重置重排光标);
+        # v32 上移到解析期 —— 段落在源头就正确, 下游(翻译上下文/段表/渲染/审核)全部
+        # 自动按条目工作, 不再需要锚点魔法。
+        #
+        # 为什么"几何"能认出文献列表而放过散文: 悬挂缩进列表是标准散文的**镜像** ——
+        #   散文(段首缩进): 首行在 med+indent(右), 续行在 med(左) -> 左离群 0 个
+        #   列表(悬挂缩进): 条目首行在编号列(左), 续行在正文缩进位(右) -> 左离群=条目数
+        # 故"x < med - size"只捞列表条目首行, 普通散文段一个都不碰。
+        # 三道门(宁缺勿滥; 误切会把散文拆碎 -> 段落文本全变 -> 无谓重译):
+        #   1. 该段 ≥3 个原文换行点;
+        #   2. ≥2 个左离群换行点;
+        #   3. 离群行首解出编号 N(纯组文本 ≤6 字符防融合残留), 且严格 +1 递增
+        #      —— 行首年份/版本号过不了序列门(`_num_at` 只认 ≤3 位数字, 故 2018/
+        #      1990s 这类 4 位年份连编号都解不出来)。
+        #      起始编号 ≤3 = 从 1 开始的清单, 2 条即认; 起始编号 >3 = **跨页续排**的
+        #      参考文献(实测 p9 该段首条是 19, 整段 3818 字符 18 条目全被 `>3` 挡掉),
+        #      证据不足会误切散文, 故加码要求 ≥3 条。位数/严格 +1/几何离群三道门不变。
+        def _num_at(off, s):
+            sub = s[off:off + 48]
+            m = re.match(r"^\{v(\d+)\}", sub)
+            if m:
+                i = int(m.group(1))
+                if i < len(var):
+                    t = "".join(c.get_text() for c in var[i]).strip()
+                    if len(t) <= 6:
+                        m2 = re.match(r"^\(?\[?(\d{1,3})[.\)\]]", t)
+                        if m2:
+                            return int(m2.group(1))
+                return None
+            m2 = re.match(r"^\(?\[?(\d{1,3})[.\)\]]", sub)
+            return int(m2.group(1)) if m2 else None
+
+        def _list_cuts(pid):
+            """命中列表返回 (离群行偏移列表, 续行缩进位 med), 否则 None。"""
+            lines = plines[pid] if pid < len(plines) else []
+            if len(lines) < 3:
+                return None
+            s = sstk[pid]
+            xs = sorted(x for _, x, _ in lines)
+            med = xs[len(xs) // 2]
+            size = pstk[pid].size or 8.0
+            offs, nums = [], []
+            for off, x, _y in lines:
+                if x < med - 1.0 * size:
+                    n = _num_at(off, s)
+                    if n is not None:
+                        offs.append(off)
+                        nums.append(n)
+            if not offs:
+                return None
+            if len(offs) < (2 if nums[0] <= 3 else 3):
+                return None
+            if any(nums[i] != nums[i - 1] + 1 for i in range(1, len(nums))):
+                return None
+            return offs, med
+
+        def _split_list_paragraphs():
+            """把命中列表的巨段按条目拆成真段落; 未命中的段落原样不动。"""
+            plan = {}
+            for pid in range(len(pstk)):
+                r = _list_cuts(pid)
+                if r:
+                    plan[pid] = r
+            if not plan:
+                return
+            # 倒序替换: 大 pid 先拆, 不影响前面下标
+            for pid in sorted(plan, reverse=True):
+                offs, med = plan[pid]
+                s = sstk[pid]
+                size = pstk[pid].size
+                boxes = plboxes[pid] if pid < len(plboxes) else []
+                lines = plines[pid] if pid < len(plines) else []
+                # 每行起点: 第 0 行是段首(pstk 初始 x/y, 与建段处同源), 其后每行一个换行点
+                starts = [(0, pstk[pid].x, pstk[pid].y)] + [(o, x, y) for o, x, y in lines]
+                cuts = sorted({0} | {o for o in offs if 0 < o < len(s)})
+                nseg = len(cuts)
+                seg_lines = [[] for _ in range(nseg)]
+                for j in range(min(len(starts), len(boxes))):
+                    o = starts[j][0]
+                    k = nseg - 1
+                    for i in range(nseg - 1, -1, -1):
+                        if o >= cuts[i]:
+                            k = i
+                            break
+                    seg_lines[k].append(j)
+                if not seg_lines[0]:
+                    seg_lines[0].append(0)
+                new_s, new_p, new_pl, new_pb, new_pc = [], [], [], [], []
+                ranges = []
+                for k in range(nseg):
+                    a = cuts[k]
+                    b = cuts[k + 1] if k + 1 < nseg else len(s)
+                    js = seg_lines[k]
+                    bx = [boxes[j] for j in js if j < len(boxes)]
+                    sx, sy = (starts[js[0]][1], starts[js[0]][2]) if js else (pstk[pid].x, pstk[pid].y)
+                    if bx:
+                        x0 = min(v[0] for v in bx)
+                        y0 = min(v[1] for v in bx)
+                        y1 = max(v[3] for v in bx)
+                    else:
+                        x0, y0, y1 = sx, sy, sy + (size or 8.0)
+                    # x1 用原段落右边界(整栏同宽), 不用本条目最右字符 —— 否则短行会让
+                    # 该条目提前折行; y0/y1 只用本条目自己的行(渲染期靠 height 定行距)
+                    p = Paragraph(sy, sx, x0, pstk[pid].x1, y0, y1, size, True)
+                    p.cont_indent = med           # 条目内续行回到正文缩进位(悬挂缩进)
+                    new_p.append(p)
+                    new_s.append(s[a:b])
+                    new_pl.append([(o - a, x, y) for (o, x, y) in lines if a <= o < b])
+                    new_pb.append([list(v) for v in bx])
+                    new_pc.append(pcls[pid])
+                    ranges.append((y0, y1))
+                # 墨迹行框(清底用)按竖向归属分给各子段: zip(ink, news) 要求同长同序
+                per = [[] for _ in range(nseg)]
+                for box in (ink[pid] if pid < len(ink) else []):
+                    cy = (box[1] + box[3]) / 2.0
+                    best, bd = 0, None
+                    for k, (lo, hi) in enumerate(ranges):
+                        d = 0.0 if lo <= cy <= hi else min(abs(cy - lo), abs(cy - hi))
+                        if bd is None or d < bd:
+                            best, bd = k, d
+                    per[best].append(box)
+                sstk[pid:pid + 1] = new_s
+                pstk[pid:pid + 1] = new_p
+                plines[pid:pid + 1] = new_pl
+                plboxes[pid:pid + 1] = new_pb
+                pcls[pid:pid + 1] = new_pc
+                ink[pid:pid + 1] = per
+
+        _split_list_paragraphs()
 
         ############################################################
         # B. 段落翻译
@@ -539,6 +728,11 @@ class TranslateConverter(PDFConverterEx):
         def _lookahead_of(i: int) -> str:
             if i + 1 >= len(sstk):
                 return ""
+            # [v32] 列表条目(参考文献/编号列表)不参与跨页前瞻: 条目是**独立板面块**,
+            # 不是"被页界切断的半句"; 且译文按"整条照抄"政策原样保留, 注入下一段的
+            # 开头只会改缓存键并在条目里塞进不属于它的文字。
+            if pstk[i].cont_indent is not None:
+                return ""
             if not _ends_mid_sentence(sstk[i]):
                 return ""
             # 跨页对之间常夹着页码/页眉/页脚小段(实测 "198" "M.C. Mandujano
@@ -549,6 +743,8 @@ class TranslateConverter(PDFConverterEx):
             for j in range(i + 1, min(i + 4, len(sstk))):
                 nxt = sstk[j]
                 if not nxt.strip() or re.match(r"^\{v\d+\}$", nxt.strip()):
+                    continue
+                if pstk[j].cont_indent is not None:  # [v32] 也不透过列表条目往前找续段
                     continue
                 if _starts_lowercase(nxt):
                     head = nxt.lstrip()[:120]
@@ -833,6 +1029,9 @@ class TranslateConverter(PDFConverterEx):
                 var.append(body_chars)
                 varl.append([])
                 varf.append(0)
+                # [v30] varcls 与 var 必须同生同长(渲染期要按组查类别): 本组是从原 {vN}
+                # 组里派生的(body_chars 取自 var[idx]), 类别沿用原组。
+                varcls.append(varcls[idx])
                 # 宽度按主体首尾字符的横向跨度重算, 供排版用
                 try:
                     _l = max(c.x1 for c in body_chars) - body_chars[0].x0
@@ -920,6 +1119,16 @@ class TranslateConverter(PDFConverterEx):
             return f"ET q 1 0 0 1 {x:f} {y:f} cm [] 0 d 0 J {linewidth:f} w 0 0 m {xlen:f} {ylen:f} l S Q BT "
 
         for id, new in enumerate(news):
+            if _scan_page and pcls[id] <= self.GRAPHIC_CLS:
+                # [v30 扫描件图/表区] 该段落在图/表区(figure/table)。扫描页的可见内容
+                # 本来就在覆盖式位图里, 这里的文字层只是**隐形 OCR 复本**(源文整页只有
+                # 一条 3 Tr), 段内字符被 cls<=0 判成"公式"原样重绘 —— 后果三重放大:
+                #   ① 落位丢失: 按重排光标 x + vch.x0 - var[vid][0].x0 定位(实测偏移
+                #      x-192.3, y+114.5), 图内数字/表头被画到正文流上;
+                #   ② 隐形变可见: Tr 由 3 变 0, 灰色 OCR 复本变成黑字;
+                #   ③ 与控制图轴/表线叠印成重影。
+                # 跳过即"让位图说话": 内容零损失(可见像素本就来自位图), 三重放大同时消除。
+                continue
             x: float = pstk[id].x                       # 段落初始横坐标
             y: float = pstk[id].y                       # 段落初始纵坐标
             x0: float = pstk[id].x0                     # 段落左边界
@@ -933,6 +1142,9 @@ class TranslateConverter(PDFConverterEx):
             tx = x
             fcur_ = fcur
             ptr = 0
+            # [v32] 列表条目续行缩进位: 条目首行在编号列, 续行回到正文缩进位
+            # (悬挂缩进)。普通段落 cont_indent 为 None -> 续行回段落左边界, 与原行为一致。
+            _indent = pstk[id].cont_indent if pstk[id].cont_indent is not None else x0
             log.debug(f"< {y} {x} {x0} {x1} {size} {brk} > {sstk[id]} | {new}")
 
             ops_vals: list[dict] = []
@@ -979,40 +1191,64 @@ class TranslateConverter(PDFConverterEx):
                             "x": tx,
                             "dy": 0,
                             "rtxt": raw_string(fcur, cstk),
-                            "lidx": lidx
+                            "lidx": lidx,
                         })
                         cstk = ""
                 if brk and x + adv > x1 + 0.1 * size:  # 到达右边界且原文段落存在换行
-                    x = x0
+                    x = _indent
                     lidx += 1
                 if vy_regex:  # 插入公式
                     fix = 0
                     if fcur is not None:  # 段落内公式修正纵向偏移
                         fix = varf[vid]
-                    for vch in var[vid]:  # 排版公式字符
+                    # [v30 扫描件图/表区] 该公式组整组落在图/表区(cls=-1): 组内字符是覆盖式位图
+                    # 里已有内容的**隐形 OCR 复本**(源文整页只有一条 3 Tr)。重绘它只会把组内字符
+                    # 按本段落落位偏移到别处、并把 Tr 由 3 变 0 变成可见黑字 —— 这就是重影。
+                    # 为什么段落级门禁之外还要守一道: 纯公式段落会把紧随其后的 cls=-1 字符并进来
+                    # (见 A 段 `xt_cls = -1` 处注释), 这种组的宿主段落不是图/表区段落, 段落级判据
+                    # 抓不到它, 只能按**组**判。
+                    _vch, _vl = var[vid], varl[vid]
+                    # [v33 原生页图/表区组绝对锚定] 图/表区组(varcls<=GRAPHIC_CLS)一旦落在
+                    # **原生数字页**上, 不能按段落流落位 —— 它不在任何文字流里, 而是图上的
+                    # 一批独立墨迹(面板字母 a-f、坐标刻度、基因型/P 值、比例尺文字)。这类组
+                    # 只可能出现在**纯占位符段落**里(解析期哨兵 xt_cls=-1 与 GRAPHIC_CLS=-1
+                    # 撞号, 见 A 段注释; 而该哨兵只在"段落尚无文字"时设置, 故含图区组的段落
+                    # 必为纯占位段落), 实测 Hagihara p4: seg0=38 组 / seg2=61 组。按段落流
+                    # 落位时, 第 2..N 组被"段落光标 x + 组宽累加"和"段落基线 y + fix(组相对前
+                    # 一字符的纵向偏移)"推出原位 —— delta 实测标签漂移 ±129/±277pt 并被压到
+                    # 同一 y 带, 叠图即"图像乱了"。
+                    # 定位语义: 图区墨迹的**绝对坐标**就是它的正确落点, 故直接取组内每个字符
+                    # 自身的 x0/y0 落位(不再参与光标累进与行号位移), 与源文逐字重合。
+                    # 为何不是"核查件那样不重绘": ops_base 已滤掉全部 T 系列指令(pdfinterp
+                    # `过滤 T 系列文字指令`), 成品页里所有文字都是重绘的 —— 不画就是丢标签;
+                    # 扫描页可见像素本就来自位图, 才走"不重绘"分支(见上)。
+                    _gabs = varcls[vid] <= self.GRAPHIC_CLS
+                    if _scan_page and _gabs:
+                        _vch, _vl = (), ()      # 整组不重绘(位图里已有)
+                    for vch in _vch:  # 排版公式字符
                         vc = chr(vch.cid)
                         ops_vals.append({
                             "type": OpType.TEXT,
                             "font": self.fontid[vch.font],
                             "size": vch.size,
-                            "x": x + vch.x0 - var[vid][0].x0,
-                            "dy": fix + vch.y0 - var[vid][0].y0,
+                            "x": vch.x0 if _gabs else x + vch.x0 - var[vid][0].x0,
+                            "dy": (vch.y0 - y) if _gabs else fix + vch.y0 - var[vid][0].y0,
                             "rtxt": raw_string(self.fontid[vch.font], vc),
-                            "lidx": lidx
+                            "lidx": 0 if _gabs else lidx,
                         })
                         if log.isEnabledFor(logging.DEBUG):
                             lstk.append(LTLine(0.1, (_x, _y), (x + vch.x0 - var[vid][0].x0, fix + y + vch.y0 - var[vid][0].y0)))
                             _x, _y = x + vch.x0 - var[vid][0].x0, fix + y + vch.y0 - var[vid][0].y0
-                    for l in varl[vid]:  # 排版公式线条
+                    for l in _vl:  # 排版公式线条
                         if l.linewidth < 5:  # hack 有的文档会用粗线条当图片背景
                             ops_vals.append({
                                 "type": OpType.LINE,
-                                "x": l.pts[0][0] + x - var[vid][0].x0,
-                                "dy": l.pts[0][1] + fix - var[vid][0].y0,
+                                "x": l.pts[0][0] if _gabs else l.pts[0][0] + x - var[vid][0].x0,
+                                "dy": (l.pts[0][1] - y) if _gabs else l.pts[0][1] + fix - var[vid][0].y0,
                                 "linewidth": l.linewidth,
                                 "xlen": l.pts[1][0] - l.pts[0][0],
                                 "ylen": l.pts[1][1] - l.pts[0][1],
-                                "lidx": lidx
+                                "lidx": 0 if _gabs else lidx,
                             })
                 else:  # 插入文字缓冲区
                     if not cstk:  # 单行开头
@@ -1038,7 +1274,7 @@ class TranslateConverter(PDFConverterEx):
                     "x": tx,
                     "dy": 0,
                     "rtxt": raw_string(fcur, cstk),
-                    "lidx": lidx
+                    "lidx": lidx,
                 })
 
             line_height = default_line_height
@@ -1058,7 +1294,7 @@ class TranslateConverter(PDFConverterEx):
 
         ops = f"BT {''.join(ops_list)}ET "
         # [v29 扫描件清底] 扫描页(覆盖式位图)在重绘前先清底; 只遮被重绘的源文字行框
-        if isinstance(ltpage, LTPage) and self._raster_covers_page(ltpage):
+        if _scan_page:
             ops = self._whiten_ops(ink, news) + ops
         return ops
 

@@ -1791,7 +1791,7 @@ class PDFTranslator:
             qc_skip_last = int(getattr(config, 'skip_last_pages', 0) or 0)
             threading.Thread(
                 target=self._run_auto_qc,
-                args=(input_path, mono_for_qc, qc_skip_last),
+                args=(input_path, mono_for_qc, qc_skip_last, engine),
                 daemon=True,
             ).start()
 
@@ -1809,13 +1809,14 @@ class PDFTranslator:
             pass
         return sys.executable
 
-    def _run_auto_qc(self, input_path, mono_path, skip_last=0):
+    def _run_auto_qc(self, input_path, mono_path, skip_last=0, engine=''):
         """[自研补丁] 翻译成功后自动执行翻前体检与质检门禁（后台线程调用）"""
         # [自研补丁] 信号量限流: 批量翻译收尾时最多 2 个 QC 进程并发
         with _QC_SEMAPHORE:
-            self._run_auto_qc_locked(input_path, mono_path, skip_last=skip_last)
+            self._run_auto_qc_locked(input_path, mono_path, skip_last=skip_last,
+                                     engine=engine)
 
-    def _run_auto_qc_locked(self, input_path, mono_path, skip_last=0):
+    def _run_auto_qc_locked(self, input_path, mono_path, skip_last=0, engine=''):
         tools_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tools')
         qc_python = self._qc_python()
@@ -1823,8 +1824,27 @@ class PDFTranslator:
         post_args = [mono_path]
         if skip_last and skip_last > 0:
             post_args += ['--skip-last', str(skip_last)]
+        # [自研补丁 2026-09-24 v30.4] 第三道 = seg_check(段表口径「局部漏译」门禁)。
+        # 它和前两道**不同**: 看的是**段表**而不是产物 PDF, 所以必须知道是哪条产线 ——
+        # 画像靠 P2Z_ENGINE 透传(与 _run_tool 同一做法; 不透传会静默按缺省 1.x 去读
+        # latest.jsonl, 那是**别的篇**的段表)。next 还要 --name = 原文 stem
+        # (<working_root>/<stem>/translate_tracking.json, 见 tools/engine.py)。
+        # --skip-last 与 post_check 同一口径(任务实际跳页数)。退出码 1 = 有段回来是
+        # 英文的**候选清单**(需人工确认), 与前两道一样只打日志、不影响任务。
+        # 刻意**不加** --layout-cuts: 那要加载版面 onnx 模型整篇推理(数十秒级), 属
+        # 离线专项; 要覆盖类②(半词进保留区)切点时手工跑
+        #     python tools/seg_check.py --mono <m.pdf> --layout-cuts
+        seg_args = ['--pdf', os.path.abspath(input_path),
+                    '--mono', os.path.abspath(mono_path),
+                    '--skip-last', str(int(skip_last or 0))]
+        if engine == pdf2zh_next:
+            seg_args += ['--name', os.path.splitext(os.path.basename(input_path))[0]]
+        qc_env = dict(os.environ)
+        if engine:
+            qc_env['P2Z_ENGINE'] = engine
         commands = (('pre_check.py', [input_path]),
-                    ('post_check.py', post_args))
+                    ('post_check.py', post_args),
+                    ('seg_check.py', seg_args))
         for script, script_args in commands:
             try:
                 script_path = os.path.join(tools_dir, script)
@@ -1835,7 +1855,7 @@ class PDFTranslator:
                 proc = subprocess.run(
                     [qc_python, '-X', 'utf8', script_path] + script_args,
                     capture_output=True, text=True, encoding='utf-8',
-                    errors='replace', timeout=300)
+                    errors='replace', timeout=300, env=qc_env)
                 if proc.returncode == 0:
                     status = 'PASS'
                 elif proc.returncode == 1:

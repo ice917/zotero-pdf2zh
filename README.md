@@ -330,6 +330,8 @@ python tools\appendix_species.py --pdf $out --redraw
 | `tools/force_rerender.py` | force 重渲染（防漏传 config 静默回落 bing 重译） |
 | `tools/verify_render.py` | 渲染验收：新串落页 / 旧串清零，13 项断言 |
 | `tools/post_check.py` | 翻译后质检门禁：汉化率 / 引用完整性 / 占位符残留 |
+| `tools/seg_check.py` | 段表口径门禁（补 post_check 交出的局部漏译监控）：逐段判「进过 LLM 吗、回来了吗」；含接缝切点读数（文本口径 + 原文坐标几何核验）；`--layout-cuts` 另扫版面切点（类② 唯一覆盖面，要跑版面模型，慢） |
+| `tools/layout_probe.py` | 版面类别图取证：逐字符打出 YOLO 版面类别 `cls`（跳变处 = 断段处），定位「词内切点」根因；`--compare` 三种采样口径对照；`--cuts` 整篇扫描版面切点（类② 的唯一覆盖面） |
 | `tools/pre_check.py` | 翻译前体检：文献页 / 扫描页 / 字体结构风险，坏 PDF 提交前拦截 |
 | `tools/pre_render_check.py` | 渲染前预检：用译文页特征提前判文献区，FAIL 就不渲染 |
 | `tools/seams_report.py` 等 | 接缝台账 / 专项审查 / 对照实验 |

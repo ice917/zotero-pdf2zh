@@ -824,6 +824,51 @@ def main():
     check("㉗k 端到端: 数词汉化段不再被拒收", rc == 0 and g11["state"] == "ok",
           (rc, g11, out[-200:]))
 
+    # ㉗l 单元: 月份名同属"同一个数的两种写法"(Hagihara 2026-09-24 #S10/#S11 的形状)
+    #      载荷 `Received: 24 February 2022` 译成「收到：2022年2月24日」—— 中文日期把月份
+    #      写成裸数字, 交付比载荷多出一个 `2`; 老判据判成"冒出载荷里没有的数字", 报告把
+    #      改法指向数字, 而这两段一个数字没丢(与 ㉗h 那批数词汉化同类, 月份名只是没在表里)。
+    check("㉗l Received: 24 February 2022 -> 收到：2022年2月24日 不算幻觉数字",
+          AD.diff_invariants("Received: 24 February 2022", "收到：2022年2月24日") == [],
+          AD.diff_invariants("Received: 24 February 2022", "收到：2022年2月24日"))
+    check("㉗l Accepted: 13 October 2022 -> 接受：2022年10月13日 不算幻觉数字",
+          AD.diff_invariants("Accepted: 13 October 2022", "接受：2022年10月13日") == [],
+          AD.diff_invariants("Accepted: 13 October 2022", "接受：2022年10月13日"))
+    check("㉗l 月份缩写也认, 且折算的是月号",
+          AD.month_numbers("Published: Feb. 24, 2022") == {"2"}
+          and AD.month_numbers("September 2019 issue") == {"9"},
+          (AD.month_numbers("Published: Feb. 24, 2022"),
+           AD.month_numbers("September 2019 issue")))
+    check("㉗l 嵌在别的词里的月份不认(remarkable / decimal)",
+          AD.month_numbers("a remarkable result in 2020 and a decimal in 3.5") == set(),
+          AD.month_numbers("a remarkable result in 2020 and a decimal in 3.5"))
+
+    # ㉗m 豁免要窄: 不是日期里的月份名不折算 —— 否则 "may be" 会把 5 白白放进豁免表
+    check("㉗m 普通用词里的月名不折算(may be / March forward)",
+          AD.month_numbers("This may be the case") == set()
+          and AD.month_numbers("March forward with the plan") == set(),
+          (AD.month_numbers("This may be the case"),
+           AD.month_numbers("March forward with the plan")))
+    check("㉗m 段里有 may 时, 译文冒出 5 仍判不符",
+          len(AD.diff_invariants("results may be noisy and repeatable",
+                                 "结果可能有 5 处噪声")) == 1,
+          AD.diff_invariants("results may be noisy and repeatable", "结果可能有 5 处噪声"))
+
+    # ㉗n 月份豁免不许盖住同一段的真漏(年份丢了仍要抓)
+    check("㉗n 月份豁免放行, 同一段丢了年份仍判不符",
+          len(AD.diff_invariants("Received: 24 February 2022", "收到：2月24日")) == 1,
+          AD.diff_invariants("Received: 24 February 2022", "收到：2月24日"))
+
+    # ㉗o 端到端: 日期段不再被门禁拒收(判据必须落到 deliver 上, 不能只在单元层)
+    reset(mk_manifest("g12", [[(1, 0)], [(1, 1)]]))
+    run(["export", "--name", "g12", "--pages", "1"])
+    mk_payload("g12", [(1, "Received: 24 February 2022"),
+                       (2, "Accepted: 13 October 2022")])
+    rc, out = deliver("g12", "#S1\n收到：2022年2月24日\n#S2\n接受：2022年10月13日\n")
+    g12 = AD.load_ledger("g12")["stages"]["deliver"]
+    check("㉗o 端到端: 日期段不再被拒收", rc == 0 and g12["state"] == "ok",
+          (rc, g12, out[-200:]))
+
     # ---- 收尾 ----
     shutil.rmtree(ROOT, ignore_errors=True)
     print("\n结果: %d PASS / %d FAIL" % (passed, failed))

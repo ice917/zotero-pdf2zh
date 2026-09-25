@@ -2,46 +2,53 @@
 # 格式: 类型<TAB>证据<TAB>上下文<TAB>日期
 # 类型: GLYPH=字形整块 / MOVE=断点两侧错位 / OTHER=编号与空段类
 # 删掉某行即不再注入; 清空本文件即回到纯静态规则。
-GLYPH	C∈{2,4}	with Wcls∈R768×C and C∈{2,4} for rotation and sliding. Additive fusion…	2026-09-21
-GLYPH	(0.69/0.63	…slightly above it. GeoTLM keeps the two directions balanced (0.69/0.6…	2026-09-21
-GLYPH	{v1}	Tail of page one {v1} closes it.	2026-09-22
-OTHER	FAIL #S3（第1页·跨页） 占位符不守恒: 多了 {v1} x1（载荷里 {v1} x1；译文里 {v1} x2）		2026-09-22
-GLYPH	110	There was 110 infection at 4° or 35°C. The fungus in the infected egg …	2026-09-23
-GLYPH	340/00Ill	…ties. From IS to 25°~., for example, infection occurring at 340/00Ill…	2026-09-23
-GLYPH	16,1959.	Received for publication September 16,1959. Financial support by the N…	2026-09-23
-OTHER	FAIL 缺段: [2]		2026-09-23
-OTHER	FAIL #S2 译文为空		2026-09-23
-OTHER	FAIL 缺段: [26]		2026-09-23
-OTHER	FAIL #S26 译文为空		2026-09-23
-GLYPH	3	Alpha ok done, and the tail carries 3 yet.	2026-09-23
-GLYPH	𝑛	x and 𝑛	2026-09-23
-GLYPH	𝑓𝑖,𝑗	…𝐿>0. Crucially, however, we do not require every individual 𝑓𝑖,𝑗 to b…	2026-09-23
-MOVE	⋮ 两侧译文互换		2026-09-23
-GLYPH	𝑖)	…given ℱ𝑡. Next, define the population mean drift (excluding 𝑖)	2026-09-23
-GLYPH	𝑠∈𝑆,	…ese events are mutually exclusive over different choices of 𝑠∈𝑆, henc…	2026-09-23
-GLYPH	𝑆∖{𝑠}	…ng all (︀𝑛−1𝑏grp−1)︀ subsets of [𝑛]∖{𝑠} of size 𝑏grp−1, and 𝑆∖{𝑠} is …	2026-09-23
-GLYPH	(𝑗𝑡𝑖′).	… third term captures the variance due to the inner sampling (𝑗𝑡𝑖′).	2026-09-23
-GLYPH	[𝑛]∖˜Ω𝑡),	… reset on 𝑖𝑡, recursive updates on Ω𝑡, and drift updates on [𝑛]∖˜Ω𝑡),…	2026-09-23
-GLYPH	{𝑗𝑡𝑖}𝑖∈Ω𝑡	…tic, while the randomness in 𝑁𝑡 comes only from the indices {𝑗𝑡𝑖}𝑖∈Ω𝑡…	2026-09-23
-GLYPH	𝑗𝑡𝑖𝑡.	… randomness in 𝑁𝑡 comes only from the indices {𝑗𝑡𝑖}𝑖∈Ω𝑡 and 𝑗𝑡𝑖𝑡.	2026-09-23
-GLYPH	𝑁𝑡	…tors 𝑅𝑡 and ¯∆𝑡𝑖 are deterministic, while the randomness in 𝑁𝑡 comes …	2026-09-23
-GLYPH	ℱ𝑡.	…, and (c) uses that 𝑖𝑡 is uniform on [𝑛] and independent of ℱ𝑡.	2026-09-23
-GLYPH	Ł	… the batch-size- dependent similarity terms that enter the PŁ Lyapuno…	2026-09-23
-GLYPH	𝑖∈[𝑛],	…riterion for choosing 𝑏grp. Assume that 𝑔0𝑖=∇𝑓𝑖(𝑥0) for all 𝑖∈[𝑛], so…	2026-09-23
-GLYPH	𝑞=𝐾/𝑇	…venly into 𝑇 macro-families, such that each family contains 𝑞=𝐾/𝑇 com…	2026-09-23
-GLYPH	𝑇	…odel. We define 𝐾 latent components partitioned evenly into 𝑇 macro-f…	2026-09-23
-GLYPH	𝛼𝑖,𝑗(𝑥)𝑎𝑖,𝑗𝑎⊤𝑖,𝑗.	… exclusively by the geometry of the rank-one logistic terms 𝛼𝑖,𝑗(𝑥)𝑎𝑖…	2026-09-23
-GLYPH	𝜋𝑖,	…g the common regularizer). Conditional on the group mixture 𝜋𝑖, the p…	2026-09-23
-GLYPH	𝑥(	…ogistic Hessian contribution of latent component 𝑘 at point 𝑥(excludi…	2026-09-23
-GLYPH	(𝑎𝑖,𝑗,𝑦𝑖,𝑗),	…ression instances used in the experiments. For a data point (𝑎𝑖,𝑗,𝑦𝑖,…	2026-09-23
-GLYPH	(𝑛>𝑚)	…atch-size tuning was performed for SILAGE (𝑚>𝑛). For SILAGE (𝑛>𝑚) in …	2026-09-23
-GLYPH	𝑛>𝑚	…ing was performed for SILAGE (𝑚>𝑛). For SILAGE (𝑛>𝑚) in the 𝑛>𝑚 setti…	2026-09-23
-GLYPH	𝑚>𝑛	…r. For D-ZeroSARAH, we used setting-dependent grids: in the 𝑚>𝑛 setti…	2026-09-23
-GLYPH	10.5×	… optimization loop. The smallest dense refinement budget is 10.5× slo…	2026-09-23
-GLYPH	59.0×	…efinement budget is 10.5× slower, and the largest budget is 59.0× slo…	2026-09-23
-GLYPH	(i,j),ˆ	…ere kij and lij are the stiffness and rest length of spring (i,j),ˆdi…	2026-09-23
-GLYPH	j,γ	…spring (i,j),ˆdij is the unit direction from node i to node j,γ is th…	2026-09-23
-GLYPH	TOLERANCE.-Lageni.	NUTRITION AND SALINITY TOLERANCE.-Lageni. diumchthamalophilum was prop…	2026-09-23
-GLYPH	011	…utrient source was ava~l~ble. Colony diameters were greater 011 the n…	2026-09-23
-GLYPH	III	…et of e;-  periments all origi~a.lly uninfected .egg masses III 25 an…	2026-09-23
-GLYPH	within	…inity are not necessarily the factors controlling infection within th…	2026-09-23
+GLYPH	.72,43–58(1983).	… activation of calcium and chloride channels. J. Membr. Biol.72,43–58…	2026-09-25
+GLYPH	29.	29. Lunevsky, V. Z., Zherelova, O. M., Vostrikov, I. Y. & Beres…	2026-09-25
+GLYPH	116,26066–26071(2019).	…oves like wounded Mimosa pudica. Proc. Natl. Acad. Sci. USA 116,26066…	2026-09-25
+GLYPH	30.	30. Kurenda, A., Nguyen, C. T., Chételat, A., Stolz, S. & Farme…	2026-09-25
+GLYPH	é	30. Kurenda, A., Nguyen, C. T., Chételat, A., Stolz, S. & Farmer, E. E…	2026-09-25
+GLYPH	10178–10183(2018).	…gnaling in a wounded plant. Proc. Natl. Acad. Sci. USA 115, 10178–101…	2026-09-25
+GLYPH	115,	…al signaling in a wounded plant. Proc. Natl. Acad. Sci. USA 115, 1017…	2026-09-25
+GLYPH	31.	31. Nguyen, C. T., Kurenda, A., Stolz, S., Chételat, A. & Farme…	2026-09-25
+GLYPH	88611(2014).	… method for the sensitive plant Mimosa pudica. PLoS ONE 9, e88611(201…	2026-09-25
+GLYPH	32.	32. Mano, H., Fujii, T., Sumikawa, N., Hiwatashi, Y. & Hasebe, …	2026-09-25
+GLYPH	9,	…tion method for the sensitive plant Mimosa pudica. PLoS ONE 9, e88611…	2026-09-25
+GLYPH	211–220(2011).	…onomic and evolutionary implications. Plant Syst. Evol.291, 211–220(2…	2026-09-25
+GLYPH	.291,	…ytotaxonomic and evolutionary implications. Plant Syst. Evol.291, 211…	2026-09-25
+GLYPH	33.	33. Dahmer, N. et al. Chromosome numbers in the genus Mimosa L.…	2026-09-25
+GLYPH	35–42(2006).	…’ cDNA ends from ampliﬁed cDNA templates. Biotechniques 41, 35–42(200…	2026-09-25
+GLYPH	34.	34. Polidoros, A. N., Pasentsis, K. & Tsaftaris, A. S. Rolling …	2026-09-25
+GLYPH	41,	…nd 3’ cDNA ends from ampliﬁed cDNA templates. Biotechniques 41, 35–42…	2026-09-25
+GLYPH	.21,375–382(2008).	…ne silencing in Lotus japonicus. Mol. Plant Microbe Interact.21,375–3…	2026-09-25
+GLYPH	35.	35. Maekawa, T. et al. Polyubiquitin promoter-based binary vect…	2026-09-25
+GLYPH	36.	36. Komari, T., Hiei, Y., Saito, Y., Murai, N. & Kumashiro, T. …	2026-09-25
+GLYPH	86,51–61(1973).	…smission of action potentials in Biophytum. Bot. Mag. Tokyo 86,51–61(…	2026-09-25
+GLYPH	165–174(1996).	…n of transformants free from selection markers. Plant J.10, 165–174(1…	2026-09-25
+GLYPH	.10,	…gation of transformants free from selection markers. Plant J.10, 165–…	2026-09-25
+GLYPH	7.0	with 50 mM EGTA, and the pH was adjusted to 7.0 using KOH and HCl. Pin…	2026-09-25
+GLYPH	1.5	…e into the solution. The isolated pinnae were inserted into 1.5-ml tu…	2026-09-25
+GLYPH	113,	…d with Paraﬁlm to the tubes, and placed in an incubator (LU-113, ESPE…	2026-09-25
+GLYPH	027255)	… can be found in GenBank with the accession numbers pSB1 (AB027255) a…	2026-09-25
+GLYPH	027256).	…Bank with the accession numbers pSB1 (AB027255) and pSB11(AB027256). …	2026-09-25
+GLYPH	731322)	… DNA Data Bank of Japan with the accession numbers ELP1B1(LC731322) a…	2026-09-25
+GLYPH	=0.60).	…10d–f) were corrected by non-linear adjustment (gamma value =0.60).	2026-09-25
+GLYPH	190	…ca S9D, Leica Microsystems) equipped with a camera (Leica MC190 HD, L…	2026-09-25
+GLYPH	.10	…s acquired using a Leica S9D microscope (Sup- plementary Fig.10d–f) w…	2026-09-25
+GLYPH	(53×39×32	…l bins containing leaves were placed in a plastic container (53×39×32…	2026-09-25
+GLYPH	,3–7	… white LED light. When the WT (control) leaves were expanded,3–7 adul…	2026-09-25
+GLYPH	2.5	… ~4 cm in length) or 2 caterpillars (Helicoverpa armigera, ~2.5 cm in…	2026-09-25
+GLYPH	23365	…ipt. This research was supported by grants from KAKENHI (21J23365 to …	2026-09-25
+GLYPH	07411	… was supported by grants from KAKENHI (21J23365 to T.H., 16K07411 and…	2026-09-25
+GLYPH	06715	…d by grants from KAKENHI (21J23365 to T.H., 16K07411 and 19K06715 to …	2026-09-25
+GLYPH	2+	… plants and performed genotyping. T.H. and T.M. performed Ca2+ imagin…	2026-09-25
+GLYPH	/10.1038/	supplementary material available at https://doi.org/10.1038/s41467-022…	2026-09-25
+GLYPH	41467	…upplementary material available at https://doi.org/10.1038/s41467-022…	2026-09-25
+GLYPH	34106	…ry material available at https://doi.org/10.1038/s41467-022-34106-x.	2026-09-25
+GLYPH	ö	…on Nature Communications thanks Simcha Lev- Yadun, Axel Mithöfer and …	2026-09-25
+GLYPH	/4.0/.	… this license, visit http://creativecommons.org/ licenses/by/4.0/.	2026-09-25
+GLYPH	4.0	…is article is licensed under a Creative Commons Attribution 4.0 Inter…	2026-09-25
+GLYPH	3×	…ase was analyzed by t-test using the criterion of a rise to 3× SD abo…	2026-09-25
+GLYPH	2+]cyt	…he following statistical analyses. The velocities of the [Ca2+]cyt in…	2026-09-25
+GLYPH	50	… by a two-tailed Wilcoxon matched-pairs signed rank test. IC50 for th…	2026-09-25
+GLYPH	3+	…airs signed rank test. IC50 for the inhibitory effects of La3+ was es…	2026-09-25
+GLYPH	1	…s were represented in the main text and Supplementary Table 1 for the…	2026-09-25

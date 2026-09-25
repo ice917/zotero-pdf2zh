@@ -14,6 +14,13 @@
   ② 图/表区(cls<0)的字符根本不进 ink;
   ③ 该段没渲出东西时不清底(否则涂出空白)。
 
+[v30] 补齐同一语义的另一半: 图/表区(cls<=-1)**整段不重绘**, 且整组落在图/表区的公式组
+也不重绘(纯公式段落会把紧随的 -1 字符并进来, 那种组的宿主段落不是图区段落)。扫描页的可见
+内容本来就在覆盖式位图里, 段内文字层只是隐形 OCR 复本; 原先它被 cls<=0 判成"公式"原样重绘
+-> 按重排落位偏移(实测 x-192.3/y+114.5)、Tr 由 3 变 0 变成可见黑字, 即重影。
+本套件为此把守: 判据单一来源、段落/组类别与各自栈平行、**分段口径不动**(守则 #1: 动 xt_cls
+哨兵会改 sstk 分段 -> 前瞻上下文变 -> 缓存键变 -> 触发重译, 实测正文译文被改写)。
+
 运行: venv python test_whiten_scan.py, 退出码 0=全过。不触网、不读真实 PDF。
 """
 import os
@@ -170,13 +177,40 @@ def main():
     check("④ 行框记录受 cls>=0 门禁(图/表区不入框)",
           re.search(r"if ink and cls >= 0:.*?_push_ink", cv, re.S) is not None)
     check("④ 清底只在本页有覆盖式位图时发生",
-          "if isinstance(ltpage, LTPage) and self._raster_covers_page(ltpage):" in cv)
+          re.search(r"_scan_page: bool = isinstance\(ltpage, LTPage\) "
+                    r"and self\._raster_covers_page\(ltpage\)", cv) is not None
+          and "if _scan_page:" in cv)
     check("④ 清底用 ink 而非段落包围盒 pstk",
           "_whiten_ops(ink, news)" in cv and "_whiten_ops(pstk" not in cv)
     check("④ 保留区判定含 -1(cls<=0)",
           "cls <= 0" in cv)
     check("④ 哨兵 -2 不与图/表区 -1 相撞",
           "xt_cls: int = -2" in cv)
+
+    # [v30] 扫描页图/表区不重绘: 段落级 + 组级两道
+    check("④ 扫描页图/表区段落不重绘(_scan_page + pcls<=GRAPHIC_CLS -> continue)",
+          re.search(r"if _scan_page and pcls\[id\] <= self\.GRAPHIC_CLS:.*?continue",
+                    cv, re.S) is not None)
+    check("④ 段落类别与段落栈平行登记(同生同长)",
+          "pcls: list[int] = []" in cv and "pcls.append(cls)" in cv)
+    check("④ 图/表区公式组: 扫描页不重绘 / 原生页绝对锚定([v30]组级门禁 + [v33]绝对落位)",
+          re.search(r"_gabs = varcls\[vid\] <= self\.GRAPHIC_CLS", cv) is not None
+          and re.search(r"if _scan_page and _gabs:\s*\n\s*_vch, _vl = \(\), \(\)",
+                        cv) is not None
+          # [v33] 原生页: 图区组按自身 x0/y0 绝对锚定(不参与段落光标累进与行号位移)
+          and "vch.x0 if _gabs else x + vch.x0 - var[vid][0].x0" in cv
+          and "(vch.y0 - y) if _gabs else fix + vch.y0 - var[vid][0].y0" in cv
+          and "l.pts[0][0] if _gabs else l.pts[0][0] + x - var[vid][0].x0" in cv
+          and '"lidx": 0 if _gabs else lidx,' in cv
+          and "for vch in _vch:" in cv and "for l in _vl:" in cv)
+    check("④ 公式组类别与组栈平行登记(每个 var.append 都有 varcls.append 配对)",
+          "varcls: list[int] = []" in cv
+          and cv.count("varcls.append(") == cv.count("var.append(")
+          and cv.count("varcls.append(") == 4)  # [v31] 换行闭组点为第 4 对配对
+    check("④ 分段口径不动: xt_cls 哨兵仍写 -1(改它会改 sstk 分段 -> 前瞻变 -> 缓存键变 -> 重译)",
+          re.search(r"xt_cls = -1\b", cv) is not None and "xt_cls = -2" not in cv)
+    check("④ 判据单一来源: _raster_covers_page 只在一处调用(同一把尺子)",
+          cv.count("self._raster_covers_page(") == 1)
 
     hl = src_of("high_level.py")
     check("④ high_level 把图/表区记 -1",

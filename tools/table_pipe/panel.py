@@ -62,6 +62,28 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
 
 **试过但否掉的读数**(别重新起头): 拉丁碎片保真 —— 实测误报 105/115
 ("Subfamily"->"亚科"被判成"丢了拉丁串"), 字面上分不开"该保留的学名"与"该翻译的英文词"。
+**长度比当判据**(v30.5 撤下, 见下条): 同一病根 —— 拿读数冒充判断。
+
+  [v30.5] 把「读数」与「判断」的层界收回来(用户实测: 正文作业的待看清单里冒出
+    「▲ 高 末条偏短 长度比 0.38 < 全批中位 0.39」, 而回包是完整的; 全表又按比值升序把
+    小标题全顶到最上面 —— 最不该看的排在最显眼处)。病根不是阈值调得不巧, 是**第三层的
+    读数被塞进了第二层的待看清单**并配上了"高/中", 于是读数获得了判断的外观:
+      · 参照错了 —— 比值大小由**源串自身性质**决定(正文里的小标题
+        "Acknowledgements"→"致谢" 天然 0.13), 拿它跟**整篇**中位数比, 是把"类别差异"
+        读成"长度异常"; `过短` 的阈值恰是 0.5×中位(≈0.14) —— 正好压在小标题那一档, 会
+        把标题全点成嫌疑。
+      · 阈值不是阈值 —— `末条 < 全批中位` 按定义就是整篇约 50% 的事件, 拿它当"高"警,
+        误报率天然 ~50%; 旧注释"健康回包末条通常在中位附近, 故不误报"是**单样本**校准
+        (一次实测 0.33 vs 0.27), 0.38 vs 0.39 当场推翻。
+    处置: 长度比**只作读数** —— 全表一列(标「读数」) + 顶部中位 + 末条原文/译文并排;
+      待看清单只留**源串自锚、零阈值**的判据(现有唯一一条: 同一原文必须同一译文);
+      全表改回**文档序**(= manifest 顺序), 不再拿读数当排序键。
+    为什么不损失已证实的检出: 长度比分不开"被截断"与"本来就短"(台账 §四实测: 1 字截断
+      0.27 vs 中位 0.27 漏报), 而 §五记的**一致性零阈值就抓到过同一次截断**
+      (`Two pollinators` 一次命中 7 个单元) —— 原两条长度比条目对那次截断是**冗余的**,
+      对完整回包则**纯误报**。删读数的判断化, 不动任何已证实的判据。
+    权限边界没变: 待看清单非空仍不阻断 ⑤(读数不判定); ④ 语义审核仍是"漏译/错译"那一层
+      的正解 —— 长度比从来只是它的拙劣替身。
 
   [v28.69→v28.71] 三步之间补上"**这一篇该做的都做了吗**"这一环(用户实测: 表格做完直接去渲染,
     表格页仍是英文; 随即又有真洞: 硬拦截只看"你碰过的", 拦不住"你压根没做的那块表格")。
@@ -149,7 +171,6 @@ import watch_clip as wc          # 复用识别/落盘/门禁/剪贴板全链, �
 import reviewer as rv            # ④ 语义审核(硅基流动): 只审不改, 与豆包无关的第三方
 
 PH = re.compile(r"\{S\d{3}\}|\{v\d+\}")   # 表格/正文两种占位符都剥掉再比长度
-SUSPECT_K = 0.5      # 长度比低于"全批中位数"的此倍 -> 列入待看(读数, 不判定)
 
 # 主题选择落在**工作目录**(数据侧, 不进仓库); 具体配色在前端 CSS 变量里。
 THEME_FILE = os.path.join(wc.D, ".panel_theme")
@@ -568,7 +589,9 @@ def analyse(text):
 
     返回 {"error": ...} 或 {"ok", "job", "ids", "got", "rows", "median", "items",
                           "n_dup", "n_incons", "last_ratio", "gate_out", "last"}
-    items 每项 = (级别, 类型, 说明, 单元号串)
+    items 每项 = (级别, 类型, 说明, 单元号串)；**只放源串自锚的判据**(见 docstring [v30.5])——
+    长度比一类**读数**一律不进 items, 只作 rows / median / last_ratio 显示给人看。
+    rows 按 manifest 顺序(文档序), 不按读数排序。
     """
     if not text.strip():
         return {"error": "粘贴区是空的。"}
@@ -593,11 +616,14 @@ def analyse(text):
     orig = {u["id"]: u["orig"] for u in wc.manifest_units(job)}
     ok, out, note = sandbox_gates(job, ids, got)
 
-    rows = [(_ratio(orig[i], got[i]), i, orig[i], got[i]) for i in ids]
-    rows.sort(key=lambda r: (r[0], r[1]))
+    rows = [(_ratio(orig[i], got[i]), i, orig[i], got[i]) for i in ids]   # 文档序, 不排序
     med = statistics.median(r[0] for r in rows) if rows else 0.0
+    last_id = ids[-1]
+    last_r = rows[-1][0]
 
-    # ---------------- 待看清单: 只放机器判不了的。正常回包应为空。 ----------------
+    # ---------------- 待看清单: 只放**源串自锚**的判据。正常回包应为空。 ----------------
+    # 长度比(rows / med / last_r)是**读数**: 只在全表那一列与顶部显示, 不产生任何条目 ——
+    # 它的参照(整篇中位数)跨了源串类别, 且"低于中位"按定义就是整篇约 50% 的事件。见 [v30.5]。
     items = []
 
     # 1) 一致性: 同一原文必须同一译文。纯机械判断 —— 不需要专业知识就能定夺。
@@ -613,20 +639,6 @@ def analyse(text):
     for k, gids, zh in sorted(incons):
         items.append(("高", "一致性", "%r 出现 %d 次却译成 %d 种: %s"
                       % (k[:60], len(gids), len(zh), "  /  ".join(zh)), " ".join(gids)))
-
-    # 2) 长度比异常短(成句丢失级)
-    short = [r for r in rows if r[0] < SUSPECT_K * med]
-    for ratio, uid, o, z in short:
-        items.append(("中", "过短", "长度比 %.2f, 全批中位 %.2f" % (ratio, med), uid))
-
-    # 3) 末条完整性: 复制截断几乎总落在末尾。**单靠长度比分不开"被截断"与"本来就短"**
-    #    (实测: 截断后 0.13 vs 全批最小 0.15, 没有能分开两者的阈值), 所以只对**末条**
-    #    这个高危位置放宽到"低于全批中位" —— 健康回包末条通常在中位附近, 故不误报。
-    last_id = ids[-1]
-    last_r = _ratio(orig[last_id], got[last_id])
-    if last_r < med and last_id not in set(r[1] for r in short):
-        items.append(("高", "末条偏短", "长度比 %.2f < 全批中位 %.2f —— 复制被截断的典型信号"
-                      % (last_r, med), last_id))
 
     items.sort(key=lambda x: 0 if x[0] == "高" else 1)     # 稳定排序: 高在前, 组内保原序
     return {"ok": ok, "job": job, "ids": ids, "got": got, "rows": rows, "median": med,
@@ -1185,7 +1197,7 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
     </div>
     <div id="paneAll" hidden>
       <div class="tblwrap"><table>
-        <thead><tr><th class="c">编号</th><th class="c">长度比</th><th>原文</th><th>译文</th></tr></thead>
+        <thead><tr><th class="c">编号</th><th class="c" title="只作读数, 不判缺陷 —— 比值大小由源串自身性质决定(小标题天然低于句子); 且「低于中位」按定义就是整篇约一半的单元">长度比<span class="muted"> 读数</span></th><th>原文</th><th>译文</th></tr></thead>
         <tbody id="tbody"></tbody>
       </table></div>
     </div>
@@ -1533,7 +1545,8 @@ function render(r){
   el.className='empty';
   el.textContent='✓ 没有需要你核对的项目。\n\n'
     +'机器能判的(编号/占位符/数字/符号/代码缩写/一致性)都过了 —— 可以直接确认。\n'
-    +'这里只会出现机器判不了的项, 正常回包为空。';
+    +'这里只会出现机器判不了的项, 正常回包为空。\n'
+    +'长度比只是读数(全表那一列), 不作为告警 —— 小标题本来就短, 末条也常低于中位。';
   var bad={};
   r.items.forEach(function(it){
     it.ids.split(/\s+/).forEach(function(u){bad[u]=1});

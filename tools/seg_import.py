@@ -33,6 +33,9 @@
   list_inbox / get_payload 直接读得到): 每条写明 真实页码 + #S编号 + 缺的字符 +
   原文上下文, 用户不必去理解控制台里的内部坐标; PASS 时把旧单子删掉, 免得读到
   过期结论。
+  回锚失败再按**修法**分两组(甲"回载荷逐句核对, 缺的按原文补齐" / 乙"把这一串原样
+  写回"), 分组只看证据 fail_where —— **没有证据就不写理由**, 且两组都是操作指令、
+  不评断译者上一版; 于是"拿不准"时给的永远是**安全的那条**(甲是乙的超集)。
 
 用法:
   python tools/seg_import.py --manifest inbox\\payload_p2_p4.manifest.json --clip
@@ -66,8 +69,9 @@ V_TOKEN = re.compile(r"\{v(\d+)\}")
 
 REWORK_SUFFIX = ".rework.md"
 GLYPH_CTX = 60          # 返工单里原文上下文的半宽(按**还原后**字符数)
-PAYLOAD_TAIL = 90       # 返工单「段尾没译完」类里引用载荷末段的字数
+PAYLOAD_TAIL = 90       # 返工单里引用"载荷末段"的字数(供译者照着核对补齐)
 HINT_MAX = 20           # 「不必改」一节最多逐条列几条提示(超出只报计数)
+SAME_VALUE_MAX = 4      # 「原文里它在哪」一栏最多列几处**同值**字形(超出只报计数)
 
 # ---- [v28.82] 回锚埋点: 把 fails / drops 按**字符家族**归档落盘 ------------------
 # 它存在的理由是一条方法论教训(改动记录 9.7.1): 「哪个字符家族在真实翻译里真的
@@ -235,43 +239,86 @@ def glyph_context(raw, vv, vn, width=GLYPH_CTX):
     return ("…" if lo > 0 else "") + txt[lo:hi] + ("…" if hi < len(txt) else "")
 
 
-def fail_where(raw, vv, fixed, zh, vn):
-    """本字形"为什么没回锚"的处境 -> ((其后整片没译?, 位置%, 交付/载荷%), 载荷末段)。
+def same_value_glyphs(raw, vv, val):
+    """载荷里**取值等于 val** 的字形号(按原序, 去重)。
 
-    判据: 载荷里本字形**之后**还有没有别的字形**成功回了锚** —— 回锚只在译文里能定位到
-    该字形时才成功, 所以"后面一个锚点都没有"就等于"本字形之后那半句在交付里没有落点"。
+    为什么返工单需要它: 版面里同一个字常常是**好几个独立的字形对象** —— 实测 #S44 的
+    `AtU6p` 的 `6`(`{v146}`)与 `Arabidopsis U6` 的 `6`(`{v140}`)就是两个。而回锚只问
+    "这个取值能不能在译文里定位到", **交付里少写一个 `6` 时报哪个字形号是任意的**(谁先
+    被匹配上谁就不算错, 见 reanchor ①段)。实测 #S44 报的正是交付里**已经写对**的
+    `AtU6p` 那个 -> 单子把译者指向一段已经译对的地方。所以同值的几处必须**一起列**,
+    让译者自己看出缺在哪(改动记录 v30.6)。
+    """
+    out = []
+    for m in V_TOKEN.finditer(raw):
+        g = m.group(1)
+        if g not in out and _TC.strip(str((vv or {}).get(g) or "")) == val:
+            out.append(g)
+    return out
+
+
+# fail_where 的证据种类(见它的 docstring): 三种处境, 对应返工单里三种印法。
+# 判据只用**占位符的秩**, 不用字符位置、也不用长度比 —— 那两个是代理指标, 实测会把人引错。
+EV_ALL_MISSING = "其后全未落地"     # 之后还有可落地的字形, 却一个都没落地
+EV_LANDED = "其后有落地"            # 之后有字形落了地 -> 这句是译了的
+EV_NONE = "无从判定"                # 之后**没有**可落地的字形 -> 没有证据
+
+
+def fail_where(raw, vv, fixed, vn):
+    """本字形"为什么没回锚"的**证据** -> (证据种类, 其后未落地的占位符, 其后已落地数, 载荷末段)。
+
+    证据只用**占位符的秩**: 载荷里本字形**之后**还有没有别的字形**成功回了锚**。
+    回锚只在译文里定位得到该字形时才成功, 所以:
+      - 之后有可落地的字形、**一个都没落地** -> `EV_ALL_MISSING`: 那半句在交付里没有落点;
+      - 之后有可落地的字形、**有落地的** -> `EV_LANDED`: 句子译了, 只是这一串没写出来;
+      - 之后**没有可落地的字形** -> `EV_NONE`: **没有证据**, 返工单这一处什么理由都不写。
+
+    `EV_NONE` 是这一版新加的处境(实测 #S44: 字形贴着载荷末尾, 之后没有别的字形)。旧口径
+    用 `last_anchor <= k` 判"其后整片没译", 那种形状下条件**自动成立**, 于是印出一行
+    "本字形在载荷 98% 处, 交付只写到载荷的 53%" —— 位置与长度比是两个量纲, 并排读起来像
+    覆盖率, 而代码注释自己就否了它(实测 #S400 比值 50% 仍整句没译)。**没有证据就不写理由**,
+    返工单只给"拿不准时安全的那条指令"(见 write_rework_note / REWORK_WHY)。
+
     这是**直接信号**, 不是"位置%"或"长度比"那类代理指标(那两个都会把已验证的案例分错,
-    实测见 改动记录 9.7.3)。
-
-    用 9 篇真译文的 26 处真 FAIL 逐条对账验证过: 20/21 例与人工判读一致。唯一一例
-    (#S595 的第二个 `PŁ` —— 整句都译了, 只有这个字母没写出来)按"补译"处理**同样能改对**:
-    译者回载荷对一眼就看出缺的是那半句里的 `PŁ`。反过来把 #S491/#S520/#S694 那类
-    "整片没译"当"写回一串字符"处理则**改不动** —— 所以信号偏向"没译完"这一侧。
+    实测见 改动记录 9.7.3)。用 9 篇真译文的 26 处真 FAIL 逐条对账验证过: 20/21 例与人工判读
+    一致。唯一一例 (#S595 的第二个 `PŁ` —— 整句都译了, 只有这个字母没写出来)证据给
+    `EV_ALL_MISSING`, 按"回载荷把缺的补齐"处理**同样能改对**: 译者回载荷对一眼就看得出缺的
+    是那半句里的 `PŁ`。反过来把 #S491/#S520/#S694 那类"整片没译"只当"写回一串字符"处理则
+    **改不动** —— 所以证据偏向"没译完"这一侧。
     """
     if not raw or not fixed:
-        return None, ""
+        return EV_NONE, [], 0, ""
     try:
         res, spans = restore_with_spans(raw, vv)
         own = spans.get(str(vn)) or []
         if not own:
-            return None, ""
-        k = own[0][0]
-        last_anchor = -1
+            return EV_NONE, [], 0, ""
+        k = own[0][0]                            # 本字形第一处在**还原后**文本里的下标
+        seen, after, landed = {}, [], 0
         for m in V_TOKEN.finditer(raw):
             g = m.group(1)
-            _p, core, _q = split_value(_TC.strip((vv or {}).get(g) or ""))
-            # 与 reanchor 同一口径: 纯符号字形按设计丢弃, 不算落点; 没锚上的也不算。
-            if not (core and has_alnum(core)) or ("{v%s}" % g) not in fixed:
-                continue
             sp = spans.get(g) or []
-            if sp:
-                last_anchor = max(last_anchor, sp[0][0])
-        tail = res[-PAYLOAD_TAIL:]
-        return ((last_anchor <= k), 100.0 * k / max(1, len(res)),
-                100.0 * len(zh) / max(1, len(res))), \
-            ("…" if len(res) > PAYLOAD_TAIL else "") + tail
+            j = seen.get(g, 0)                   # 第 j 次出现的 {g} 对应 spans[g][j]
+            seen[g] = j + 1                      # (restore_with_spans 按同一次 finditer 落 spans)
+            if j >= len(sp) or sp[j][0] <= k:
+                continue                         # 只看本字形**之后**的占位符
+            val = _TC.strip((vv or {}).get(g) or "")
+            _p, core, _q = split_value(val)
+            # 与 reanchor 同一口径: 纯符号字形按设计丢弃 -> 它永远不落地, 不能当证据。
+            if not (core and has_alnum(core)):
+                continue
+            if ("{v%s}" % g) in fixed:
+                landed += 1
+            else:
+                after.append("{v%s}=%r" % (g, val))
+        tail = ("…" if len(res) > PAYLOAD_TAIL else "") + res[-PAYLOAD_TAIL:]
+        if landed:
+            return EV_LANDED, after, landed, tail
+        if after:
+            return EV_ALL_MISSING, after, 0, tail
+        return EV_NONE, [], 0, tail
     except Exception:
-        return None, ""
+        return EV_NONE, [], 0, ""
 
 
 # 返工单的固定段落。放在模块级是为了让 test 能直接断言措辞(它是**给译者看的合同**)。
@@ -289,12 +336,13 @@ REWORK_INTRO = """# 返工单 —— {name}
 REWORK_WHY = """## 一、必须改
 
 **共同原因**：这些段里的字符是版面里**独立的字形对象**，译文里不出现它就**没有落点**，
-渲染这一处会出错。但"为什么没出现"分两类，修法不一样，下面分开列了，照着做：
+渲染这一处会出错。下面按**修法**分两组 —— 两组对应的是**做法**，不是对你上一版的评断；
+照着做即可：
 
-- **甲、载荷这一段没译完**（这批里最常见）：整句/从句/段尾那半截压根没进交付。
-  回载荷把缺的部分**补译完** —— 包括段尾那个"看起来没写完"的公式残块，它属于原文，照译，
-  不要因为"看着不完整"就丢掉（任务包规则 9）。
-- **乙、句子译了，只是这一串字符没写出来**：把它**原样写回**（数字/字母照抄，不要改写成
+- **甲组 · 回载荷逐句核对，缺的按原文补齐**（**拿不准时的安全修法**，两组通用）：回原载荷
+  把这一段逐句对一遍，缺哪半句就补译哪半句。段尾那个"看起来没写完"的公式残块也属于原文，
+  照译，不要因为"看着不完整"就丢掉（任务包规则 9）。
+- **乙组 · 句子译了，只是这一串字符没写出来**：把它**原样写回**（数字/字母照抄，不要改写成
   「三维」「二维」这类中文说法）；紧邻的字母/数字一起照抄；公式片段整块照抄、中文放在块外
   （任务包规则 2、7）。
 """
@@ -307,9 +355,15 @@ def write_rework_note(man, src, report, detail):
     两类分开渲染: 回锚失败能给出"缺哪个字符 + 原文哪一处"(译者看不见字形占位符背后的
     东西, 这正是它需要的线索); 其余 FAIL 原样转述。
 
-    回锚失败再按**修法**分两栏(见 REWORK_WHY, 判据见 fail_where): 甲"段尾没译完 -> 补译" /
-    乙"句子译了 -> 把这串写回"。混在一栏里点名"缺的字符: `3`"会把人引到"补一个字符"上去,
-    而实测这批 FAIL 里绝大多数是整句没译 —— 补一个字符根本改不动(见 改动记录 9.7.3)。
+    回锚失败再按**修法**分两栏(见 REWORK_WHY, 证据见 fail_where): 甲"回载荷逐句核对, 缺的
+    按原文补齐" / 乙"句子译了 -> 把这串写回"。混在一栏里点名"缺的字符: `3`"会把人引到
+    "补一个字符"上去, 而实测这批 FAIL 里绝大多数是整片没译 —— 补一个字符根本改不动
+    (见 改动记录 9.7.3)。
+
+    归栏与印行只依据**证据**, 任何一行都不印百分数: 旧版在甲栏印"本字形在载荷 98% 处，
+    交付只写到载荷的 53%", 那是"字符位置"与"长度比"两个量纲并排、动词读起来像覆盖率 ——
+    实测 #S44 正是被这行引着去"补一个字符"的。**没有证据(EV_NONE)就什么理由都不写**,
+    只给"拿不准时安全的那条指令"。
     """
     name = man.get("name") or os.path.basename(src).replace(".manifest.json", "")
     if not name:
@@ -331,14 +385,16 @@ def write_rework_note(man, src, report, detail):
     if detail:
         L.append("")
         L.append(REWORK_WHY.rstrip())
-        # 逐段归栏: 一段里只要有一处属于"段尾没译完", 就整段按甲处理 —— 甲那句
-        # "把缺的补译完"对乙那种"只差一串字符"也成立, 反过来不成立。
+        # 逐段归栏: 一段里只要有一处**不是**"其后有落地", 就整段按甲处理 —— 甲的指令
+        # ("回载荷把缺的补齐")是乙的**超集**: 乙按甲处理同样改对, 甲按乙处理改不动。
+        # 于是 **"没有证据"(EV_NONE) 也进甲**: 拿不准就给安全的那条指令。
         grp = {"甲": [], "乙": []}
         for d in detail:
-            infos = [(fail_where(d["raw"], d.get("vv"), d.get("fixed"), d.get("zh"), vn), vn, val)
+            infos = [(fail_where(d["raw"], d.get("vv"), d.get("fixed"), vn), vn, val)
                      for vn, val in d["fails"]]
-            grp["甲" if any(w and w[0] and w[0][0] for w, _vn, _v in infos) else "乙"].append((d, infos))
-        for tag, title in (("甲", "载荷这一段没译完 —— 回载荷把缺的补译完"),
+            evs = [w[0] for w, _vn, _v in infos]
+            grp["乙" if evs and all(e == EV_LANDED for e in evs) else "甲"].append((d, infos))
+        for tag, title in (("甲", "回载荷逐句核对，缺的按原文补齐（拿不准时的安全修法）"),
                            ("乙", "句子译了，只是这一串字符没写出来 —— 原样写回")):
             if not grp[tag]:
                 continue
@@ -348,24 +404,57 @@ def write_rework_note(man, src, report, detail):
                 L.append("")
                 L.append("### #S%d（第 %d 页）" % (d["key"], d["tp"]))
                 L.append("- 缺的字符: %s" % "、".join("`%s`" % v for _vn, v in d["fails"][:8]))
-                w = next((w for w, _vn, _v in infos if w), None)
-                if tag == "甲" and w:
-                    # 位置/长度是**给人核对的旁证**, 不是判据: 交付明显短于载荷时它印证
-                    # "没译完"; 但长度比正常也不能反证(实测 #S400 比值 50% 仍整句没译)。
-                    L.append("- 位置对照: 本字形在载荷 %d%% 处，交付只写到载荷的 %d%%"
-                             % (round(w[0][1]), round(w[0][2])))
-                    if w[1]:
-                        L.append("- 载荷这一段的后半（照它把没译的补齐）: %s" % w[1])
-                for vn, _val in d["fails"][:4]:
-                    ctx = glyph_context(d["raw"], d["vv"], vn)
-                    if ctx:
-                        L.append("- 原文里它在哪: %s" % ctx)
+                # 证据只报**占位符的秩**(它之后还有几个、落了几个), 不印任何百分数 ——
+                # 没有证据的那种形状(EV_NONE)这一节一个字都不写, 只留下面的操作线索。
+                w = next((w for w, _vn, _v in infos if w[0] == EV_ALL_MISSING), None)
+                if w:
+                    L.append("- 证据: 其后 %d 个占位符**均未落地**（%s）"
+                             "—— 这半句在交付里没有落点"
+                             % (len(w[1]), "、".join("`%s`" % x for x in w[1][:6])))
+                if tag == "甲":
+                    tail = next((w[3] for w, _vn, _v in infos if w[3]), "")
+                    if tail:
+                        L.append("- 载荷末段（末尾 %d 字，照它把缺的补齐）: %s"
+                                 % (PAYLOAD_TAIL, tail))
+                else:
+                    w = next((w for w, _vn, _v in infos if w[0] == EV_LANDED), None)
+                    if w:
+                        L.append("- 证据: 其后 %d 个占位符已在译文中落点（句子本身是译了的）"
+                                 % w[2])
+                for vn, val in d["fails"][:4]:
+                    # 同值的字形可能不止这一处(版面里同一个字常是多个独立字形对象), 全列出来
+                    # 让译者自己看出缺在哪 —— 只列报错的那一处会把一段已经译对的地方指给他
+                    # (#S44 实测: 报的是 `AtU6p` 的 `6`, 真缺的是 `Arabidopsis U6` 的 `6`)。
+                    ctxs, seen_ctx = [], []
+                    for g in [vn] + [x for x in same_value_glyphs(d["raw"], d["vv"], val)
+                                     if x != vn]:
+                        ctx = glyph_context(d["raw"], d["vv"], g)
+                        if ctx and ctx not in seen_ctx:
+                            seen_ctx.append(ctx)
+                            ctxs.append(ctx)
+                    if len(ctxs) <= 1:
+                        if ctxs:
+                            L.append("- 原文里它在哪: %s" % ctxs[0])
+                    else:
+                        L.append("- 原文里它在哪: 载荷里 `%s` 共 %d 处（交付里少了一个 —— "
+                                 "请对照这几处找）:" % (val, len(ctxs)))
+                        for c in ctxs[:SAME_VALUE_MAX]:
+                            L.append("    - %s" % c)
+                        if len(ctxs) > SAME_VALUE_MAX:
+                            L.append("    - …（同值字形共 %d 处，其余不再列出）" % len(ctxs))
                 if d.get("moved"):
                     L.append("- **这一处的修法不同**: 上面这些字符的译文被写到了 ⋮ 的**另一侧**。"
                              "本段是「跨页续接」合并来的（⋮ 左右各对应原 PDF 的一页），"
                              "版面上这些字符属于那一页。请把 ⋮ 摆回原文那一处："
                              "⋮ 左边只写 ⋮ 左边原文的译文，右边只写右边原文的译文，"
                              "**不要把某一侧的短语提到另一侧去**（同侧内部可以按中文习惯调语序）。")
+            if tag == "乙":
+                # "指令永远给安全的那条": 乙的证据只覆盖了字形**之后**的部分, 万一这一处
+                # 其实是整片没译, 原样写回就白改一轮 —— 底线那句话永远附在乙栏末尾。
+                L.append("")
+                L.append("> **底线**：若原样写回后这一处仍判 FAIL，说明这一整片在交付里也"
+                         "**缺落点** —— 请回载荷逐句核对，按**甲组**（回载荷把缺的补齐）"
+                         "那套改。")
     # 小节编号随实际出现的小节走: 只写"一、必须改"和"三、不必改"、中间空着"二"，
     # 读的人会以为单子缺了一节。
     sections = []
@@ -989,10 +1078,9 @@ def main():
                 report.append(line)
                 detail.append({"key": key, "tp": part_true_page(p, o), "line": line,
                                "raw": raw, "vv": vv, "fails": fails, "moved": moved,
-                               # 返工单要按修法分栏(见 write_rework_note): 分栏判据要看
-                               # "这一处字形之后有没有别的字形锚上了", 得把回锚结果与
-                               # 交付原文都带上。
-                               "fixed": fixed, "zh": seg_zh})
+                               # 返工单要按修法分栏(见 write_rework_note): 证据是
+                               # "这一处字形之后有没有别的字形落了地", 得把回锚结果带上。
+                               "fixed": fixed})
             if drops:
                 report.append("提示 %s 纯标点字形丢弃 %d 个: %s" % (
                     loc, len(drops), [d[1] for d in drops[:6]]))

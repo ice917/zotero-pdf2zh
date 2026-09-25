@@ -124,6 +124,39 @@ REF_AY_SPAN_CAP = 400    # 两姓名锚之间的跨度上限(字符): 超长视�
                          # 不是条目内容, 不计入(防止正文中文被当文献汉化)。
 PLACEHOLDER = re.compile(r"\{v\d+\}")   # pdf2zh 公式占位符 {v1} {v2} ...
 REF_ENTRY = re.compile(r"(?m)^\s*\[\d{1,3}\]")
+# [自研补丁 2026-09-24] 文献区**区域**判据（第三种体例 / 半页文献块）。
+# 事故: Johnson 第3页是「正文末段 + LITERATURE CITED 标题 + 5 条条目」——页级
+# 密度判据（REF_DENSITY）在此必然失效: 该页 5834 字符里文献只占末尾 5 行,
+# 编号制 0.00 / 作者-年份制 0.00 / 连"姓, 名首字母"密度也只有 1.03, 全在
+# 阈值 2.5 之下 → is_ref_page 判 False。而这一页的条目形态是**第三种体例**:
+#   GOLD, H. S. 1959. Distribution of some ... Jour. Elisha Mitchell Sci. Soc.
+# 行首无 [n], 年份也不在括号里（在作者名之后、无括号）→ REF_ENTRY 与 REF_AY
+# 两臂都抓不到。三种体例的共同点是**都有一行标题**（LITERATURE CITED /
+# REFERENCES / BIBLIOGRAPHY…）, 故区域判据改用「标题锚点」定位, 不再依赖密度。
+#
+# 只认「整段就是标题」且标题之后不得紧跟小写字母 —— 后者是最主要的误报源:
+#   "References to earlier work show..." / "Bibliography of the genus" 这类
+# 正文句子会以标题词开头, 但后面跟的是小写词。
+# 收得**很紧**（整段只剩标题，可带一个句点/冒号）是实测逼出来的: 放宽到
+# "标题词打头即可"时, 全语料出了两类误报, 而误报的代价是**静默藏住漏译**
+# （标题之后的正文段全被豁免）:
+#   · 表头行 `Reference | Dim. | Filter type | ...`（Melhani 第4页，行位 6%）
+#   · 图例行 `ReferenceEKF estimate`（Melhani 第32页；"Reference" 后面接的是
+#     字母 E, 连词边界都没有）
+# 收紧后这两类都落空。代价: 若某引擎把标题与首条条目并成一段
+# （`LITERATURE CITED GOLD, H. S. ...`），该段不被认作锚点 —— 结果是**多报**
+# 一个漏译段（噪音，看得见），而不是少报（危险）。本机 16 篇侧车实测无此形态。
+# 刻意**不收**光板的 LITERATURE —— "LITERATURE REVIEW" 是正文章节标题,
+# 把它当文献区锚点会把该页后半的正文段全部豁免掉。
+REF_HEADING = re.compile(
+    r"^\s*(?i:LITERATURE\s+CITED|REFERENCES?\s+CITED|REFERENCES?|BIBLIOGRAPHY"
+    r"|WORKS\s+CITED|参考文献|引用文献)(?![A-Za-z\u4e00-\u9fff])\s*[.:：]?\s*$")
+# 注: 本判据只给**区域级**消费者用（tools/seg_check.py 的页内文献段豁免）。
+# 刻意不接进 is_ref_page —— 那是**页级**判据, 供断言1/断言4 用: 一个"正文占
+# 九成、末尾挂文献块"的页一旦被当成文献页, 断言4 会在该页正文的中文上跑
+# count_zh_ay_blocks（姓名锚切块）而误报"文献区被汉化", 断言1 也会整页豁免。
+# 页级与区域级是同一件事的两个粒度, 判据文本同源, 阈值语义各自成立。
+
 # [自研补丁 2026-09-20] 引用标号判据要容忍**提取空隙**: 同一份 PDF 的两侧
 # (原文 vs 译文)提取形态可以不一样 —— 原文里 `[22]` 是公式字体里的字形对象,
 # 提取出来常带空格(`[ 22]`, 实测 SILAGE 第2页 8 处全是 `[ ` 开头), 而回填后的
@@ -267,6 +300,20 @@ def is_ref_page(feat):
     译文页的条目被汉化/换标点后, 行首 [n] 与年份都会被 pypdf 拆散。
     """
     return max(feat["ref_density"], feat["ref_ay_density"]) >= REF_DENSITY
+
+
+def is_ref_heading(text):
+    """这段文字是否为「文献区标题」（见 REF_HEADING）。
+
+    [自研补丁 2026-09-24] 文献区判据的**区域版**: is_ref_page 回答"整页是不是
+    文献页"（靠条目密度）, 本函数回答"这一行/这一段是不是文献区的**开头**"。
+    半页文献块（正文末页 + 文献标题 + 条目）只有后者能定位 —— 那是 Johnson
+    第3页的情形, 页级密度必然低于阈值。
+
+    与 is_ref_page 判据文本同源、粒度不同: 同属"文献区"这一件事, 不各写一套。
+    消费者: tools/seg_check.py（标题之后的段落整条保留英文属预期, 豁免漏译判定）。
+    """
+    return bool(REF_HEADING.match(text or ""))
 
 
 # ---------------------------------------------------------------- 断言
