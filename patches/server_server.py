@@ -30,6 +30,7 @@ import re   # 用于解析版本号和提取错误信息
 import io
 import glob    # [v28.23] 等网页 AI 交件落盘(out/<name>.<族>*.txt, 族=doubao|webai)
 import hashlib  # [v28.26] 按 PDF 内容散列定位本轮的归档侧车(提字进度源)
+import sqlite3  # [v28.80] 骨架行护栏的库侧判据: 只读缓存库数本篇 raw→raw 行
 import socket  # 用于端口检查
 import tempfile  # [v28.79+] 面板端口握手文件(临时目录: 本机一次运行的状态, 不进项目)
 import time    # 用于 SSE 推送间隔
@@ -120,32 +121,105 @@ def _adopt_ledger(name):
         return None
 
 
-def _skeleton_pending(name):
-    """[v28.79] 这一篇的缓存里是不是还压着 raw→raw **骨架行**(提了字、还没回灌)。
-    返回 "" 表示"没有, 可以渲染"; 否则返回一句给人看的理由。
+# [v28.80] 库侧判据的两个常数: 同时满足才判"这篇压着骨架行"。
+# 口径来自 2026-09-25 全库实测(25 个 doc fp / 9141 行): 除两篇"提了字没回灌"的
+# (79.6% 与 100%)以外, 其余正常篇目最高只有 24.8% —— 取 0.5 有一倍以上余量。
+SKELETON_MIN_RATIO = 0.5
+SKELETON_MIN_ROWS = 20
+# 数骨架行时读的那个库(pdf2zh 的译文缓存)。提成模块级常量是为了让
+# tools/tests/test_pause_adopt.py 能把它重定向到一个临时库来做无用例。
+SKELETON_CACHE_DB = os.path.join(os.path.expanduser("~"), ".cache", "pdf2zh", "cache.v1.db")
 
-    判据全在 adopt 台账上: `export` 已 ok 而 `inject` 还没 ok = 骨架行还活着 ——
-    暂停档第一趟为了让 seg_inject(UPDATE-only)有行可改, 按最终键形态落了一批
-    raw→raw 行(adopt.py 的 rollback 就是为它们准备的)。这时候渲染跑出去, 命中的
-    **全是**这些行, 产物是一份全英文 PDF —— 而它看起来与正常那份无异, 用户会以为
-    是自己的稿渲染出来的(SILAGE 那晚就是这么排查了一整夜)。
 
-    为什么用台账当判据而不是另立标记: 它会**自己变对** —— 面板 ⑤ 的正文工序跑完
-    deliver/import/inject, 台账里 inject 就成了 ok, 这道闸自动放行, 不需要谁来清标记。
-    """
-    led = _adopt_ledger(name)
-    if not led:
-        return ""
-    stages = led.get("stages") or {}
-    if (stages.get("export") or {}).get("state") != "ok":
-        return ""
-    if (stages.get("inject") or {}).get("state") == "ok":
-        return ""
-    return ("这篇的 adopt 回路停在「提字」：缓存里还有 raw→raw 骨架行，现在渲染会整篇"
+def _skeleton_why(name, skel=0, tot=0):
+    """护栏拦下时给人看的那句话(库侧有实据时补一句, 便于一眼判断该不该放)。"""
+    ev = ("（库侧实据：本篇缓存 %d 行里 %d 行是 raw→raw 骨架行）" % (tot, skel)) if tot else ""
+    return ("这篇的 adopt 回路停在「提字」：缓存里还有 raw→raw 骨架行%s，现在渲染会整篇"
             "命中它们，出来的是一份**全英文 PDF**。两条出路：① 走中继面板 ⑤ 把豆包"
             "回包 deliver → import → inject 回来，再渲染（正常路径）；② 放弃这一轮："
             "跑 `python tools/adopt.py rollback --name \"%s\" --pdf <原文 PDF> --force` "
-            "撤掉骨架行。" % name)
+            "撤掉骨架行。" % (ev, name))
+
+
+def _segflow_doc_fp(sidecar):
+    """[v28.80] 读侧车自带的文档画像指纹(doc_fp, 形如 docsummary:<16hex>:<...>)。
+
+    口径与 tools/adopt.py 的 sidecar_doc_fp 一致: 只看第一行(同篇每行同值),
+    取其中的 16 位十六进制; 拿不到返回 ""(老侧车没有这一项)。
+    """
+    if not sidecar:
+        return ""
+    try:
+        with open(sidecar, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                m = re.search(r"([0-9a-f]{16})",
+                              (json.loads(line) or {}).get("doc_fp") or "")
+                return m.group(1) if m else ""
+    except Exception:
+        return ""
+    return ""
+
+
+def _cache_skeleton_rows(pdf_path):
+    """[v28.80] 回缓存库数本篇的 raw→raw 骨架行, 返回 (骨架行, 总行数)。
+
+    为什么还要这条库侧判据: 台账判据只在"台账在"的篇目上成立 —— 旧命名时代
+    (payload_xxx)提过字的篇目根本没有台账, 护栏对它们是**瞎的**。2026-09-25 查明:
+    Lee 那篇 133 行骨架行 + 无台账 -> 护栏放行 -> force 重渲染出整篇英文 PDF。
+    所以"台账读不到"不能等同于"这篇没提过字", 得回库里看一眼。
+
+    只读; 任何异常都退化成 (0, 0) = 放行 —— 护栏宁可漏拦, 不因自身故障把人挡在门外。
+    """
+    if not pdf_path:
+        return 0, 0
+    fp = _segflow_doc_fp(_segflow_doc_sidecar(pdf_path))
+    if not fp:
+        return 0, 0
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % SKELETON_CACHE_DB.replace("\\", "/"), uri=True)
+        try:
+            row = con.execute(
+                "SELECT COUNT(*), SUM(original_text = translation) FROM _translationcache"
+                " WHERE translate_engine_params LIKE ?",
+                ("%" + fp + "%",)).fetchone()
+        finally:
+            con.close()
+    except Exception:
+        return 0, 0
+    return int(row[1] or 0), int(row[0] or 0)
+
+
+def _skeleton_pending(name, pdf_path=None):
+    """[v28.79|v28.80] 这一篇的缓存里是不是还压着 raw→raw **骨架行**(提了字、还没回灌)。
+    返回 "" 表示"没有, 可以渲染"; 否则返回一句给人看的理由。
+
+    判据: 优先 adopt 台账 —— `export` 已 ok 而 `inject` 还没 ok = 骨架行还活着。暂停档
+    第一趟为了让 seg_inject(UPDATE-only)有行可改, 按最终键形态落了一批 raw→raw 行
+    (adopt.py 的 rollback 就是为它们准备的)。这时候渲染跑出去, 命中的**全是**这些行,
+    产物是一份全英文 PDF —— 而它看起来与正常那份无异, 用户会以为是自己稿渲染出来的
+    (SILAGE 那晚就是这么排查了一整夜)。
+
+    为什么用台账当判据而不是另立标记: 它会**自己变对** —— 面板 ⑤ 的正文工序跑完
+    deliver/import/inject, 台账里 inject 就成了 ok, 这道闸自动放行, 不需要谁来清标记。
+
+    [v28.80] 但台账**读不到**不等于安全(旧命名时代提字的篇目没有台账, 见
+    `_cache_skeleton_rows`), 故补一条库侧退路: 台账没记到"导出 ok"时, 回缓存库数
+    本篇骨架行, 占比与条数都过线就照样拦。
+    """
+    led = _adopt_ledger(name)
+    if led:
+        stages = led.get("stages") or {}
+        if (stages.get("inject") or {}).get("state") == "ok":
+            return ""
+        if (stages.get("export") or {}).get("state") == "ok":
+            return _skeleton_why(name)
+    skel, tot = _cache_skeleton_rows(pdf_path)
+    if tot and skel >= SKELETON_MIN_ROWS and skel >= SKELETON_MIN_RATIO * tot:
+        return _skeleton_why(name, skel, tot)
+    return ""
 
 
 def _inbox_dir():
@@ -1627,11 +1701,12 @@ class PDFTranslator:
             # 提字完就收尾, 缓存里那批 raw→raw 骨架行会一直躺着等人回灌; 此时从任何
             # 别的地方发起渲染(走投无路时重跑、别的工具 force、Zotero 里点重试), 命中的
             # 全是骨架行 -> 一份全英文 PDF, 且看起来与正常产物无异。判据在
-            # _skeleton_pending(取自 adopt 台账, 会自己变对: 面板 ⑤ 跑完 inject 就放行)。
+            # _skeleton_pending(先看 adopt 台账, 会自己变对: 面板 ⑤ 跑完 inject 就放行;
+            # [v28.80] 台账读不到时回缓存库数本篇骨架行, 免得旧命名时代的篇目成了盲区)。
             if force or not _two_pass_enabled():
-                why = _skeleton_pending(_adopt_run_name(input_path))
+                why = _skeleton_pending(_adopt_run_name(input_path), input_path)
                 if why:
-                    print("🛑 [v28.79] 拒绝渲染: %s" % why)
+                    print("🛑 [v28.79|v28.80] 拒绝渲染: %s" % why)
                     raise RuntimeError(why)
             # [v28.23] 两趟采纳回路: 开着开关才走「提字 → 待译 → 重渲染」;
             # [v28.53] 默认开(零 LLM 提字), force 请求旁路 —— force_rerender 提交的

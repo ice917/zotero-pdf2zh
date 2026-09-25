@@ -13,6 +13,8 @@
   B. 停住那种状态**要拦得住渲染**: 缓存里此刻压着 raw→raw 骨架行, 从别处发起渲染会
      整篇命中它们, 出来是一份全英文 PDF。_skeleton_pending 拿 adopt 台账当判据
      (export 已 ok 而 inject 还没 ok), 会随面板 ⑤ 跑完自己放行。
+     [v28.80] 台账**读不到**不等于安全: 旧命名时代提过字的篇目没有台账(Lee 就是),
+     故台账没记到"导出 ok"时回缓存库数本篇骨架行, 占比+条数都过线照样拦(见 B-2)。
   C. 面板 ⑤ 的**正文**工序改走 adopt(deliver → import → inject → force_rerender),
      不再单跑 seg_import/seg_inject —— 那一条缺 ⋮ 断点对账/只译半截/逐段不变量三道门,
      且 seg_inject 没给 --fp 会静默回落 Cactaceae 指纹(UPDATE 命中 0 行、渲染还是英文)。
@@ -26,7 +28,9 @@ _auto_adopt_enabled / _skeleton_pending 在隔离命名空间里真跑。
 import ast
 import json
 import os
+import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -72,7 +76,7 @@ def func_src(name, path=SERVER_PY):
 
 def server_ns(*names):
     """把抽出来的模块级函数装进一个只带它真用得上的标准库的命名空间。"""
-    ns = {"os": os, "json": json, "time": time}
+    ns = {"os": os, "json": json, "time": time, "re": re, "sqlite3": sqlite3}
     for n in names:
         src = func_src(n)
         assert src, "server.py 里找不到 %s" % n
@@ -212,13 +216,17 @@ def main():
         with with_env(PAUSE_AUTO_ADOPT=v):
             check("A %r -> 关(停在待译)" % v, auto() is False)
 
-    # ---- B. 骨架行护栏: 判据全在台账上, 且会自己变对 ----
-    pending = server_ns("_adopt_ledger", "_skeleton_pending")["_skeleton_pending"]
+    # ---- B. 骨架行护栏: 台账判据 + [v28.80] 库侧退路, 而且会自己变对 ----
+    guard = server_ns("_adopt_ledger", "_skeleton_why", "_segflow_doc_fp",
+                      "_cache_skeleton_rows", "_skeleton_pending")
+    for c in ("SKELETON_MIN_RATIO", "SKELETON_MIN_ROWS", "SKELETON_CACHE_DB"):
+        exec(compile(const_src(c), "<server.%s>" % c, "exec"), guard)
+    pending = guard["_skeleton_pending"]
     drop_ledger()
-    check("B 没有台账 -> 放行(不是提字档, 与本文无关)", pending(NAME) == "")
+    check("B 没有台账 + 没给 pdf(查不到库实据) -> 放行", pending(NAME) == "")
 
     write_ledger({"export": {"state": "failed"}})
-    check("B export 没成功 -> 放行(没有骨架行这回事)", pending(NAME) == "")
+    check("B export 没成功 + 没给 pdf -> 放行", pending(NAME) == "")
 
     write_ledger({"export": {"state": "ok"}})
     why = pending(NAME)
@@ -231,6 +239,56 @@ def main():
     check("B inject 失败 -> 仍然拦住(骨架行还在)", pending(NAME) != "")
     write_ledger({"export": {"state": "ok"}, "inject": {"state": "ok"}})
     check("B inject 已 ok -> 自动放行(不需要谁来清标记)", pending(NAME) == "")
+    drop_ledger()
+
+    # ---- B-2. [v28.80] 台账读不到时的库侧退路 ----
+    # 为什么补这条: 旧命名时代提过字的篇目**没有台账** —— Lee 2026-09-25 就是这样
+    # (133 行骨架行 + 无台账 -> 护栏放行 -> force 重渲染出一份整页英文 PDF)。
+    # 库/侧车两处换成本测试的临时件真跑, 不碰真缓存库、不需要真 PDF。
+    FP = "0123456789abcdef"
+    db_path = os.path.join(_TMP, "cache.v1.db")
+    sidecar = os.path.join(_TMP, "pdf-fake.jsonl")
+    guard["SKELETON_CACHE_DB"] = db_path
+    guard["_segflow_doc_sidecar"] = lambda _p: sidecar
+
+    def seed(n_same, n_zh):
+        with sqlite3.connect(db_path) as con:
+            con.execute("DROP TABLE IF EXISTS _translationcache")
+            con.execute("CREATE TABLE _translationcache (id INTEGER PRIMARY KEY,"
+                        " translate_engine TEXT, translate_engine_params TEXT,"
+                        " original_text TEXT, translation TEXT)")
+            con.executemany(
+                "INSERT INTO _translationcache"
+                " (translate_engine_params, original_text, translation) VALUES (?,?,?)",
+                [("doc_fp:" + FP, "seg %d" % i, "seg %d" % i) for i in range(n_same)]
+                + [("doc_fp:" + FP, "segz %d" % i, "中文段 %d" % i) for i in range(n_zh)])
+
+    def write_sidecar(doc_fp):
+        with open(sidecar, "w", encoding="utf-8") as f:
+            f.write(json.dumps({"page": 1, "pageid": 0, "doc_fp": doc_fp}) + "\n")
+
+    write_sidecar("docsummary:%s:zz" % FP)
+    seed(30, 3)
+    check("B2 从侧车读到 fp, 库侧数出骨架行 = 30/33",
+          guard["_cache_skeleton_rows"]("/no/such.pdf") == (30, 33),
+          guard["_cache_skeleton_rows"]("/no/such.pdf"))
+    why = pending(NAME, "/no/such.pdf")
+    check("B2 台账读不到但库里压着骨架行(30/33) -> 照样拦, 并带上库侧实据",
+          bool(why) and "30" in why and "33" in why, why)
+
+    seed(1, 60)
+    check("B2 正常篇目(只有 1 行 raw→raw) -> 不误拦",
+          pending(NAME, "/no/such.pdf") == "",
+          guard["_cache_skeleton_rows"]("/no/such.pdf"))
+
+    write_sidecar("")                      # 老侧车没有 doc_fp 这一项
+    seed(30, 3)
+    check("B2 老侧车(没有 doc_fp) -> 查不到就不拦(宁可漏拦, 不误挡人)",
+          pending(NAME, "/no/such.pdf") == "")
+
+    write_ledger({"export": {"state": "ok"}, "inject": {"state": "ok"}})
+    check("B2 台账 inject 已 ok -> 优先按台账放行(不去看库)",
+          pending(NAME, "/no/such.pdf") == "")
     drop_ledger()
 
     # ---- C-1. 服务端: 提字后就停, 别再自己等交件 ----
