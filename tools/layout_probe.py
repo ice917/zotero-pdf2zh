@@ -198,10 +198,15 @@ def blame_edge(page_layout, x_lo, x_hi):
 
 
 def parse_pages_arg(spec, total):
-    """`'3,5-9'` -> `[3,5,6,7,8,9]`（去重保序、越界丢弃）；空/无有效项 -> 全页。"""
+    """`'3,5-9'` -> `[3,5,6,7,8,9]`（去重保序、越界丢弃）；空/无有效项 -> 全页。
+
+    [v34] 无效项**不再静默**（非数 / 倒序 / 越界各报一行到 stderr，行为仍是"丢弃该项"）：
+    最后那条「无有效项 -> 全页」的回退会把 `--pages 200-300`（20 页文档）**整篇**扫掉 ——
+    静默的代价是"人以为只扫了 2 页、实际扫了 20 页"，还看到一堆切点，读数对不上也查不出原因。
+    """
     if not spec:
         return list(range(1, total + 1))
-    out = []
+    out, bad, oob, rev = [], [], [], []
     for part in str(spec).replace("，", ",").split(","):
         part = part.strip()
         if not part:
@@ -210,11 +215,34 @@ def parse_pages_arg(spec, total):
         try:
             rng = range(int(a), int(b) + 1) if sep else [int(part)]
         except ValueError:
+            bad.append(part)
             continue
+        if sep and int(b) < int(a):
+            rev.append(part)
+            continue
+        hit = False
         for n in rng:
-            if 1 <= n <= total and n not in out:
-                out.append(n)
-    return out or list(range(1, total + 1))
+            if 1 <= n <= total:
+                hit = True
+                if n not in out:
+                    out.append(n)
+        if not hit:
+            oob.append(part)
+    if bad or oob or rev:
+        bits = []
+        if bad:
+            bits.append("不是页码: %s" % ",".join(bad))
+        if rev:
+            bits.append("区间倒序: %s" % ",".join(rev))
+        if oob:
+            bits.append("越界: %s" % ",".join(oob))
+        print("⚠ --pages 有 %d 段没算进来 —— %s（文档 %d 页）"
+              % (len(bad) + len(oob) + len(rev), "；".join(bits), total), file=sys.stderr)
+    if not out:
+        print("⚠ --pages 里一段有效页码都没有 —— 按**整篇** %d 页扫（本函数的既定回退）"
+              % total, file=sys.stderr)
+        return list(range(1, total + 1))
+    return out
 
 
 def scan_cuts(pdf, pages_spec="", model=None):
@@ -297,6 +325,36 @@ def compare(pdf, pageno, model):
     return res
 
 
+def page_count(pdf):
+    """PDF 总页数（打不开/读不了返回 None）。"""
+    try:
+        d = pymupdf.open(pdf)
+        n = d.page_count
+        d.close()
+        return n
+    except Exception:
+        return None
+
+
+def parse_page_arg(pdf, raw):
+    """命令行页码 -> `(pageno, None)` 或 `(None, 原因)`。
+
+    [v34] 为什么要单起一道: 旧代码是 `pageno = int(sys.argv[2])` 直接进 `doc[pageno - 1]` ——
+    越界抛的是 pymupdf 的 IndexError, 栈里全在库内部, 看着像"工具坏了"; 非数则裸
+    ValueError。两种都只是**页码写错**, 该退 2 并说清, 而不是把 traceback 当故障报。
+    """
+    try:
+        pageno = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None, "页码要是个整数: %r" % raw
+    n = page_count(pdf)
+    if n is None:
+        return None, "读不了 PDF 的页数（文件不存在或不是 PDF）: %s" % pdf
+    if not (1 <= pageno <= n):
+        return None, "页码 %d 越界（这份 PDF 共 %d 页）" % (pageno, n)
+    return pageno, None
+
+
 class Collector(PDFConverterEx):
     """只收集顶层 LTPage 的 LTChar（与生产 receive_layout 的遍历口径一致）。"""
 
@@ -371,7 +429,13 @@ def _cuts_main(argv):
 def main():
     argv = sys.argv[1:]
     if argv and argv[0] == "--compare" and len(argv) > 2:
-        compare(argv[1], int(argv[2]), load_model(default_model()))
+        # [v34] 页码先核边界（旧代码 `int(argv[2])` 直接进 _page_box -> 非数裸 ValueError、
+        # 越界裸 IndexError, 都分不清"页码写错"与"工具坏了"）。
+        pageno, err = parse_page_arg(argv[1], argv[2])
+        if err:
+            print("❌ %s" % err, file=sys.stderr)
+            return 2
+        compare(argv[1], pageno, load_model(default_model()))
         return 0
     if argv and argv[0] == "--cuts":
         return _cuts_main(argv)
@@ -379,7 +443,13 @@ def main():
         print(__doc__)
         return 2
     pdf = sys.argv[1]
-    pageno = int(sys.argv[2])
+    if not os.path.isfile(pdf):
+        print("❌ 找不到 PDF: %s" % pdf, file=sys.stderr)
+        return 2
+    pageno, err = parse_page_arg(pdf, sys.argv[2])
+    if err:
+        print("❌ %s" % err, file=sys.stderr)
+        return 2
     kw = sys.argv[3] if len(sys.argv) > 3 else None
 
     model = load_model(default_model())
@@ -403,6 +473,11 @@ def main():
               % (i, name, val, x0, y0, x1, y1))
 
     chars = parse_chars(pdf).get(pageno - 1, [])
+    # [v34] 空字符流要说一声: 本工具靠 **LTChar** 定位断段, 扫描页(整页位图)本来就没有
+    # LTChar —— 静默打出一个空清单, 看着像「这页没问题」, 实际是「这页没得判」。
+    if not chars:
+        print("\n⚠ 本页字符流为空（pdfminer 一个 LTChar 都没吐）—— 可能是扫描页/整页位图,"
+              " 本口径对这类页没有覆盖（这是「没得判」, 不是「没问题」）。")
     print("\n-- 字符流 cls 分组（cls 跳变处 = 生产里的断段处）--")
     runs = []
     for ch in chars:

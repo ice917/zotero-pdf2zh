@@ -35,7 +35,7 @@ if _VENV_SITE not in sys.path:
     sys.path.insert(0, _VENV_SITE)
 
 from pdf2zh.converter import TranslateConverter
-from pdfminer.layout import LTFigure, LTImage, LTPage
+from pdfminer.layout import LTChar, LTFigure, LTImage, LTPage
 
 
 class FakeChar:
@@ -68,6 +68,28 @@ class _FakeStream:
 def make_image(x0, y0, x1, y1):
     im = LTImage("Im1", _FakeStream(), (x0, y0, x1, y1))
     return im
+
+
+class _FakeFont:
+    """真 LTChar 的最小字体替身 —— 只用到这三个成员(见 pdfminer.layout.LTChar.__init__)。"""
+    fontname = "F1"
+
+    def is_vertical(self):
+        return False
+
+    def get_descent(self):
+        return -0.2
+
+
+def make_char(x, y, w=5.0, size=10.0):
+    """真 LTChar。
+
+    [v34] 必须是真的: `_page_chars` 按 `isinstance(it, LTChar)` 认字, 用 FakeChar 的话
+    字符数恒为 0 —— 比例判据就成了空转(测了等于没测, 与 test_pause_adopt 的空转断言同类)。
+    水平书写、matrix=(1,0,0,1,x,y) 时 bbox = (x, y-2, x+w, y+8), 即**中心 ≈ (x+w/2, y+3)**。
+    """
+    return LTChar((1, 0, 0, 1, x, y), _FakeFont(), size, 1.0, 0.0, "a",
+                  w / size, 0.0, None, None)
 
 
 def src_of(rel):
@@ -103,6 +125,42 @@ def main():
     check("① 无位图不判为扫描", c._raster_covers_page(none) is False)
     check("① 退化页(面积 0)不判为扫描",
           c._raster_covers_page(FakePage(0, 0, [make_image(0, 0, 1, 1)])) is False)
+
+    # ---------- ①b [v34] 判据第二腿: 文字层必须基本落在覆盖式位图内 ----------
+    # 反面样本(2026-09-26 送审前审计, EXP-G): **原生数字页 + 半页大图**。只看位图面积时
+    # 它满足 >=0.5 被判成扫描件 -> 该页图/表区(cls<=-1)段落整段不重绘, 而 ops_base 已滤掉
+    # 全部 T 系列文字指令 -> 那几段在成品里永久缺字(它们并不在位图里)。压在图上方的正文
+    # 行框还会被清底铺白 -> 图被抹掉一块。真扫描件的分野不是面积, 是**文字层的位置**:
+    # 它的文字层是位图的隐形 OCR 复本, 逐字落在位图内。
+    def page_with(n_in, n_out, img=(0, 0, 612, 400)):
+        """半页位图(0,0,612,400) + n_in 个字在位图内(y=300, 中心≈303) / n_out 个在外(y=500)"""
+        items = [make_image(*img)]
+        items += [make_char(10 + i * 8, 300) for i in range(n_in)]
+        items += [make_char(10 + i * 8, 500) for i in range(n_out)]
+        return FakePage(612, 792, items)
+
+    check("①b 半页大图 + 正文大半在位图外 -> 不判扫描(原生页, 防永久缺字)",
+          c._raster_covers_page(page_with(2, 8)) is False)
+    check("①b 半页大图 + 文字层全在位图内 -> 判扫描(位图就是这页的可见内容)",
+          c._raster_covers_page(page_with(10, 0)) is True)
+    check("①b 比例恰好 = RASTER_INSIDE_RATIO(0.9) -> 判扫描(阈值含等号)",
+          c._raster_covers_page(page_with(9, 1)) is True)
+    check("①b 比例 8/9≈0.889 < 0.9 -> 不判扫描",
+          c._raster_covers_page(page_with(8, 1)) is False)
+    check("①b 比例判据用的是 RASTER_INSIDE_RATIO 常量",
+          c.RASTER_INSIDE_RATIO == 0.9, c.RASTER_INSIDE_RATIO)
+
+    # 递归: 位图与文字都埋在 LTFigure 里, 比例照样算得对(不递归就会漏掉这半页字符)
+    f2 = LTFigure("F2", (0, 0, 612, 792), (1, 0, 0, 1, 0, 0))
+    f2.add(make_image(0, 0, 612, 400))
+    f2.add(make_char(10, 300))
+    f2.add(make_char(20, 500))
+    check("①b 文字埋在 LTFigure 内也参与比例计算",
+          c._raster_covers_page(FakePage(612, 792, [f2])) is False)
+
+    # 无文字层 -> 退化为只看面积(与旧口径一致; 无字可重绘, 判哪边产物都一样)
+    check("①b 纯图页(无文字层)仍按面积判扫描",
+          c._raster_covers_page(page_with(0, 0)) is True)
 
     # 旁路: PDF2ZH_WHITEN_SCAN=0 -> 一律 False(出问题可秒关)
     _old = os.environ.get("PDF2ZH_WHITEN_SCAN")

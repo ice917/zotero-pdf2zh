@@ -111,15 +111,23 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
   退出: 两条腿 ——
         ① **主动告别**: 页面关窗前 sendBeacon 打 /api/bye -> 进 15s 宽限期, 期内有新心跳
            (F5 刷新 / 别的页面还活着)则告别作废, 否则退出。
-        ② **干完收摊**(v28.79+): ⑤ 出稿成功**且这一篇该做的都出齐了** -> 3s 后自动关停
-           (判据见 paper_done / stop_after_done)。失败、或还有块没出稿, 一律不退 ——
-           那时你要改稿重贴、或接着把表格做完。
-        [v28.79] **原先那条"心跳静默 IDLE_LIMIT=1800s 当窗口已关"的兜底已删掉**。
+        ② **完工关面板**(v36.4): 概念链接区那颗「完工, 关面板」按钮 -> 关掉自己的服务器。
+           **只有人按了才关**(或关窗走 ①)。
+        [v36.4] **原先的"⑤ 出稿且整篇出齐 -> 3s 自动收摊"(v28.79)已删掉**。
+        理由是它与概念链接区**天生冲突**: 加链接必须在成品出来之后(锚要落在成品印出来的
+        中文上、"第几处"要在成品里数), 而"整篇出齐"恰恰就是成品刚出来的那一刻 ——
+        留着自动收摊, 这条动线在第一步就被掐断, 人得重开面板才能接着做。
+        代价说白: 那条腿原是为了"正常动线走完不留常驻进程", 现在**收场交给人** ——
+        要么点②, 要么关窗(走①)。不肯按也不肯关窗时进程会留着, 这是新口径下的已知代价;
+        不拿"估一个时限"去堵, 理由见下。原判据 paper_done 留着 —— 它现在只用来在出稿
+        日志里说"这一篇齐了", 不再驱动任何自动行为。
+        [v28.79] **心跳静默 IDLE_LIMIT=1800s 当"窗口已关"的兜底也早已删掉**。
         它本质是个**估**: 估窄了把"切去豆包翻长文"的用户误杀(30s 实测踩过 ——
         用户切回来服务器已经自杀了, 前端还把连接失败谎报成"剪贴板里没有文本"),
         估宽了窗口真死了还要霸着 60642; 而放宽到多少都只是把同一个错误推远。
-        **② 就是那条兜底真正想近似的东西**: 它想说的不是"你多久没动静了", 而是"活干完了吧"。
-        换成⑤ 成功这个**确定性信号**之后, 时限怎么设就不再是问题 —— 也不用再删一次。
+        那条兜底真正想近似的东西**不是**"你多久没动静了", 而是"活干完了吧"。v28.79 曾用
+        "⑤ 出稿且整篇出齐"这个**确定性信号**接过它, v36.4 又按上面的理由退掉 —— 所以现在
+        这条动线上**没有**任何自动退出: 退出只有①关窗与②按按钮两条, 都得人来。
         连带的 /api/idle 端点、头部倒计时与暂停按钮一并删除。
   改动作废: /api/check 记下当时文本的 sha1, /api/commit 发现文本变了直接拒绝 ——
             "确认"不可能按在过期内容上(服务器端强制, 不只靠前端禁用按钮)。
@@ -145,10 +153,13 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
 
   [v28.73] **概念链接区**。原版超链接是**继承来的**(引文锚 -> 文献表, 学名 -> 附录), 读者只能点
     原书给的那几条 —— 而"读到这里我需要一点背景"这种需求原书不会替你想到, 位置该由读者定。
-    面板只接一条动线: **点选成品页面的文字 -> 填网址 -> 预检(不落盘) -> 装入 + 变蓝**。
-    判据一条都不重写(命中几处 / 该不该给"第几处" / 压住了谁), 全由 tools/user_links.py 说了算 ——
-    两边各判一套, 迟早分叉成两个答案。装完**自动接着跑 style_links**(新锚不变蓝 = 读者看不出能点,
-    功能等于没做), 这步顺序由代码保证, 不靠人记。
+    面板只接一条动线: **取该页逐段「原文↔译文」-> 点右边中文(或划一小段) -> 填网址 ->
+    预检(不落盘) -> 装入 + 变蓝**。判据一条都不重写(命中几处 / 该不该给"第几处" / 压住了谁),
+    全由 tools/user_links.py 说了算 —— 两边各判一套, 迟早分叉成两个答案。装完**自动接着跑
+    style_links**(新锚不变蓝 = 读者看不出能点, 功能等于没做), 这步顺序由代码保证, 不靠人记。
+    [v28.85] 取字的来源从"成品页的文本行"换成**本篇段表(侧车)**: 成品页文本层是排版后的
+    行、中英混排且不标语言, 在文献页/回填页上取字取到的必然是英文; 段表的 trans 是渲染时的
+    最终态, 且一份文件就有 页码+原文+译文。
 """
 import hashlib
 import io
@@ -245,6 +256,10 @@ UL_SCRIPT = os.path.join(UL_TOOLS, "user_links.py")
 UL_STYLE = os.path.join(UL_TOOLS, "style_links.py")
 UL_SPEC = os.path.join(wc.PROJ, "user_links.json")
 UL_KINDS = (("mono", "-mono.pdf"), ("dual", "-dual.pdf"))
+UL_SAVEAS_TAG = ".links"    # [v36.4] 「另存为」件: <stem>-mono.links.pdf
+# 为什么带这个尾巴: ① 它一眼看得出"这份带链接", 与干净成品并排放着不会认错;
+# ② 它以 .links.pdf 结尾而**不是** -mono.pdf, 所以 ul_pdfs() 列不到它 —— 挑成品时
+# 不会被它污染("拿带链接的那份再去装一遍"这条路从入口上就不存在)。
 
 
 def ul_body():
@@ -292,6 +307,82 @@ def ul_save(spec):
     with io.open(tmp, "w", encoding="utf-8") as f:
         json.dump(spec, f, ensure_ascii=False, indent=2)
     os.replace(tmp, UL_SPEC)
+
+
+# [v36.2] 三个**写**端点的留痕。落在 logs/ 下(logs/ 整个目录在 .gitignore 里, 不会弄脏仓库)。
+UL_AUDIT = os.path.join(wc.PROJ, "logs", "user_links_audit.log")
+
+
+def ul_counts(spec):
+    """(global 条数, 本篇条数)。"""
+    return (len(spec.get("global") or []),
+            len((spec.get("tasks") or {}).get(ul_task()) or []))
+
+
+def ul_echo_check(arr, idx, b):
+    """[v36.3] 回显校验: 要删/改的那一条, **必须还是前端当时看见的那一条**。返回错误话或 None。
+
+    为什么非有不可 —— `_ul_del`/`_ul_edit` 此前只认下标(idx), 不认身份。而概念链接区的
+    清单**只在加载时与 ulAbsorb()(用户自己增删改之后)刷新**: 页面开着不动, 清单就冻着
+    (全文件 setInterval 只有 5s 的 ping, 不碰清单)。冻结的清单 + 事后盘上变过 =>
+    同一下标指的是**点击者从没看见过的那一条**, 于是"删第 0 行"删掉了盘上第 0 行 ——
+    静默且不可逆。
+    (2026-09-26 实发: 一份只有 1 条的规格被一次点击清空, 真条目靠快照才捞回来。
+      机制已定 = 冻结清单 + 陈旧下标; 那一下是**谁**点的当时无留痕, 不可考。)
+
+    判据取 (anchor, url) **全等**: 前端回显它那一行的这两个字段, 与盘上 arr[idx] 比。
+    这两项都相同的两条, 内容完全一样, 删哪条结果一致 —— 所以这道判据到此为止是够的。
+    缺字段 = 页面是旧的(新前端必带) -> 一并拒绝, 免得留下一条不校验的旁路。
+
+    失败方向永远是"不动盘": 拒绝只是让用户按 F5 刷新, 猜错就是丢资产 —— 两者不对称。
+    """
+    if "oldanchor" not in b:
+        return "面板页面是旧的(缺回显字段)—— 按 F5 刷新页面再操作。"
+    if not (0 <= idx < len(arr)):
+        return "这条已经不在了(按 F5 刷新页面看看)。"
+    got = arr[idx] or {}
+    if (str(got.get("anchor") or "") != str(b.get("oldanchor") or "")
+            or str(got.get("url") or "") != str(b.get("oldurl") or "")):
+        return ("清单已经过期 —— 你要动的那一条跟盘上第 %d 条对不上(盘上是『%s』)。"
+                "按 F5 刷新页面, 看清了再来; 盘上**一个字都没动**。"
+                % (idx + 1, str(got.get("anchor") or "")[:40]))
+    return None
+
+
+def ul_digest():
+    """规格文件当下的 sha1 前 12 位 —— 留痕要能回答"那一下之后盘上到底是什么"。"""
+    try:
+        with io.open(UL_SPEC, "rb") as f:
+            return hashlib.sha1(f.read()).hexdigest()[:12]
+    except OSError:
+        return "-"
+
+
+def ul_audit(evt, before, after, entry=None, **extra):
+    """写端点留痕: 一行一条 JSON。
+
+    [v36.2] **为什么非补不可**: 2026-09-26 09:08:23 真规格被清成空模板, 事后**全无痕迹** ——
+    当时连"是谁、哪一下"都问不出, 丢的那条只能从快照捞回来(见 改动记录.md v36.1 末节)。
+    (机制已在 v36.3 定位: 冻结清单 + 陈旧下标, 见 ul_echo_check; 那一下是谁点的仍不可考 ——
+      正是"无留痕"本身把可考性断了, 这就是本段存在的理由。)
+    三个写端点此前一个日志都没有, 等于"改了用户的资产, 却问不出是谁、哪一下、删了哪一条"。
+    所以留痕里**必须带被动的条目原文**: add 写进去的是什么 / edit 改前是什么 / del 删掉的是哪一条 ——
+    只记"条目数 1 -> 0"照样答不出"丢的是哪条"。
+    **留痕是旁路, 失败不许影响主流程**: 整段吞异常(与 ul_save 的原子性同级要求)。
+    """
+    try:
+        rec = {"ts": time.strftime("%Y-%m-%d %H:%M:%S"), "pid": os.getpid(),
+               "evt": evt, "spec": UL_SPEC, "panel_proj": wc.PROJ,
+               "before": list(before), "after": list(after),
+               "entry": entry, "spec_sha1_12": ul_digest()}
+        rec.update(extra)
+        d = os.path.dirname(UL_AUDIT)
+        if d and not os.path.isdir(d):
+            os.makedirs(d)
+        with io.open(UL_AUDIT, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
 
 
 def ul_run(*args):
@@ -443,15 +534,19 @@ def pending_of(todos):
 
 
 def paper_done(todos):
-    """**这一篇该做的都出过稿了吗** —— ⑤ 出稿后要不要收摊, 就看这一个判据(见 stop_after_done)。
+    """**这一篇该做的都出过稿了吗** —— ⑤ 出稿的日志里说"这一篇齐了"就靠它。
 
-    为什么不是"⑤ 一成功就收": 面板是多格的(正文 + 表格正文/表注), 顺序随人 —— 正文出完稿、
-    表格还没做就关窗, 等于把人手里的活收走。所以判据是"**整篇齐了**"而不是"这一步过了"。
-    与 pending_of 的差别: 那个排除 self(出稿时提醒"还有 X 没出稿"用, 正在出的那块当然不算),
-    这里恰恰要算上正在出的那块 —— 它是收尾那一步, 出完才算齐。
+    [v36.4] 它**不再驱动任何自动行为**。v28.79 曾用它当"整篇出齐就自动收摊"的判据, 那条腿
+    已按本文件头的理由删掉(加概念链接必须在出稿之后, 自动收摊会把这条动线在第一步掐断)。
+    现在它只决定日志那句话 —— 判据口径本身没变, 所以留着, 不删。
+
+    为什么不是"⑤ 一成功就算": 面板是多格的(正文 + 表格正文/表注), 顺序随人 —— 正文出完稿、
+    表格还没做就说"齐了", 等于把人手里的活当干完了。所以判据是"**整篇齐了**"而不是
+    "这一步过了"。与 pending_of 的差别: 那个排除 self(出稿时提醒"还有 X 没出稿"用, 正在出的
+    那块当然不算), 这里恰恰要算上正在出的那块 —— 它是收尾那一步, 出完才算齐。
 
     foreign(烙着别篇的表)不算本篇欠的, 与 pending_of 同一口径。列表为空(这个目录里没有
-    正文任务)也**不算齐** —— 那种面板没有"这一篇"可言, 关不关不由这里决定。
+    正文任务)也**不算齐** —— 那种面板没有"这一篇"可言, 齐不齐不由这里决定。
     """
     return bool(todos) and not any(t["state"] != "done" and not t["foreign"] for t in todos)
 
@@ -1083,6 +1178,10 @@ textarea:focus{border-color:var(--primary);box-shadow:0 0 0 3px color-mix(in srg
 .lkind{flex:0 0 64px;color:var(--text2)}
 .lmsg{word-break:break-all}
 .lids{color:var(--muted);font-family:Consolas,monospace;font-size:12px;margin-top:3px}
+/* [v36] 「正在改」的那一条: 加一圈警示色。只把输入框填上是不够的 —— 清单里十几条
+   长得一样, 不标出来用户看不出在改哪一条, 会以为"改"是"再加一条"(实测就是这个坑)。 */
+.look.editing{border-color:var(--warn);box-shadow:0 0 0 1px var(--warn) inset}
+.look .lacts{display:flex;gap:6px;flex:0 0 auto}
 .empty{color:var(--ok);padding:16px 6px;font-size:13.5px;white-space:pre-line}
 /* 术语裁决入表(v28.76): ④ 报「术语」存疑 -> 人裁决 -> 就地写进术语表。两份表(1.x 的
    terms.csv 与 BabelDOC 的 terms.babeldoc.csv)格式不同, 手工维护必漏其中一份, 而漏掉的
@@ -1102,11 +1201,55 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
 .uli{background:var(--input-bg);color:var(--text);border:1px solid var(--glass-border);border-radius:10px;
   padding:6px 10px;font:inherit;font-size:13px;outline:none}
 .uli:focus{border-color:var(--primary);box-shadow:0 0 0 3px color-mix(in srgb,var(--primary) 20%,transparent)}
-.ul-lines{max-height:190px;overflow:auto;border-radius:12px;border:1px solid var(--glass-border);
-  background:var(--card-bg);padding:4px;margin:8px 0}
-.ul-line{padding:5px 10px;border-radius:8px;cursor:pointer;font-size:13px;word-break:break-all}
-.ul-line:hover{background:var(--hover)}
-.ul-line.sel{background:color-mix(in srgb,var(--primary) 22%,transparent);color:var(--text)}
+.ul-lines{max-height:230px;overflow:auto;border-radius:12px;border:1px solid var(--glass-border);
+  background:var(--card-bg);padding:4px;margin:8px 0;position:relative}
+/* 页分组小标题: sticky 钉在列表顶上, 滚到哪页那页的标题就停在那 —— 滚动联动里
+   人能看见"我现在在第几页"的另一半(spy 只改左上角读数, 这里给位置感)。
+   sticky 的 offsetTop 在浏览器里会报"钉住后的位置", 所以 spy 只数普通行(.ul-seg), 不数它。
+   [v28.94] 每页的标题+段行必须包在 .ul-group 里 —— sticky 的粘着范围是**包含块**:
+   平铺(标题与段行同为 .ul-lines 的直接子元素)时所有标题的包含块都是整个滚动容器,
+   于是滚过的标题**全部**钉在同一个 y(实测 11 页时第 1~9 页标题 relTop 全是 4.7, 一字不差),
+   再配上半透明的 --card-bg(.5) 就透出下层文字 —— 用户看到的就是"第9页与第10页叠字"。
+   分组后粘着范围收窄到本页, 下一组上推时把上一组的标题顶出去(sticky 原生推挤),
+   列表顶任何时刻只有一个标题, 上一页的字**彻底看不见**(不是被半透明盖住)。
+   ⚠ .ul-group 不许加 position(positioned 会让 .ul-seg 的 offsetParent 从 .ul-lines
+   变成它, offsetTop 少掉前面各组累计量 -> ulSpy/ulJump 的坐标基准当场作废)。 */
+.ul-group{position:static}
+.ul-lines .ul-head{position:sticky;top:0;z-index:1;color:var(--muted);font-size:12px;
+  padding:3px 10px;background:var(--card-bg);border-bottom:1px solid var(--glass-border)}
+.ulnav{margin-bottom:0}
+.ulnav button{min-width:32px;padding:6px 10px}
+/* [v28.89] 边界态不再用 disabled(禁用按钮浏览器不派发点击, 用户点了毫无反应,
+   实测 browser_click 直接报 "Element is disabled")。改 .off: 只变暗, 点击照常落地,
+   由监听器回一句话 —— 「点不动」的观感根源就是这份静默。 */
+.ulnav button.off{opacity:.35;cursor:not-allowed}
+/* [v36.1] 范围切换也用同一套: 没成品时「本篇」变暗但**不禁用** —— 与上面 .off 的理由一样,
+   点了给一句为什么(见 ulScopeSeg 的点击处理器), 不无声吞掉。 */
+.seg button.off{opacity:.35;cursor:not-allowed}
+.ul-seg{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:6px 10px;border-radius:8px;
+  cursor:pointer;font-size:13px;word-break:break-all;border-bottom:1px solid var(--glass-border)}
+/* 只有整个列表的最后一行才收掉下边框(本来的语义)。[v28.94] 分组后 .ul-seg 不再是
+   .ul-lines 的直接子元素, 光写 .ul-seg:last-child 会退化成"每页末行都收边框"
+   -> 页与页的断处少一条线(观感变化), 故按组来判定。 */
+.ul-group:last-child .ul-seg:last-child{border-bottom:0}
+.ul-seg:hover{background:var(--hover)}
+.ul-seg.sel{background:color-mix(in srgb,var(--primary) 22%,transparent)}
+.ul-seg .ul-src{color:var(--muted)}
+.ul-seg .ul-dst{color:var(--text)}
+.ul-seg.same .ul-dst{color:var(--muted);font-style:italic}
+/* [v35] 定位预览: 按 ◀▶ 时把那一处所在的**整页**渲出来、目标处涂成荧光黄 —— 面板这一区
+   由此第一次有了"页面"这一层。图是后端按需渲的只读快照(成品不动)。
+   width/height 都留 auto + max-* 双上限: 长宽比交给图片自己, 窄屏按宽缩、高屏按高缩,
+   两条都不超出 —— 不会有半张图被裁掉(黄块若恰在被裁的那半边, 定位就白做了)。
+   底衬固定白: 页面本身是白的, 深色主题下若透出卡片底色, 细笔画会糊掉。 */
+.ul-shot{margin:8px 0;border:1px solid var(--glass-border);border-radius:12px;
+  background:var(--card-bg);overflow:hidden}
+.ul-shot-hd{display:flex;align-items:center;gap:8px;padding:6px 10px;font-size:12px;
+  color:var(--muted);border-bottom:1px solid var(--glass-border)}
+.ul-shot-hd .ul-shot-ttl{flex:1}
+.ul-shot-bd{background:#fff;display:flex;justify-content:center}
+.ul-shot-bd img{display:block;max-width:100%;max-height:430px;width:auto;height:auto}
+.ul-shot-err{padding:10px;color:var(--danger);font-size:13px}
 .ulok{color:var(--ok)} .ulerr{color:var(--danger)}
 ::-webkit-scrollbar{width:10px;height:10px}
 ::-webkit-scrollbar-thumb{background:var(--glass-border);border-radius:8px;border:2px solid transparent;background-clip:content-box}
@@ -1215,20 +1358,33 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
         <div class="dd-list" role="listbox" hidden></div>
       </div>
       <label>页</label>
-      <input class="uli" id="ulPage" type="number" min="1" value="1" style="width:78px">
-      <button class="btn small" id="ulLinesBtn" type="button">取本页文字</button>
-      <span class="muted" id="ulPageStat"></span>
+      <div class="seg ulnav" id="ulPageNav" title="逐页翻。本篇条目记的就是这一页, 搜索也只在这一页里做">
+        <button type="button" id="ulPrev" title="上一页">◀</button>
+        <button type="button" id="ulNext" title="下一页">▶</button>
+      </div>
+      <span class="muted" id="ulPageStat">第 1 页</span>
+      <button class="btn small" id="ulLinesBtn" type="button" title="重读段表(出稿后段表变了点这个)">载入对照</button>
     </div>
     <div class="ul-lines" id="ulLines" hidden></div>
+    <div class="muted" id="ulSegHint"></div>
     <div class="row">
       <label>锚</label>
-      <input class="uli" id="ulAnchor" placeholder="点上面某一行的字填进来(手打要命: 差一个字就是一条死链)" style="flex:1;min-width:240px">
+      <input class="uli" id="ulAnchor" placeholder="点右边中文取整段, 或在中文里划一小段再点(短锚更稳)" style="flex:1;min-width:240px">
     </div>
     <div class="row">
       <label>网址</label>
       <input class="uli" id="ulUrl" placeholder="https://… (由你填, 机器不猜)" style="flex:1;min-width:220px">
       <label>第几处</label>
-      <input class="uli" id="ulOcc" type="number" min="1" placeholder="留空=只此一处" style="width:150px">
+      <div class="seg ulnav" id="ulOccNav" title="同一条锚在这一页出现多次时, 选第几处 —— 按 ◀▶ 会跳到那一处并把它涂成荧光黄标出来。只有一处时可不动">
+        <button type="button" id="ulOccPrev" title="上一处(跳到并涂亮)">◀</button>
+        <button type="button" id="ulOccNext" title="下一处(跳到并涂亮)">▶</button>
+      </div>
+      <span class="muted" id="ulOccStat">—</span>
+    </div>
+    <div class="ul-shot" id="ulShotWrap" hidden>
+      <div class="ul-shot-hd"><span class="ul-shot-ttl" id="ulShotStat">—</span>
+        <button class="btn small" id="ulShotClose" type="button">收起</button></div>
+      <div class="ul-shot-bd"><img id="ulShot" alt="该处所在页(荧光黄高亮即这一处)"></div>
     </div>
     <div class="row">
       <label>范围</label>
@@ -1237,16 +1393,42 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
         <button data-ulscope="全局" type="button">全局(跨篇通用)</button>
       </div>
       <button class="btn small" id="ulAddBtn" type="button">加入清单</button>
+      <button class="btn small" id="ulEditCancel" type="button" hidden
+              title="退出编辑, 不改这一条">取消编辑</button>
       <span style="flex:1"></span>
       <button class="btn small" id="ulCheckBtn" type="button">预检(不落盘)</button>
       <button class="btn primary small" id="ulApplyBtn" type="button">装入成品并变蓝</button>
+      <button class="btn small" id="ulSaveAsBtn" type="button"
+              title="不动原成品: 先复制一份 &lt;篇名&gt;-mono.links.pdf, 再把链接写进副本">另存为一份带链接的</button>
+      <button class="btn small" id="ulOpenBtn" type="button"
+              title="打开成品所在文件夹 —— 装好之后把这一份交给 Zotero">打开文件夹</button>
+      <button class="btn small" id="ulCloseBtn" type="button"
+              title="我完事了: 关掉面板(服务器一起停)。不碰盘上任何文件">完工, 关面板</button>
     </div>
     <div class="muted" id="ulWhy"></div>
     <div id="ulList"></div>
     <div class="log" id="ulOut" hidden></div>
-    <div class="muted">装入 = 只加你自己给的 URI 链接（原有的引文锚另说：压住同一条才删，且记账）。变蓝由 style_links 叠绘完成 ——
-      顺序（user_links → style_links）由面板保证，不用你记。落在回填页（整页无译文、原封搬过来的页）上的新锚不会变蓝：
-      那页的蓝字是原书自带的。</div>
+    <div class="muted">「载入对照」把<b>本篇段表（侧车）</b>逐段「原文 ↔ 译文」<b>一次载全篇、按页分组</b>——
+      <b>左列灰字是原文（不能当锚）, 右列黑字才是译文</b>。<b>在列表里滚动, 左上角页码就跟着走到你正看的页</b>（◀▶ 也能翻, 跳到那一页）;
+      点哪一段, 本篇条目就记那一段自己的页, 搜索只在那页里做（全局条目不吃页码）。
+      纯字形段（页眉/页码/整页表格）已按导出端同一口径滤掉, 故文献页整页不出现。
+      「第几处」不用手填：点完中文面板会拿这条锚去数, <b>只有一处就自动留空</b>（工具自己的默认语义即第 1 处）,
+      多处才要你选, 且选不到界外去。<b>按「第几处」边上的 ◀▶ 不只是改数字</b>：
+      面板会跳到那一处所在的页、并把<b>那一页渲出来、目标处涂成荧光黄</b>给你看（那图是只读快照, 成品不动）——
+      「第 3 处」到底是哪一处, 不用自己去数。长锚会跨行、跨行就搜不到 —— 拿不准就在中文里<b>划一小段</b>再点（越短越稳）,
+      <b>清单里每条都能「编辑」</b>：点它就把这一条回填到上面的表单（连页码与「第几处」一起），
+      改完点「更新这条」——<b>就地改，位置不变</b>（不是"删了再加"，那样会跳到清单末尾，用户会以为改错了条）；
+      范围也能一起改（本篇 ↔ 全局，全局条目自动不带页码）。不想改就点「取消编辑」。
+      改完还要「装入成品并变蓝」一次（或「另存为一份带链接的」），成品才跟得上。
+      填完先「预检」。装入 = 只加你自己给的 URI 链接（原有的引文锚另说：压住同一条才删, 且记账）。
+      变蓝由 style_links 叠绘完成 —— 顺序（user_links → style_links）由面板保证, 不用你记。
+      落在回填页（整页无译文、原封搬过来的页）上的新锚不会变蓝：那页的蓝字是原书自带的。
+      <b>「装入」就地改上面选中的那份成品；「另存为」不动原成品</b>, 另存成
+      <b>&lt;篇名&gt;-mono.links.pdf</b>（与干净成品并排放着, 一眼分得清）。
+      <b>面板不会去改 Zotero 里的文件</b> —— 那边的附件归 Zotero 自己管, 从外面动它是<b>热改</b>：
+      可能正被阅读器占住、可能正在同步, 而且改坏了当场看不出来。正确顺序是<b>先把链接装进成品,
+      再把这一份交给 Zotero</b>（点「打开文件夹」然后拖进去, 或让 ZotMoov 移进去）——
+      这样 Zotero 拿到的天生就带链接, 谁都不必去动它管的文件。装完点<b>「完工, 关面板」</b>收场。</div>
   </section>
 
   <section class="glass" id="healCard">
@@ -1581,8 +1763,8 @@ function render(r){
 /* ⑤ 出稿。底片(渲染前的存档)做不出来时服务器直接拦下(见 _commit), 这里只显示失败;
    **正文**出稿时若这一篇还有没出稿的, 服务器只**提醒**(日志黄条 + 台账记「缺 X」)并照旧渲染 ——
    顺序随你, 齐了就过, 缺了提醒。(v28.69 的硬拦截 + 逃生门已删: 渲染根本不读表格产物。)
-   服务器那侧还多一条: 出稿成功且**这一篇都出齐了**时会安排收摊(退出腿②, 见 stop_after_done),
-   响应里带 done —— 这里据此把话说明白并顺手试一次关窗。 */
+   [v36.4] 响应里的 done(= 这一篇出齐了)现在**只是句话**: 服务器不再据此收摊(理由见模块头
+   "退出"契约 —— 成品刚出来, 正是要接着做概念链接的时候)。所以这里也**不再试关窗**。 */
 function doCommit(){
   commitBtn.disabled=true;
   setBanner('busy','正在写入并排版…');
@@ -1596,15 +1778,12 @@ function doCommit(){
       return;
     }
     var msg=(r.warn?'! 已出稿, 但这一篇还有没出稿的: ':'✓ 已出稿: ')+r.out;
-    if(r.done)msg+=' —— 这一篇已出齐, 面板即将自动关停(这扇窗可以关了)';
+    if(r.done)msg+=' —— 这一篇已出齐。还要加概念链接就接着做, 完事了点概念链接区的「完工, 关面板」';
     setBanner(r.warn?'warn':'ok',msg);
     log('✓ 出稿: '+r.out+'  (翻译方 '+vendor+', 已记台账)');
     if(r.done){
-      /* 退出腿②(服务器的 stop_after_done 会关掉服务器)。这里顺手试着把窗口也关掉 ——
-         --app 开出来的窗通常拒绝脚本关窗(不是 script 打开的), 关不掉就靠横幅告诉人;
-         能关掉的话这扇窗就自己消失了。不赌它成功, 所以两条都做。 */
-      log('   服务器即将关停 —— 成品已自动打开。');
-      try{window.close()}catch(e){}
+      /* 成品刚出来 —— **不要**收摊: 概念链接必须在这一刻之后做(见模块头)。提示一句就够。 */
+      log('   成品已自动打开。下一步去「概念链接」区: 装上链接, 再把这一份交给 Zotero。');
     }
   });
 }
@@ -1721,32 +1900,130 @@ document.addEventListener('visibilitychange',function(){
 });
 window.addEventListener('pagehide',function(){navigator.sendBeacon('/api/bye')});
 /* ---- 概念链接: 把"成品里选中的那段字 -> 你自己的网址"装进成品 ----
-   动线为什么长这样: 锚文本必须**从成品页面上点选**。手打一个中文概念词, 差一个字就是一条
-   死链, 而"差一个字"光看屏幕看不出来 —— 所以先「取本页文字」, 点一行填进来, 再裁到要解释
-   的那个词。判据(命中几处/该不该给第几处/压住了谁)一律由 tools/user_links.py 说了算,
-   面板不另判一套: 两处各写一份, 迟早分叉成两个答案。 */
-var ul={pdfs:[],picked:'',task:'',global:[],own:[],scope:'本篇'};
+   动线为什么长这样: 锚文本必须**是成品页面上真正印出来的那段中文**。手打一个中文概念词,
+   差一个字就是一条死链, 而"差一个字"光看屏幕看不出来 —— 所以先「载入对照」, 点右边
+   中文(或在那段中文里划一小段)填进来。
+   为什么看的是段表(侧车)而不是成品页的文本行: 成品页的文本层是**排版后的行**、中英混排
+   且不标语言, 在文献页/回填页上取字取到的必然是英文; 段表自带 raw/trans 逐段对照, 一份
+   文件就有 页码+原文+译文, 且 trans 是渲染时的最终态。
+   判据(命中几处/该不该给第几处/压住了谁)一律由 tools/user_links.py 说了算, 面板不另判
+   一套: 两处各写一份, 迟早分叉成两个答案。 */
+/* [v35] hitsPos: 当前口径下每一处的 {page, rect}(后端 hits_pos, 阅读序) —— ◀▶ 定位的
+   唯一坐标来源; shotUrl: 预览图的 objectURL(换图前必须撤, 见 ulShotHide);
+   lastAnchor: 上一次**数过**的锚, 用来判断"锚换了没有"(换了才收预览/清位置)。 */
+var ul={pdfs:[],picked:'',task:'',global:[],own:[],scope:'本篇',page:1,pages:0,hits:-1,hitsDoc:undefined,occ:1,hitsPos:[],shotUrl:'',lastAnchor:null,
+/* [v36] 正在改哪一条(空 idx = 没在改)。**只存"哪一条"**(范围+下标), 不存条目内容 ——
+   内容始终从 ul.global/ul.own 现读, 免得两份副本各改各的(改完清单变了、副本还是旧的)。 */
+edit:{scope:'',idx:-1,anchor:'',occ:undefined}};
 function ulMsg(s,cls){var el=$('ulStat');el.className='muted'+(cls?' '+cls:'');el.textContent=s}
 function ulShow(t){var el=$('ulOut');el.hidden=!t;el.textContent=t||''}
+/* 页/第几处两处读数的**唯一**出口 —— 免得三个地方各写一套显示逻辑又各说各话。 */
+function ulPagePaint(){
+  /* [v36.1] 没成品就说没有页 —— 旧写法在 ul.pages=0 时显示"第 1 页", 那是一个不存在的页。 */
+  $('ulPageStat').textContent=ul.pages?('第 '+ul.page+' / '+ul.pages+' 页'):'—（还没成品 PDF）';
+  /* [v28.89] 边界态变暗但不禁用 —— 点了给话(见 ulGo), 不无声吞掉。 */
+  var lo=ul.page<=1, hi=!!ul.pages&&ul.page>=ul.pages;
+  $('ulPrev').classList.toggle('off',lo);
+  $('ulNext').classList.toggle('off',hi);
+  $('ulPrev').setAttribute('aria-disabled',lo?'true':'false');
+  $('ulNext').setAttribute('aria-disabled',hi?'true':'false');
+}
+function ulOccPaint(){
+  var n=ul.hits;
+  if(n<0){$('ulOccStat').textContent='—'}
+  else if(n===0){$('ulOccStat').textContent=(ul.scope==='全局'?'全篇':'这一页')+'找不到这条锚'}
+  else if(n===1){
+    /* [v28.89] 带全篇上下文: 「本页就这 1 处」而全篇还有, 就直说去「全局」能选。 */
+    $('ulOccStat').textContent=(ul.scope!=='全局'&&typeof ul.hitsDoc==='number'&&ul.hitsDoc>1)
+      ?('本页就这 1 处 · 全篇 '+ul.hitsDoc+' 处, 切「全局」可选'):'就这一处, 不用选';
+  }
+  else {$('ulOccStat').textContent='第 '+ul.occ+' / '+n+' 处'}
+  var lo=!(n>1)||ul.occ<=1, hi=!(n>1)||ul.occ>=n;
+  $('ulOccPrev').classList.toggle('off',lo);
+  $('ulOccNext').classList.toggle('off',hi);
+  $('ulOccPrev').setAttribute('aria-disabled',lo?'true':'false');
+  $('ulOccNext').setAttribute('aria-disabled',hi?'true':'false');
+}
+/* 拿锚去数命中几处。为什么回后端数: "命中几处"是 PDF 层的读数(search_for + 并框),
+   浏览器数不了; 而判据必须与门禁**同一套** —— 所以走 user_links.py --count-hits,
+   面板不另判一套。数不出来(n<0)读数就留「—」—— 绝不猜一个值; 但话要说(见下)。
+   数完必须**回一句话**: 0 处/1 处/多处各有各的说法(后者自己说, 前两者交给 ulOccWhy),
+   沉默就会让上一条锚的话挂在状态行上。 */
+function ulCount(){
+  var a=$('ulAnchor').value.trim();
+  /* [v35] 锚换了 -> 上次那些位置的框就不再对应当前这条锚, 立刻收掉预览。
+     只收"换锚"这一种: 滚动联动/翻页也会重数(锚没变), 那里把用户正看的图抽走就是倒退。 */
+  if(a!==ul.lastAnchor){ul.lastAnchor=a;ulShotHide()}
+  ul.hits=-1;ul.hitsDoc=undefined;ul.hitsPos=[];ul.occ=1;ulOccPaint();
+  if(!a||!ul.picked){
+    /* [v28.93] 提前返回也必须说话 —— 否则 #ulStat 停在上一条锚的话: 实测清空锚框后
+       它仍挂着「这条锚在当前页找不到…」。措辞不另写: ulOccWhy 是"为什么数不出来 /
+       为什么没得选"的唯一来源(与 v28.91 同一条纪律)。 */
+    ulOccWhy();return Promise.resolve()
+  }
+  return api('/api/ulhits',{target:ul.picked,anchor:a,page:ul.page,scope:ul.scope})
+    .then(function(r){
+      if(r.error||typeof r.hits!=='number'){
+        /* [v28.91] 数不出来也得说 —— 静默 return 会让 #ulStat 停在上一条锚的旧话上。 */
+        ulMsg('✗ '+(r.error||'命中处数没数出来'),'ulerr');ulShow(r.out||'');ulOccPaint();return;
+      }
+      ul.hits=r.hits;
+      ul.hitsDoc=(typeof r.hits_doc==='number')?r.hits_doc:undefined;
+      /* [v35] 每一处的位置(阅读序)。它只是**同一份 cand 的位置部分**(后端与 occ_list
+         同源), 故 hits_pos[i] 与写进 JSON 的 occurrence=i+1 必然是同一处。 */
+      ul.hitsPos=(r.hits_pos||[]);
+      /* [v28.91] 0 处/1 处也要说。以前只在 >1 时说, 于是这两种情况下 #ulStat 残留
+         上一条锚的「命中 N 处…」, 与本行的 #ulOccStat(「找不到 / 就这一处」)同屏打架。
+         措辞不另写一套: ulOccWhy 就是"为什么没得选"的唯一说法(点 ◀▶ 走的也是它)。 */
+      if(ul.hits>1){ulMsg('这条锚在'+(r.where||'本页')+'命中 '+ul.hits+' 处 —— 用 ◀▶ 选第几处(默认第 1 处)。')}
+      else{ulOccWhy()}
+      ulOccPaint();
+      /* [v35] 预览开着就跟着新读数走: 重数会把 occ 打回第 1 处, 图若还是上一处那张,
+         一屏之内就"读数说第 1 处、图上框的是第 3 处"(滚动过页界时会走到这里)。 */
+      if(!$('ulShotWrap').hidden){if(ul.hits>0)ulShot();else ulShotHide()}
+    });
+}
+/* [v36.1] 没成品时先解释**为什么只能攒全局** —— 否则用户会以为「本篇」坏了。 */
 function ulWhy(){
+  if(!ul.pdfs.length){
+    $('ulWhy').textContent='还没成品 PDF ⇒ 只能攒「全局」条目(跨篇通用, 按口径本来就不吃页码); '
+      +'本篇条目的页码现在无从谈起。「第几处」也数不出来 —— 都等出稿后用「编辑」补。';
+    return;
+  }
   $('ulWhy').textContent=ul.scope==='全局'
     ?'全局: 跨篇通用(锚按全篇找, “第几处”是全篇第几次出现; 不许带页码) —— 比如“基因漂变 → 某个百科”。'
     :'本篇: 只在这一篇生效(锚按该页找, “第几处”是该页第几次出现) —— 比如“图 3 里那个概念”。';
+}
+/* [v36] 退编辑态。**只清状态与按钮**, 不动输入框里的内容 —— 用户可能想拿它当"再搭一条"
+   的起点(锚留着、只换网址再加), 顺手清空等于惩罚。取消时才连输入框一起清(见 ulEditCancel)。 */
+function ulEditExit(){
+  ul.edit={scope:'',idx:-1,anchor:'',url:'',occ:undefined};
+  $('ulAddBtn').textContent='加入清单';
+  $('ulEditCancel').hidden=true;
+  ulRender();
 }
 function ulRender(){
   var rows=[];
   function row(e,scope,i){
     var where=scope==='全局'?'全篇':('第'+e.page+'页');
     var occ=e.occurrence?('，第'+e.occurrence+'处'):'';
-    return '<div class="look"><span class="lv '+(scope==='全局'?'mid':'hi')+'">'+scope+'</span>'
+    /* [v36] 正在改的那一条:**必须看得出来是哪一条** —— 清单十几条长得一样, 不标出来
+       用户会以为"改"是"再加一条", 于是重复加。边框由 .look.editing 给, 按钮也换字。 */
+    var ed=(ul.edit.scope===scope&&ul.edit.idx===i);
+    return '<div class="look'+(ed?' editing':'')+'">'
+      +'<span class="lv '+(scope==='全局'?'mid':'hi')+'">'+scope+'</span>'
       +'<div class="lmsg"><b>'+esc(e.anchor)+'</b><span class="muted"> '+where+occ+'</span>'
       +'<div class="lids">'+esc(e.url)+'</div></div>'
-      +'<button class="btn small" type="button" data-uldel="'+scope+':'+i+'">删</button></div>';
+      +'<span class="lacts">'
+      +'<button class="btn small" type="button" data-uledit="'+scope+':'+i+'">'
+      +(ed?'改的就是它':'编辑')+'</button>'
+      +'<button class="btn small" type="button" data-uldel="'+scope+':'+i+'">删</button>'
+      +'</span></div>';
   }
   (ul.global||[]).forEach(function(e,i){rows.push(row(e,'全局',i))});
   (ul.own||[]).forEach(function(e,i){rows.push(row(e,'本篇',i))});
   $('ulList').innerHTML=rows.length?rows.join('')
-    :'<div class="emptyhint">还没有绑定。取本页文字 -> 点一行 -> 填网址 -> 「加入清单」。</div>';
+    :'<div class="emptyhint">还没有绑定。载入对照 -> 点右边中文 -> 填网址 -> 「加入清单」。</div>';
 }
 function ulAbsorb(s){
   ul.task=s.task||ul.task;ul.global=s.global||[];ul.own=s.own||[];
@@ -1754,55 +2031,329 @@ function ulAbsorb(s){
   ulMsg('本篇「'+ul.task+'」 已绑定 '+ul.own.length+' 条 | 全局 '+ul.global.length+' 条');
 }
 function ulLines(){
-  var pg=parseInt($('ulPage').value||'0',10);
-  if(!ul.picked||!pg){return}
-  api('/api/ullines',{target:ul.picked,page:pg}).then(function(r){
+  if(!ul.picked){return}
+  /* [v28.87] page=0 = 全篇一次载入、按页分组。为什么不再一页一拉: 用户要在列表里
+     滚着看, 左上角页码跟着走 —— 只载一页就没有"滚过页界"这回事。段表是本地文件,
+     Lee 11 页 168 段也就几十 KB; 百页级再谈懒载(挂账, 未做)。 */
+  api('/api/ullines',{target:ul.picked,page:0}).then(function(r){
     if(r.error){ulMsg('✗ '+r.error,'ulerr');ulShow(r.out||'');return}
-    $('ulPageStat').textContent='成品共 '+r.pages+' 页'+(r.dual?'（双语版, 页码按单语数）':'');
-    if(pg>(r.pages||0)){$('ulPage').value=r.pages||1;return}
+    ul.pages=r.pages||0;ulPagePaint();
     $('ulLines').hidden=false;
-    window.__ulLines=r.lines||[];
-    $('ulLines').innerHTML=window.__ulLines.map(function(t,i){
-      return '<div class="ul-line" data-ulline="'+i+'">'+esc(t)+'</div>'
-    }).join('')||'<div class="emptyhint">这一页没有可取的文字。</div>';
+    var segs=r.segs||[];window.__ulSegs=segs;
+    var nz=segs.filter(function(s){return s.zh&&!s.same}).length;
+    $('ulSegHint').textContent='全篇 '+segs.length+' 段 · 有译文 '+nz+' 段'
+      +'（原文=译文的那几段是设计如此: 器件名/单位/文献条目不译, 拿它们当锚没意义）';
+    /* 按页分组: 每页一条小标题(样式钉在列表顶上), 段行跟着自己的页走。
+       [v28.94] 一页包一层 .ul-group —— 让 .ul-head 的 sticky 只在本页范围内生效,
+       否则滚过的标题会全叠在列表顶(用户实拍: "第9页"与"第10页"叠字)。见 CSS 处说明。
+       .ul-group 必须保持非 positioned(否则 .ul-seg 的 offsetTop 基准会变)。 */
+    var by={};segs.forEach(function(s,i){(by[s.page||1]=by[s.page||1]||[]).push(i)});
+    var html='';
+    Object.keys(by).map(Number).sort(function(a,b){return a-b}).forEach(function(pg){
+      html+='<div class="ul-group"><div class="ul-head">第 '+pg+' 页</div>';
+      by[pg].forEach(function(i){
+        var s=segs[i],zh=(s.zh||'').trim();
+        html+='<div class="ul-seg'+(s.same?' same':'')+'" data-ulseg="'+i+'"'
+          +' title="点右列取整段; 在右列里划一小段再点, 就取你划的那一小段">'
+          +'<span class="ul-src">'+esc(s.orig||'')+'</span>'
+          +'<span class="ul-dst">'+esc(zh||'(无译文, 原样保留)')+'</span></div>';
+      });
+      html+='</div>';
+    });
+    $('ulLines').innerHTML=html
+      ||'<div class="emptyhint">全篇没有可取的段（整篇是字形层/文献表, 没有能当锚的正文）。</div>';
+    ulSpy();          // 载入后先对一次表(重载后 scrollTop 会归零, 页码也得归位)
   });
+}
+/* 联动判据与跳页余量**必须成对看**: 跳页把目标行放在"离顶 UL_LEAD 像素"处,
+   联动在"离顶 UL_PAD 像素"的带子里找压在最下面的一行 —— 只有 UL_LEAD < UL_PAD,
+   跳完认回来的才是**目标页**; 反过来就是认成上一页、当场退回。
+   [v28.87 的 bug, 实测记录] 初版是 UL_LEAD=20 配 UL_PAD=10: 真实鼠标点 ▶ 后
+   scrollTop 由 0 变成 5424(列表确实滚到了第 2 页首行 5444-20), 但页读数仍是"第 1 / 11 页"
+   —— spy 算 st=5434, 第 2 页首行 5444 > 5434 不够格, 于是取到**第 1 页末行**并退回。
+   表现就是"◀▶ 点不动"(◀ 在第 1 页本就是 disabled, ▶ 又被退回)。
+   UL_LEAD 为什么不是 0: 页面分组标题(.ul-head, ~25px)是 sticky 钉在列表顶上的,
+   目标行若贴着顶边就被自己的标题盖住 -> 留 28px 让首行从标题下沿露出来。
+   余量校验: 下一行至少高 ~31px, 而判据只往上留 UL_PAD-UL_LEAD=12px, 够不开。 */
+var UL_LEAD=28, UL_PAD=40;
+function ulSpy(){
+  var c=$('ulLines'),rows=c.querySelectorAll('[data-ulseg]');
+  if(!rows.length)return;
+  var st=c.scrollTop+UL_PAD,cur=parseInt(rows[0].getAttribute('data-ulseg'),10);
+  for(var i=0;i<rows.length;i++){
+    if(rows[i].offsetTop<=st)cur=parseInt(rows[i].getAttribute('data-ulseg'),10);
+    else break;
+  }
+  var pg=(window.__ulSegs[cur]||{}).page;
+  if(pg&&pg!==ul.page){
+    ul.page=pg;ulPagePaint();
+    /* [v34] 页读数一变, **命中处数就得跟着重数**: 「本篇」口径下的 hit 数是**该页**的读数
+       (ulCount 把 ul.page 发给后端, 见 /api/ulhits), 不重数就会挂着上一页的数字 ——
+       观感是"都滚到第 2 页了, 下面还写着第 1 页的第 3/3 处"。另两条改页的路径早就重数了
+       (ulGo(◀▶) 与点段的处理器末尾都显式调 ulCount), 漏的正是这条滚动驱动的路径。
+       只在「本篇」且锚与成品都在时重数: 「全局」口径的读数与页无关, 数了也是白跑一趟后端。 */
+    if(ul.scope!=='全局'&&ul.picked&&$('ulAnchor').value.trim())ulCount();
+  }
+}
+$('ulLines').addEventListener('scroll',ulSpy);
+/* ◀▶ 不再重拉数据(全篇已在列表里): 直接滚到那一页首行, spy 会把读数对上。
+   坐标基准只有一层: .ul-lines 设了 position:relative, 行的 offsetTop 就是相对
+   容器 padding 盒的, scrollTop 直接用。UL_LEAD 必须 < UL_PAD —— 见上面的成对说明。 */
+function ulJump(pg){
+  var c=$('ulLines'),head=null,rows=c.querySelectorAll('[data-ulseg]');
+  for(var i=0;i<rows.length;i++){
+    var p=(window.__ulSegs[parseInt(rows[i].getAttribute('data-ulseg'),10)]||{}).page;
+    if(p===pg){head=rows[i];break}
+    if(p>pg)break;
+  }
+  if(head)c.scrollTop=Math.max(0,head.offsetTop-UL_LEAD);
+}
+/* [v36] 口径的**唯一**写法: 改 ul.scope + 点亮按钮 + 刷新说明。编辑时会用它把口径切到
+   那一条自己的范围(全局条目不许带页), 所以从点击处理器里提出来共用一份。 */
+function ulScopeSet(s){
+  ul.scope=s;
+  $('ulScopeSeg').querySelectorAll('button').forEach(function(x){
+    var sc=x.getAttribute('data-ulscope');
+    x.classList.toggle('on',sc===s);
+    /* [v36.1] 没成品时「本篇」变暗(不禁用 —— 同 .off 的既有约定: 点了给话, 不无声吞掉)。
+       正在编辑一条**已有的**本篇条目时例外: 那时它的页码来自规格本身, 是真值, 不是现编的。 */
+    x.classList.toggle('off',sc!=='全局'&&!ul.pdfs.length&&!(ul.edit.scope===sc));
+  });
+  ulWhy();
 }
 var ulPdfDD;
 $('ulScopeSeg').addEventListener('click',function(e){
   var b=e.target.closest('button');if(!b)return;
-  ul.scope=b.getAttribute('data-ulscope');
-  this.querySelectorAll('button').forEach(function(x){x.classList.toggle('on',x===b)});
-  ulWhy();
+  var sc=b.getAttribute('data-ulscope');
+  /* [v36.1] 没成品就**无从给页码**: ul.pages=0 时 ul.page 只是编辑框里那个"第 1 页",
+     它不是真值(而且旧 ulGo 在 pages=0 时连上界都没有)。静默写一个编出来的页码, 是
+     这一区最不能犯的错 —— 链接会安静地装到别处去。 */
+  if(sc!=='全局'&&!ul.pdfs.length&&ul.edit.scope!==sc){
+    ulMsg('还没成品 PDF —— 本篇条目要给真实页码, 现在给不出。先按「全局」攒(跨篇通用, 不吃页码), 出稿后用「编辑」改成本篇并补页。','ulerr');
+    return;
+  }
+  ulScopeSet(sc);
+  ulShotHide();       // [v35] 口径换了 -> 页/处都换了一套, 上一张预览作废(重数后 occ 也回第 1 处)
+  ulCount();          // 口径换了(本篇=该页 / 全局=全篇), 命中处数跟着换 —— 必须重数
 });
+/* 翻页 [v28.87]: 全篇已载进列表, ◀▶ 只是滚到那一页(不重拉); 滚动触发 spy,
+   读数由 spy 写 —— 这里只把 ul.page 先行写掉, 免得 ulCount 拿旧页去数。 */
+function ulGo(d){
+  /* [v36.1] 没成品时**页不存在**。而且旧写法这里没有上界(pages=0 时 hi 恒为假)——
+     能一路翻到"第 9 页"却一页都不存在, 翻出来的页号还会被写进条目。挡在入口。 */
+  if(!ul.pages){ulMsg('还没有成品 PDF —— 现在没有"页"可翻。','ulerr');return}
+  var next=ul.page+d;
+  if(next<1){ulMsg('已经是第 1 页了。');return}
+  if(ul.pages&&next>ul.pages){ulMsg('已经是最后一页(第 '+ul.pages+' 页)了。');return}
+  ul.page=next;ulPagePaint();
+  $('ulLines').querySelectorAll('.ul-seg').forEach(function(x){x.classList.remove('sel')});
+  ulJump(next);ulCount();
+}
+$('ulPrev').addEventListener('click',function(){ulGo(-1)});
+$('ulNext').addEventListener('click',function(){ulGo(1)});
+/* [v28.89] 点了必须有一句话 —— 静默是「点不动」观感的根源(实测教训)。
+   每种"不能选"的状态各有一句为什么 + 下一步怎么办。
+   [v28.91] 它不再只服务 ◀▶: 调用点扩到两处 —— ①点 ◀▶ 没得选时解释; ②ulCount 数完
+   hits<=1 时报当前状态。所以 "为什么没得选"这句话只此一份 —— 不再在 ulCount 里另写一套措辞。
+   [v28.93] 第三处: ③ulCount 的**提前返回**(锚为空 / 没选成品)也走它 —— 那条路径原先
+   一声不响, 于是清空锚框后会留着上一条锚的话。 */
+/* [v36] 提交按钮当下叫什么 —— 编辑态是「更新这条」, 其余时候是「加入清单」。
+   ulOccWhy 要引用它: 把按钮名写死的下场是"用户在编辑, 提示却叫他去点「加入清单」"
+   (实测就是这样) —— 名字都不对, 下一步该点哪里就说不清了。 */
+function ulSubmitName(){return $('ulAddBtn').textContent}
+function ulOccWhy(){
+  if(ul.hits>1)return;
+  if(!ul.picked){ulMsg('先在「成品」里选一个 PDF, 才数得出第几处。');return}
+  /* [v28.93] 锚为空是**独立**的一种状态, 不能并进下面那条"还没数过": 锚空时根本没有可数
+     之物, 说"还没数过"会让人以为框里有东西。排在 !ul.picked 之后 —— 成品没选是更前面的
+     坎, 先解决它。 */
+  if(!$('ulAnchor').value.trim()){ulMsg('锚为空 —— 先在右列中文里取字(点整段, 或划一小段再点)。');return}
+  if(ul.hits<0){ulMsg('这条锚还没数过 —— 点一下右列中文(或改完锚点一下别处), 数完才知道有没有第几处。');return}
+  if(ul.hits===0){ulMsg('这条锚在'+(ul.scope==='全局'?'全篇':'当前页')+'找不到 —— 锚要和右列黑字一字不差, 划一小段更稳。');return}
+  if(ul.scope==='全局'){ulMsg('这条锚全篇就 1 处, 没有第几处可选 —— 直接点「'+ulSubmitName()+'」即可。');return}
+  if(ul.hitsDoc>1){ulMsg('本页就这 1 处, 没得选 —— 全篇共 '+ul.hitsDoc+' 处, 切「全局」再点 ◀▶ 就能跨页选。');return}
+  ulMsg('这条锚全篇就 1 处, 没有第几处可选 —— 直接点「'+ulSubmitName()+'」即可。');
+}
+/* [v35] 预览图的生命周期只此一处: 撤掉上一张 objectURL 再换新的。
+   keepOpen=true 用于"换图不关窗"(◀▶ 连续点时画面不闪); 其余场景(换锚/换成品/收起)
+   一律连面板一起收掉。
+   为什么必须先撤: 每次 ◀▶ 都渲一张新 PNG, 不撤就一份份攒在内存里(1224×1584 的位图
+   一张约 7.7MB, 手上按二十下就上百 MB)。 */
+function ulShotHide(keepOpen){
+  if(ul.shotUrl){URL.revokeObjectURL(ul.shotUrl);ul.shotUrl=''}
+  var im=$('ulShot');if(im)im.removeAttribute('src');
+  if(!keepOpen)$('ulShotWrap').hidden=true;
+}
+/* 把"第几处"那一处**指出来**: 后端渲该页 PNG(目标处涂荧光黄) -> 显示在下面。
+   坐标一个都不在面板算 —— 全用后端 hits_pos 给的那四个数(与"命中几处"同一把尺子)。 */
+function ulShot(){
+  var p=ul.hitsPos[ul.occ-1];
+  if(!p){ulMsg('这一处的坐标没拿到 —— 改一下锚再改回来, 重数一次就有。','ulerr');return}
+  $('ulShotWrap').hidden=false;
+  $('ulShotStat').textContent='第 '+ul.occ+' / '+ul.hits+' 处 → 第 '+p.page+' 页（黄色高亮就是这一处）';
+  fetch('/api/ulshot',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({target:ul.picked,page:p.page,rect:p.rect})})
+    .then(function(r){
+      /* 认**内容类型**而不是 r.ok: 面板的错也是 JSON + 200(见 _json 的默认 code) ——
+         照 r.ok 判, 一份 {"error":…} 会被当成图片塞进 img, 显示成一张破图, 用户看不到原因。 */
+      if((r.headers.get('Content-Type')||'').indexOf('image/')!==0){
+        return r.json().then(function(j){throw new Error(j.error||'这一页渲不出来')})
+      }
+      return r.blob();
+    })
+    .then(function(bl){ulShotHide(true);ul.shotUrl=URL.createObjectURL(bl);$('ulShot').src=ul.shotUrl})
+    .catch(function(e){$('ulShotStat').textContent='✗ '+((e&&e.message)||'这一页渲不出来')});
+}
+/* ◀▶ 不再只改数字了: 它同时**把那一处指给人看** —— 跳页(段表滚到该页) + 显示涂了荧光黄的那一页。
+   [边界, 有意保留] 命中 <=1 处时仍走 ulOccWhy(不显示预览): ◀▶ 的语义是"在多处之间选",
+   只有一处时"选"这件事不存在 —— 那句话(v28.89/91/93 反复打磨过)比一张图更能说明白。
+   跳页之后**不重数**: 「本篇」口径下所有命中本来就在同一页(不会跳), 「全局」口径的读数
+   与页无关(重数纯属白跑一趟, 且会把用户刚选的第几处打回第 1 处)。 */
+function ulOccGo(d){
+  if(!(ul.hits>1)){ulOccWhy();return}
+  var next=ul.occ+d;
+  if(next<1){ulMsg('已经是第 1 处了。');return}
+  if(next>ul.hits){ulMsg('已经是最后一处（共 '+ul.hits+' 处）了。');return}
+  ul.occ=next;ulOccPaint();
+  var p=ul.hitsPos[ul.occ-1];
+  if(!p){ulShot();return}
+  if(p.page!==ul.page){ul.page=p.page;ulPagePaint();ulJump(p.page)}
+  ulShot();
+  ulMsg('已定位到第 '+ul.occ+' / '+ul.hits+' 处 —— 第 '+p.page+' 页, 下面图里涂黄的就是它。');
+}
+$('ulOccPrev').addEventListener('click',function(){ulOccGo(-1)});
+$('ulOccNext').addEventListener('click',function(){ulOccGo(1)});
+$('ulShotClose').addEventListener('click',function(){ulShotHide()});
+$('ulAnchor').addEventListener('change',function(){ulCount()});
 $('ulLinesBtn').addEventListener('click',ulLines);
 $('ulLines').addEventListener('click',function(e){
-  var d=e.target.closest('[data-ulline]');if(!d)return;
-  $('ulAnchor').value=(window.__ulLines||[])[parseInt(d.getAttribute('data-ulline'),10)]||'';
-  this.querySelectorAll('.ul-line').forEach(function(x){x.classList.remove('sel')});
+  var d=e.target.closest('[data-ulseg]');if(!d)return;
+  var s=(window.__ulSegs||[])[parseInt(d.getAttribute('data-ulseg'),10)]||{};
+  /* 划词优先: 在右列(译文)里划一小段再点, 取的就是那一小段。长锚会跨行, 跨行 search_for
+     就搜不到 —— 实测 Lee: 整段命中 15.6%, 8 字窗口 84.4%, 而中文在页面文本层是 100%。 */
+  var sel=window.getSelection(),picked='';
+  /* [v34] 划的两头都必须在**同一段**里: 只验 anchorNode 的话, 从这一段划到下一段、
+     再点回这一段, 锚就成了"两段文字拼起来的串" —— 页面上并不存在这个串, 数命中时
+     要么 0 处(用户莫名其妙), 要么靠字符级兜底拼出一个跨大半页的假热区。 */
+  if(sel&&!sel.isCollapsed&&d.contains(sel.anchorNode)&&d.contains(sel.focusNode)
+     &&String(sel).trim()){
+    picked=String(sel).trim();
+  }
+  var a=picked||(s.zh||'').trim();
+  if(!a){ulMsg('✗ 这一段没有译文(原文原样保留), 拿它当锚没意义 —— 换一段有中文的。','ulerr');return}
+  $('ulAnchor').value=a;
+  /* 页跟着行走: 条目记的是**这一段自己的页**, 不依赖滚动状态(spy 可能还没追上,
+     而且手敲锚的人未必滚在行所在页)。 */
+  if(s.page&&s.page!==ul.page){ul.page=s.page;ulPagePaint()}
+  this.querySelectorAll('.ul-seg').forEach(function(x){x.classList.remove('sel')});
   d.classList.add('sel');
-  ulMsg('已填入整行 —— 请裁到要解释的那个词再「加入清单」: 多一个字就是一个不同的锚。');
+  ulMsg(picked?('已填入你划的这一小段（'+picked.length+' 字）—— 越短越稳。')
+              :('已填入整段译文（'+a.length+' 字）—— 若「预检」说搜不到, 就在这段中文里划一小段再点。'));
+  ulCount();          // 顺手数一遍命中几处: 只有一处就自动留空, 多处才要人选
 });
 $('ulList').addEventListener('click',function(e){
+  /* [v36] 编辑: 把这一条**回填进上方的表单**, 并把「加入清单」换成「更新这条」。
+     回填的是这一条的**真实字段**(含 page 与 occurrence) —— 用户改没改、改了什么, 一眼可见。
+     行内的"改的就是它"标记见 ulRender: 清单十几条长得一样, 没有标记用户会以为是"再加一条"。 */
+  var eb=e.target.closest('button[data-uledit]');
+  if(eb){
+    var ev=eb.getAttribute('data-uledit').split(':');
+    var es=ev[0],ei=parseInt(ev[1],10);
+    var arr=(es==='全局'?ul.global:ul.own)||[];
+    var it=arr[ei];
+    if(!it){ulMsg('这条已经不在了 —— 重开面板看看。','ulerr');return}
+    ul.edit={scope:es,idx:ei,anchor:it.anchor,url:it.url,occ:it.occurrence};
+    $('ulAnchor').value=it.anchor||'';$('ulUrl').value=it.url||'';
+    ulScopeSet(es);                 // 口径跟着这条走(全局条目本来就不带页)
+    if(es!=='全局'&&it.page&&it.page!==ul.page){ul.page=it.page;ulPagePaint()}
+    ulRender();
+    $('ulAddBtn').textContent='更新这条';
+    $('ulEditCancel').hidden=false;
+    /* 数一遍当前锚: 让「第几处」/◀▶/荧光黄预览**立刻对这条锚有效**, 并把原 occurrence 认回来
+       (ulCount 会把 occ 归 1, 所以得数完再摆正)。锚若被改小了命中数, 就只认得的那一个 ——
+       越界由工具那边"occurrence 越界"这条门禁在「预检」里拦, 面板不替它判。 */
+    ulCount().then(function(){
+      if(it.occurrence&&ul.hits>1){
+        ul.occ=Math.min(Math.max(1,it.occurrence),ul.hits);ulOccPaint();ulShot();
+      }
+      /* 这句交代必须写在**数完之后**: ulCount 内部会用它自己的话(ulOccWhy)覆盖状态行 ——
+         写在外面等于刚说出口就被擦掉(实测: 进去编辑的人看到的却是"直接「加入清单」即可")。
+         还要认一下用户是不是**已经取消**了: 取消后再弹这句, 就是在说一条不存在的编辑。 */
+      if(ul.edit.scope===es&&ul.edit.idx===ei){
+        ulMsg('正在改「'+it.anchor+'」—— 改好后点「更新这条」;不想改就点「取消编辑」。');
+      }
+    });
+    return;
+  }
   var b=e.target.closest('button[data-uldel]');if(!b)return;
   var v=b.getAttribute('data-uldel').split(':');
-  api('/api/uldel',{scope:v[0],idx:parseInt(v[1],10)}).then(function(r){
+  /* [v36.3] 把**这一行自己的原文**一起回显给后端。后端只认下标时: 冻着的旧清单 + 盘上
+     已变 = 删掉点击者从没看见过的那一条(2026-09-26 实发, 一份只有 1 条的规格被清空)。
+     idx 指的就是 ul.global/ul.own 里那一行 —— 行由 ulRender 从**同一个数组**渲出, 同源。 */
+  var dit=((v[0]==='全局'?ul.global:ul.own)||[])[parseInt(v[1],10)];
+  if(!dit){ulMsg('这条已经不在了 —— 按 F5 刷新页面看看。','ulerr');return}
+  api('/api/uldel',{scope:v[0],idx:parseInt(v[1],10),
+      oldanchor:String(dit.anchor||''),oldurl:String(dit.url||'')}).then(function(r){
     if(r.error){ulMsg('✗ '+r.error,'ulerr');return}
+    /* 删完之后它后面每一条的下标都往前挪了 —— 编辑态里记的那个下标**已经指到别人身上**,
+       就地退出(不退的话下一次"更新"会改错条, 而且是静默的)。 */
+    if(ul.edit.idx>=0)ulEditExit();
     ulAbsorb(r);ulMsg('已删掉 1 条(成品若已装过, 得重新「装入成品并变蓝」才跟得上)');
   });
 });
+$('ulEditCancel').addEventListener('click',function(){
+  ulEditExit();
+  $('ulAnchor').value='';$('ulUrl').value='';
+  ul.hits=-1;ul.occ=1;ul.hitsPos=[];ulShotHide();ulOccPaint();
+  ulMsg('已取消编辑, 这一条一个字都没改。');
+});
 $('ulAddBtn').addEventListener('click',function(){
   var anchor=$('ulAnchor').value.trim(),url=$('ulUrl').value.trim();
-  if(!anchor){ulMsg('✗ 锚文本是空的 —— 先「取本页文字」点一行。','ulerr');return}
+  if(!anchor){ulMsg('✗ 锚文本是空的 —— 先「载入对照」点右边中文。','ulerr');return}
   if(!/^https?:\/\//.test(url)){ulMsg('✗ 网址要以 http:// 或 https:// 开头。','ulerr');return}
-  api('/api/uladd',{scope:ul.scope,anchor:anchor,url:url,
-                    page:parseInt($('ulPage').value||'0',10),occurrence:$('ulOcc').value})
+  var ed=ul.edit.idx>=0;
+  /* [v36.1] 没成品时**只许攒全局**: 本篇条目须有真实页码, 而没成品时 ul.page 只是编辑框里
+     那个"第 1 页"(见 ulGo 与范围切换的同一道拦)。静默写一个编出来的页码, 正是这一区最不能
+     犯的错 —— 链接会安静地装到别处去。编辑一条**已有的**本篇条目不受此限: 页码来自规格本身。 */
+  if(!ed&&ul.scope!=='全局'&&!ul.pdfs.length){
+    ulMsg('还没成品 PDF —— 本篇条目要给真实页码, 现在给不出。把范围切到「全局」先攒(跨篇通用, 不吃页码), 出稿后再「编辑」改成本篇补页。','ulerr');
+    return;
+  }
+  /* 先数再提交: 手敲的锚可能还没数过(change 与点击只差一个往返), 数出来再提交,
+     就不会撞上"命中 N 处请给 occurrence"那条门禁, 也不会猜一个越界的值。
+     数不出来(hits<0)就 occurrence 留空 —— 保持"不给值"的原语义, **绝不猜**。
+     [v36] 编辑走同一个出口: 只有端点与两个附加字段不同, 校验/计数/收尾全共用 ——
+     分成两段写迟早分叉成两种行为。 */
+  ulCount().then(function(){
+    var occ=(ul.hits>1?ul.occ:'');
+    if(ed&&ul.hits<0){
+      /* [v36.1] 数不出来时**不许把 occurrence 洗掉**: 原条目上那个值是上一轮在成品上数出来的
+         真值, 这一趟只是改网址, 不该因为"此刻数不了"就丢(那是静默数据丢失)。锚改了就不敢保 ——
+         那个值是按旧锚数的, 对新锚没有意义, 只能先出稿。 */
+      if(anchor!==ul.edit.anchor){
+        ulMsg('锚改了、可现在没有成品 PDF, 数不出新锚命中几处 —— 先出稿再改锚(否则「第几处」只能乱写)。','ulerr');
+        return;
+      }
+      occ=(ul.edit.occ===undefined||ul.edit.occ===null)?'':ul.edit.occ;
+    }
+    var body={scope:ul.scope,anchor:anchor,url:url,page:ul.page,occurrence:occ};
+    if(ed){body.idx=ul.edit.idx;body.oldscope=ul.edit.scope;
+      /* [v36.3] 回显的是**进编辑态那一刻的原文**(ul.edit 里存的), 不是现在输入框里的值 ——
+         用户可能正好在改锚, 拿改后的值去校验等于自己给自己盖章。 */
+      body.oldanchor=String(ul.edit.anchor||'');body.oldurl=String(ul.edit.url||'')}
+    api(ed?'/api/uledit':'/api/uladd',body)
     .then(function(r){
       if(r.error){ulMsg('✗ '+r.error,'ulerr');return}
+      ulEditExit();          // 先退编辑态: 否则重渲出来的行还挂着"改的就是它"
       ulAbsorb(r);
-      $('ulAnchor').value='';$('ulUrl').value='';$('ulOcc').value='';
-      $('ulLines').querySelectorAll('.ul-line').forEach(function(x){x.classList.remove('sel')});
-      ulMsg('已进清单 —— 点「预检」看它装不装得上(此刻还一个字都没写进成品)。');
+      $('ulAnchor').value='';$('ulUrl').value='';
+      ul.hits=-1;ul.occ=1;ul.hitsPos=[];ulShotHide();      // [v35] 锚清了, 位置与预览一起作废
+      ulOccPaint();
+      $('ulLines').querySelectorAll('.ul-seg').forEach(function(x){x.classList.remove('sel')});
+      ulMsg(ed?'已更新这一条(位置不变) —— 点「预检」看它还装不装得上(此刻成品还是旧的)。'
+              :'已进清单 —— 点「预检」看它装不装得上(此刻还一个字都没写进成品)。');
     });
+  });
 });
 $('ulCheckBtn').addEventListener('click',function(){
   ulShow('预检中…');
@@ -1812,12 +2363,38 @@ $('ulCheckBtn').addEventListener('click',function(){
           r.ok?'ulok':'ulerr');
   });
 });
-$('ulApplyBtn').addEventListener('click',function(){
-  ulShow('装入中…');
-  api('/api/ulapply',{target:ul.picked}).then(function(r){
-    ulShow(r.out||'');
-    ulMsg(r.ok?'✓ 已装入并变蓝。':'✗ 装入没过 —— 照上面输出看哪一条卡住了(没过就不落盘)。',
-          r.ok?'ulok':'ulerr');
+/* 装入: 两条去向都由**后端**算 —— 前端只报一个 mode, 不指路径(它本来就给不出路径,
+   见 _ul_apply)。就地 = 改选中那份成品; 另存为 = 先复制再改副本, 原成品一个字节不动,
+   于是"试错"永远伤不到干净成品, 也不需要另做一套备份。 */
+function ulInstall(mode,btn){
+  if(btn)btn.disabled=true;
+  ulShow(mode==='saveas'?'另存为并装入中…':'装入中…');
+  api('/api/ulapply',{target:ul.picked,mode:mode}).then(function(r){
+    if(btn)btn.disabled=false;
+    ulShow((r.file?'→ '+r.file+'\n\n':'')+(r.out||''));
+    if(r.ok){
+      ulMsg('✓ '+(mode==='saveas'?'已另存为带链接的一份（原成品没动）：':'已就地装入并变蓝：')
+            +(r.file||''),'ulok');
+    }else if(r.links_written){
+      /* 链接写了、变蓝没成 —— 不许含糊成"没装", 也不许说成"全好了"。 */
+      ulMsg('! 链接已写进 '+r.file+' , 但「变蓝」这步没过 —— 照上面输出看。','ulerr');
+    }else{
+      ulMsg('✗ 装入没过 —— 照上面输出看哪一条卡住了(没过就不落盘)。','ulerr');
+    }
+  });
+}
+$('ulApplyBtn').addEventListener('click',function(){ulInstall('inplace',this)});
+$('ulSaveAsBtn').addEventListener('click',function(){ulInstall('saveas',this)});
+$('ulOpenBtn').addEventListener('click',function(){
+  api('/api/ulopen',{target:ul.picked}).then(function(r){
+    ulMsg(r.error?('✗ '+r.error):('✓ 已打开成品所在文件夹：'+r.dir), r.error?'ulerr':'ulok');
+  });
+});
+$('ulCloseBtn').addEventListener('click',function(){
+  /* 关面板必须是人按的: 出稿不再自动收摊(理由见模块头"退出"契约 —— 加链接在出稿之后,
+     自动收摊会把它掐断)。所以退出的入口就摆在这一区, 不藏。 */
+  api('/api/ulclose',{}).then(function(r){
+    ulMsg('✓ '+(r.out||'面板即将关停。'),'ulok');
   });
 });
 api('/api/ulstate').then(function(s){
@@ -1826,16 +2403,30 @@ api('/api/ulstate').then(function(s){
   ul.global=s.global||[];ul.own=s.own||[];
   ulWhy();ulRender();
   if(!ul.pdfs.length){
-    ulMsg('还没找到成品 PDF（server/translated 下的 <篇名>-mono.pdf / -dual.pdf）—— 先出稿, 再来装链接。','ulerr');
-    ['ulLinesBtn','ulAddBtn','ulCheckBtn','ulApplyBtn'].forEach(function(i){$(i).disabled=true});
+    /* [v36.1] 「加入清单」**不再跟着禁用**。依据是后端事实: _ul_add 不调用 _ul_target,
+       它只校验字段 + 写 JSON, **根本不需要成品**(见 _ul_add/_ul_entry)。原先这道禁用是前端
+       多设的一道, 它把"出稿前先把锚和网址攒下来"这条本该可行的路堵死了。
+       但只放开「全局」—— 本篇条目必须有真实页码, 而没成品就没有页(ulGo 与范围切换各自都拦)。
+       其余按钮**照旧禁用**: 载入对照/预检/装入/另存为/打开文件夹 这五件本身都要读成品
+       (「完工, 关面板」不在此列, 见下)。 */
+    ulMsg('还没找到成品 PDF（server/translated 下的 <篇名>-mono.pdf / -dual.pdf）—— '
+          +'定位要等出稿; 但「锚 + 网址」现在就能先攒(范围限「全局」, 不吃页码), '
+          +'「第几处」出稿后用「编辑」补。','ulerr');
+    /* 「完工, 关面板」**不在这张禁用表里** —— 它是退出入口, 与有没有成品无关;
+       恰恰在没有成品的时刻(这一篇还没出稿)也可能想关掉面板。 */
+    ['ulLinesBtn','ulCheckBtn','ulApplyBtn','ulSaveAsBtn','ulOpenBtn']
+      .forEach(function(i){$(i).disabled=true});
+    ulScopeSet('全局');ulPagePaint();ulOccPaint();   // 口径落到「全局」(并点亮/变暗两个按钮)
     return;
   }
   ulPdfDD=mkDropdown($('ulPdfSel'),function(v){
     var hit=ul.pdfs.filter(function(p){return p.name===v})[0];
-    ul.picked=hit?hit.path:'';ulLines();
+    ul.picked=hit?hit.path:'';ulShotHide();          // [v35] 换了成品, 上一张预览是别一份成品渲的
+    ulLines();ulCount();                             // 换了成品, 命中处数也要按新成品重数
   });
   ulPdfDD.setOptions(ul.pdfs.map(function(p){return p.name}));
   ulMsg('本篇「'+ul.task+'」 已绑定 '+ul.own.length+' 条 | 全局 '+ul.global.length+' 条');
+  ulPagePaint();ulOccPaint();
   ulLines();
 });
 
@@ -1898,10 +2489,10 @@ api('/api/state').then(function(s){
 # ---------------------------------------------------------------------- 本机服务器(零依赖 stdlib)
 
 BYE_GRACE = 15       # 收到告别后的宽限秒数(退出腿①, 见模块头"退出"契约)
-DONE_GRACE = 3       # ⑤ 出稿收摊前的宽限秒数(退出腿②): 留几秒让"✓ 已出稿"回到页面上
+CLOSE_GRACE = 3      # 点「完工, 关面板」后的宽限秒数(退出腿②): 留几秒让那句回话先回到页面上
 STATE = {"checked": None, "sha": None, "ping": None, "bye_at": None}
 LOCK = threading.Lock()
-SRV = {"h": None}    # main() 起的那个服务器; 收摊腿要它才关得掉(见 stop_after_done)
+SRV = {"h": None}    # main() 起的那个服务器; 退出腿② 要它才关得掉(见 close_panel)
 
 
 def build_stamp():
@@ -2085,14 +2676,24 @@ class H(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif path == "/api/uladd":
             self._ul_add(b)
+        elif path == "/api/uledit":
+            self._ul_edit(b)
         elif path == "/api/uldel":
             self._ul_del(b)
         elif path == "/api/ullines":
             self._ul_lines(b)
+        elif path == "/api/ulhits":
+            self._ul_hits(b)
+        elif path == "/api/ulshot":
+            self._ul_shot(b)
         elif path == "/api/ulcheck":
             self._ul_check(b)
         elif path == "/api/ulapply":
             self._ul_apply(b)
+        elif path == "/api/ulopen":
+            self._ul_open(b)
+        elif path == "/api/ulclose":
+            self._ul_close()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -2117,53 +2718,210 @@ class H(BaseHTTPRequestHandler):
                     "own": list((spec.get("tasks") or {}).get(ul_task()) or [])})
 
     def _ul_lines(self, b):
+        """本页逐段「原文↔译文」—— 数据源是**本篇段表(侧车)**, 不再是成品页的裸文本行。
+
+        [v28.85] 成品页的文本层是**排版后的行**、中英混排且不标语言 —— 在整页无译文的
+        文献页/回填页上取字, 取到的必然是英文; 而读者点的是中文, 锚就该落在中文上。段表自带
+        raw/trans 逐段对照, 一份文件就有 页码+原文+译文, 且 trans 是**渲染时的最终态**。
+        判据一条都没在面板重写 —— 纯字形段过滤、{vN} 还原、真实页码全在 tools/user_links.py。
+        """
         target = self._ul_target(b)
         if not target:
             return
         pg = int(b.get("page") or 0)
-        args = [UL_SCRIPT, "--target", target, "--page", str(pg), "--list-lines"]
-        dual = target.endswith("-dual.pdf")
-        if dual:
+        sc = ul_sidecar()
+        if not (sc and os.path.exists(sc)):
+            self._json({"error": "拿不到本篇段表(侧车) —— 先出稿(⑤), 段表才带最终译文。",
+                        "out": sc})
+            return
+        rc, out = ul_run(UL_SCRIPT, "--target", target, "--sidecar", sc,
+                         "--page", str(pg), "--list-segs")
+        try:
+            obj = json.loads(out.strip().splitlines()[0])
+        except Exception:
+            self._json({"error": "第 %d 页取不到对照" % pg, "out": out})
+            return
+        obj.update(ok=True, dual=target.endswith("-dual.pdf"))
+        self._json(obj)
+
+    def _ul_hits(self, b):
+        """这条锚命中几处 —— 只读, 一个字都不写。
+
+        为什么这一问必须回后端: "命中几处"是 **PDF 层的读数**(search_for + 碎片并框),
+        浏览器那个文本层数不了; 而判据必须与门禁**同一套** —— 所以走 user_links.py 的
+        --count-hits, 面板不另判一套(与 [v28.73] 那条纪律同源)。
+
+        用法只有一个: 让「第几处」不再手填。命中 1 处 -> 前端留空(工具自己的默认语义
+        就是第 1 处, 等价); 命中 >1 处 -> 前端才要人选, 且只能选 1..N, 选不到界外去。
+        数不出来就**什么都不填**, 让工具在「预检」里说 —— 面板绝不猜一个值。
+        [v35] 这一问现在还捎着 **hits_pos**(每一处的 页+矩形, 阅读序) —— ◀▶ 用它定位与
+        画框(见 _ul_shot)。这里是**纯透传**(obj.update 后整个回给前端), 所以多一个字段
+        不必改这一处; 但字段名是 front/back 的契约, 改名要先看 ulCount。
+        """
+        target = self._ul_target(b)
+        if not target:
+            return
+        anchor = (b.get("anchor") or "").strip()
+        if not anchor:
+            self._json({"error": "锚是空的 —— 没有可数的东西。"})
+            return
+        scope = b.get("scope") or "本篇"
+        args = [UL_SCRIPT, "--target", target, "--count-hits",
+                "--anchor", anchor, "--scope", scope]
+        if scope != "全局":
+            args += ["--page", str(int(b.get("page") or 0))]
+        if target.endswith("-dual.pdf"):
             args.append("--dual")
         rc, out = ul_run(*args)
         try:
             obj = json.loads(out.strip().splitlines()[0])
         except Exception:
-            self._json({"error": "第 %d 页取不到文字" % pg, "out": out})
+            self._json({"error": "命中处数数不出来。", "out": out})
             return
-        obj.update(ok=True, dual=dual)
+        obj.update(ok=True)
         self._json(obj)
 
-    def _ul_add(self, b):
+    def _ul_shot(self, b):
+        """把某一页渲成 PNG 回给浏览器, 目标那一处涂成荧光黄 —— 「第几处」的定位标记。
+
+        [v35] 为什么图片由后端出: 这一区至今**零渲染层**, 而"那一处落在页面的什么位置"
+        是 **PDF 层的读数** —— 与"命中几处"同源。渲染与涂黄全在 tools/user_links.py 的
+        `--render-page` 里(页码换算与 hits_pos 的那些矩形是同一把尺子), 面板只搬字节,
+        不自己算坐标(否则就是第二套判据)。
+        **只读**: 画的黄块只活在这次渲染出的临时 PNG 上, 成品一个字节都不动; 临时文件读完即删。
+        """
+        target = self._ul_target(b)
+        if not target:
+            return
+        try:
+            pg = int(b.get("page") or 0)
+        except (TypeError, ValueError):
+            pg = 0
+        args = [UL_SCRIPT, "--target", target, "--render-page", "--page", str(pg)]
+        if target.endswith("-dual.pdf"):
+            args.append("--dual")
+        rect = b.get("rect") or []
+        if rect:
+            # 给了坐标就必须是 4 个数: 静默"不画框"会把"框没了"当成正常结果回给用户
+            # (他会以为是这一处本来就没框) —— 面板宁可报错也不降级。
+            if not (isinstance(rect, (list, tuple)) and len(rect) == 4):
+                self._json({"error": "坐标要 4 个数(x0,y0,x1,y1)。"})
+                return
+            try:
+                args += ["--rect", ",".join("%.2f" % float(v) for v in rect)]
+            except (TypeError, ValueError):
+                self._json({"error": "这一处的坐标看不懂 —— 重数一次再点。"})
+                return
+        fd, tmp = tempfile.mkstemp(prefix="p2z_ulshot_", suffix=".png")
+        os.close(fd)
+        args += ["--out", tmp]
+        try:
+            rc, out = ul_run(*args)
+            if rc != 0:
+                self._json({"error": "这一页渲不出来。", "out": out})
+                return
+            with io.open(tmp, "rb") as f:
+                data = f.read()
+        except OSError as e:
+            self._json({"error": "预览图读不了: %s" % e})
+            return
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        self._w(data, "image/png")
+
+    def _ul_entry(self, b):
+        """面板发来的一条规格 -> (entry, None) 或 (None, 错误话)。
+
+        「加入」与「编辑」**共用这一份校验**: 分成两套写法的下场是同一条数据走两个
+        入口判出两种结果, 而用户只在其中一个入口看到报错(与 user_links.py 那边
+        "判据只写一套"同一条纪律)。校验内容与 user_links.py 的门禁**同名同义**:
+        锚非空 / URL 是 http(s) / 全局不许带 page / 本篇必须有 page>=1。
+        """
         anchor = (b.get("anchor") or "").strip()
         url = (b.get("url") or "").strip()
         if not anchor:
-            self._json({"error": "锚文本是空的 —— 先「取本页文字」点一行。"})
-            return
+            return None, "锚文本是空的 —— 先「载入对照」点右边中文。"
         if not re.match(r"^https?://\S+$", url):
-            self._json({"error": "网址要以 http:// 或 https:// 开头。"})
-            return
-        spec = ul_load()
+            return None, "网址要以 http:// 或 https:// 开头。"
+        # e 是**新建**的 dict(不是在旧条目上改) —— 所以编辑时被删掉的字段(比如从
+        # 本篇改成全局后的 page)真会消失, 不会静默残留在盘上。
         e = {"anchor": anchor, "url": url}
         if str(b.get("occurrence") or "").strip():
             try:
                 e["occurrence"] = int(b["occurrence"])
             except (TypeError, ValueError):
-                self._json({"error": "“第几处”要么留空, 要么是正整数。"})
-                return
+                return None, "“第几处”要么留空, 要么是正整数。"
         if (b.get("scope") or "本篇") == "全局":
             # 全局条目**不许带 page**(它跨篇用; 要在某一页生效请改成本篇) —— 口径同 user_links.py
+            return e, None
+        try:
+            e["page"] = int(b.get("page") or 0)
+        except (TypeError, ValueError):
+            e["page"] = 0
+        if e["page"] < 1:
+            return None, "本篇条目要给页码(从上面「页」那一栏来)。"
+        return e, None
+
+    def _ul_add(self, b):
+        e, err = self._ul_entry(b)
+        if err:
+            self._json({"error": err})
+            return
+        spec = ul_load()
+        before = ul_counts(spec)
+        if (b.get("scope") or "本篇") == "全局":
             spec["global"].append(e)
         else:
-            try:
-                e["page"] = int(b.get("page") or 0)
-            except (TypeError, ValueError):
-                e["page"] = 0
-            if e["page"] < 1:
-                self._json({"error": "本篇条目要给页码(从上面「页」那一栏来)。"})
-                return
             spec.setdefault("tasks", {}).setdefault(ul_task(), []).append(e)
         ul_save(spec)
+        ul_audit("add", before, ul_counts(spec), entry=e,
+                 scope=("全局" if (b.get("scope") or "本篇") == "全局" else "本篇"),
+                 task=ul_task())
+        self._ul_state()
+
+    def _ul_edit(self, b):
+        """改一条已绑定的条目 —— **就地替换**, 不是"删一条再加一条"。
+
+        为什么要就地: 删+加会把它挪到清单末尾。清单的顺序是用户找它的位置,
+        只改个网址就跳位, 用户会以为改错了条(与用户_links.json 里的顺序也是同一件事)。
+        范围也允许改(全局 <-> 本篇): 换了范围就得**换数组**; 而该带/不该带的字段
+        由 _ul_entry 重建的 e 决定 —— 全局那条不会留下旧的 page。
+        """
+        try:
+            idx = int(b.get("idx"))
+        except (TypeError, ValueError):
+            self._json({"error": "改哪一条没点清。"})
+            return
+        e, err = self._ul_entry(b)
+        if err:
+            self._json({"error": err})
+            return
+        spec = ul_load()
+        before = ul_counts(spec)
+        new_scope = b.get("scope") or "本篇"
+        old_scope = b.get("oldscope") or "本篇"
+        old_arr = (spec["global"] if old_scope == "全局"
+                   else spec.setdefault("tasks", {}).get(ul_task()) or [])
+        if not (0 <= idx < len(old_arr)):
+            self._json({"error": "这条已经不在了(按 F5 刷新页面看看)。"})
+            return
+        err = ul_echo_check(old_arr, idx, b)      # [v36.3] 与 _ul_del 同一道判据(只写一套)
+        if err:
+            self._json({"error": err})
+            return
+        was = dict(old_arr[idx])                  # [v36.2] 改前原文 —— 留痕要答得出"改了什么"
+        if new_scope == old_scope:
+            old_arr[idx] = e                      # 就地: 位置不变
+        else:
+            del old_arr[idx]
+            (spec["global"] if new_scope == "全局"
+             else spec.setdefault("tasks", {}).setdefault(ul_task(), [])).append(e)
+        ul_save(spec)
+        ul_audit("edit", before, ul_counts(spec), entry=e, was=was,
+                 scope=new_scope, oldscope=old_scope, idx=idx, task=ul_task())
         self._ul_state()
 
     def _ul_del(self, b):
@@ -2173,13 +2931,19 @@ class H(BaseHTTPRequestHandler):
             self._json({"error": "删哪一条没点清。"})
             return
         spec = ul_load()
-        arr = (spec["global"] if b.get("scope") == "全局"
+        before = ul_counts(spec)
+        sc = "全局" if b.get("scope") == "全局" else "本篇"
+        arr = (spec["global"] if sc == "全局"
                else spec.setdefault("tasks", {}).get(ul_task()) or [])
-        if not (0 <= idx < len(arr)):
-            self._json({"error": "这条已经不在了(重开面板看看)。"})
+        err = ul_echo_check(arr, idx, b)          # [v36.3] 先认身份, 再谈下标
+        if err:
+            self._json({"error": err})
             return
+        gone = dict(arr[idx])                     # [v36.2] 删掉的**原文** —— 这是事后唯一能答"丢的是哪条"的东西
         del arr[idx]
         ul_save(spec)
+        ul_audit("del", before, ul_counts(spec), entry=gone,
+                 scope=sc, idx=idx, task=ul_task())
         self._ul_state()
 
     def _ul_check(self, b):
@@ -2193,28 +2957,96 @@ class H(BaseHTTPRequestHandler):
         self._json({"ok": rc == 0, "out": out})
 
     def _ul_apply(self, b):
+        """装入: 把规格里的锚写成链接, 再让它们变蓝。
+
+        [v36.4] 两条**去向**, 都由后端自己算 —— 浏览器不能指路(理由同 _ul_target):
+          inplace(默认)  就地改探测到的那份成品
+          saveas        先 copy2 成 <stem>.links<ext>, 再改**副本** —— 原成品一个字节不动
+
+        为什么**没有**"覆盖 Zotero 附件"这条去向(用户 2026-09-26 提过, 据证据否掉):
+        那等于在**别的程序正管着那个文件**的时候去改它 —— 可能被阅读器占住、可能正被同步,
+        而且改完 Zotero 也不知道(它自己的条目里记着 md5/mtime); 最要紧的是**失败是静默的**
+        (覆盖错了哪一份、覆盖掉的是不是原文, 当场都看不出来)。改**我们自己的产物**正相反:
+        原成品在盘上、丢了能重出稿, 失败必然可见。
+        正确动线是**顺序**: 先把链接装进成品, **再**把这份成品交给 Zotero(拖进去 / ZotMoov
+        移进去) —— 于是 Zotero 拿到的天生就带链接, 谁都不必去改它管的文件。
+        """
         target = self._ul_target(b)
         if not target:
             return
         dual = target.endswith("-dual.pdf")
-        args = [UL_SCRIPT, "--target", target, "--spec", UL_SPEC, "--task", ul_task()]
+        mode = b.get("mode") or "inplace"
+        if mode not in ("inplace", "saveas"):
+            self._json({"error": "不知道要装到哪里: %r" % mode})
+            return
+        if mode == "saveas":
+            stem, ext = os.path.splitext(target)
+            work = stem + UL_SAVEAS_TAG + ext
+            try:
+                shutil.copy2(target, work)   # 每次都从**干净成品**复制, 不在旧副本上叠
+            except Exception as e:
+                self._json({"ok": False, "out": "另存为失败: %r" % e})
+                return
+        else:
+            work = target
+        args = [UL_SCRIPT, "--target", work, "--spec", UL_SPEC, "--task", ul_task()]
         if dual:
             args.append("--dual")
         rc, out = ul_run(*args)
         if rc != 0:
-            self._json({"ok": False, "out": out})       # 没过就一个字都没写, 照输出改就行
+            # 没过就一个字都没写(user_links 自己保证)。但另存为那条路上**副本已经落了盘** ——
+            # 它现在是个没人要的半成品, 删掉, 免得下次被当成"成品"看。
+            if mode == "saveas":
+                try:
+                    os.remove(work)
+                except OSError:
+                    pass
+            self._json({"ok": False, "out": out})       # 照输出改就行
             return
         # 顺序在这里被**代码**钉死(user_links -> style_links): 新锚必须跟着一起变蓝,
         # 否则读者看不出那儿能点, 功能等于没做。侧车拿得到就传 —— style_links 靠它跳过
         # 回填页(那些页的蓝字是原书自带的, 再叠一遍只会多出一份重复文本)。
-        sargs = [UL_STYLE, "--target", target]
+        sargs = [UL_STYLE, "--target", work]
         sc = ul_sidecar()
         if sc:
             sargs += ["--sidecar", sc]
         if dual:
             sargs.append("--dual")
         rc2, out2 = ul_run(*sargs)
-        self._json({"ok": rc2 == 0, "out": out + "\n\n" + out2})
+        if rc2 != 0:
+            # 链接**已经写进去了**, 只是变蓝这步没过 —— 两头都不许含糊: 别说"没装",
+            # 也别说"全好了"。把文件名带回去, 让人知道该看哪一份。
+            self._json({"ok": False, "links_written": True, "file": work,
+                        "out": out + "\n\n" + out2})
+            return
+        self._json({"ok": True, "mode": mode, "file": work,
+                    "out": out + "\n\n" + out2})
+
+    def _ul_open(self, b):
+        """打开**成品所在文件夹** —— 装好之后要把这一份交给 Zotero, 少一步自己翻目录。
+
+        只开文件夹、不选集: 资源管理器 `/select,` 的逗号参数在不同 shell 下行为不一,
+        不值得为省一次点击去赌它。路径仍走 _ul_target —— 只开探测到的那几份所在的地方。
+        """
+        target = self._ul_target(b)
+        if not target:
+            return
+        d = os.path.dirname(os.path.abspath(target))
+        try:
+            os.startfile(d)
+        except Exception as e:
+            self._json({"error": "打不开文件夹: %r" % e})
+            return
+        self._json({"ok": True, "dir": d})
+
+    def _ul_close(self):
+        """退出腿②: 人点了「完工, 关面板」。
+
+        这里**只关面板**, 不碰盘上任何文件 —— 与 close_panel 的纪律一致(只关自己那个
+        服务器对象, 不发信号、不杀进程)。
+        """
+        close_panel()
+        self._json({"ok": True, "out": "面板即将关停(这扇窗可以关了)。"})
 
     def _build(self):
         """重新装配: 在**工作目录**里子进程跑 mk_job.py(它模块层无条件 main()),
@@ -2389,14 +3221,15 @@ class H(BaseHTTPRequestHandler):
             STATE["checked"] = None
         if miss:
             logs.append("! 已记台账: 这一篇还有 %s 没出稿。" % names)
-        # 退出腿②: 这一篇该做的都出齐了 -> 面板收摊(判据与理由见 paper_done / stop_after_done)。
-        # 放在**出稿成功之后**才算: 门禁没过、底片没做成、排版失败都在上面各就各位地早退了 ——
-        # 那些情况要么得改稿重贴, 要么得重跑, 关窗等于把活收走。
+        # [v36.4] 这里原有一条"整篇齐了就安排收摊"(退出腿②, v28.79)。**已删** —— 收摊改由
+        # 人点「完工, 关面板」触发。理由见模块头"退出"契约: 那条自动腿恰好在"成品刚出来"
+        # 的那一刻开火, 而概念链接**必须先有成品才能做**, 于是它把动线掐在第一步。
+        # 只删了"自动"这一层; "整篇齐了"这句话留着 —— 它现在是纯提示, 说给要收尾的人听。
         todos = paper_tasks()
         done = paper_done(todos)
         if done:
-            logs.append("✓ 这一篇该做的都出齐了 —— 面板即将自动关停(这扇窗可以关了)。")
-            stop_after_done()
+            logs.append("✓ 这一篇该做的都出齐了 —— 还要加概念链接就接着做; "
+                        "完事了点「完工, 关面板」。")
         try:
             os.startfile(out)
         except Exception as e:
@@ -2429,14 +3262,19 @@ def open_app(url):
     return False
 
 
-def stop_after_done(delay=DONE_GRACE):
-    """退出腿②: ⑤ 出稿且整篇出齐后, 过 delay 秒把面板关掉(判据见 paper_done 与 _commit)。
+def close_panel(delay=CLOSE_GRACE):
+    """退出腿②: 人点了「完工, 关面板」-> 过 delay 秒把面板关掉。
 
-    为什么要 delay: `_commit` 的响应还在路上 —— 立刻 shutdown 会让浏览器收到连接中断,
-    用户看不到"✓ 已出稿: <成品路径>"那一句, 台账也少写一行。这几秒就是留给那句话的。
+    [v36.4] 由 stop_after_done 改名而来, **触发者变了**: 原先是"⑤ 出稿且整篇出齐"这个
+    自动信号, 现在是人的一次点击(理由见模块头"退出"契约 —— 那个条件与概念链接区天生冲突:
+    链接必须在出稿之后做, 而它恰在出稿那一刻触发)。"怎么关"这段机制一个字没改,
+    所以原有三条理由仍然成立:
+
+    为什么要 delay: 响应还在路上 —— 立刻 shutdown 会让浏览器收到连接中断, 用户看不到
+    "面板即将关停"那一句。
 
     为什么另起一条腿、不并进 _watchdog: 看门狗 5 秒一跳, 并进去最坏要等 5 秒以上才关,
-    而"出稿完盯着屏幕等窗口消失"很怪; 而且 ① 段的退出契约测试是靠"看门狗空转"跑的,
+    而"点了按钮盯着屏幕等窗口消失"很怪; 而且 ① 段的退出契约测试是靠"看门狗空转"跑的,
     动它的节拍会把那条用例一起改坏。
 
     只关**自己**那个服务器对象, 不发信号、不杀进程 —— 与 --takeover 同一条纪律:
@@ -2451,8 +3289,8 @@ def stop_after_done(delay=DONE_GRACE):
 
 
 def _watchdog(srv):
-    """退出腿①(主动告别)的看门狗。另一条腿(② 干完收摊)在 stop_after_done, **不在这里** ——
-    那一条是确定事件触发的, 塞进这个 5 秒节拍只会变钝(理由见 stop_after_done)。
+    """退出腿①(主动告别)的看门狗。另一条腿(② 完工关面板)在 close_panel, **不在这里** ——
+    那一条是人点按钮这个确定事件触发的, 塞进这个 5 秒节拍只会变钝(理由见 close_panel)。
 
     主动 —— 页面关窗前 sendBeacon 打 /api/bye, 进 BYE_GRACE 秒宽限期。宽限内若收到
             新心跳(F5 刷新后新页面起来 / 还有别的页面活着), 告别作废; 否则退出。
@@ -2466,11 +3304,12 @@ def _watchdog(srv):
     多少都只是把同一个错误推远。同理删掉了配套的 /api/idle 暂停入口与头部倒计时:
     一条要被用户手动压住的自动行为, 不如不要。
 
-    那条兜底真正想近似的东西(不是"你多久没动静了", 而是"活干完了吧")现在由**确定性信号**
-    回答: ⑤ 出稿且整篇出齐 -> 自己收摊(见 stop_after_done)。正常动线走完就不会留下常驻
-    进程; 剩下的窟窿只有"浏览器崩了、回包还没提交过"这种半路夭折 —— 处理办法不是再加回
-    一条估算, 而是**让下次启动看得见**: main() 在 60642 被自家旧实例占住时会点出 PID 与
-    构建时间, 并给出 --takeover(见模块头)。"""
+    那条兜底真正想近似的东西(不是"你多久没动静了", 而是"活干完了吧"): v28.79 用"⑤ 出稿且
+    整篇出齐"这个**确定性信号**回答过, v36.4 又按模块头的理由退掉了 —— 因为它与概念链接区
+    天生冲突(链接必须在出稿之后才做)。所以现在**没有**自动退出, 收场是人二选一:
+    点「完工, 关面板」或关窗。剩下能兜的只有"浏览器崩了、回包还没提交过"这种半路夭折 ——
+    处理办法不是再加回一条估算, 而是**让下次启动看得见**: main() 在 60642 被自家旧实例
+    占住时会点出 PID 与构建时间, 并给出 --takeover(见模块头)。"""
 
     while True:
         time.sleep(5)
@@ -2595,10 +3434,10 @@ def main():
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
     url = "http://127.0.0.1:%d/" % port
     announce_port(announce, port)   # 先回话再看门: 服务端在等着这个端口号(见 announce_port)
-    SRV["h"] = srv                  # 退出腿② 要它才关得掉本进程的服务器(见 stop_after_done)
+    SRV["h"] = srv                  # 退出腿② 要它才关得掉本进程的服务器(见 close_panel)
     threading.Thread(target=_watchdog, args=(srv,), daemon=True).start()
     print("翻译中继面板 v3  %s   (构建 %s)" % (url, build_stamp()))
-    print("关窗即退出; ⑤ 出稿且整篇出齐后也会自己收摊。也可 Ctrl+C。")
+    print("关窗即退出; 也可以点概念链接区的「完工, 关面板」。也可 Ctrl+C。")
     if not os.environ.get("P2Z_PANEL_NO_OPEN"):  # 冒烟测试时关掉自动开窗
         open_app(url)
     try:

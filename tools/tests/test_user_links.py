@@ -33,6 +33,22 @@
   ⑪ 1 页: 同一个带空格的锚出现两次 —— 锁住"原样搜"与按出现次数计数。
   ⑫ 1 页: 一条横向锚(非嵌入 Helvetica) + 一条旋转行(模拟页边戳)各挂一条链接 ——
      锁住 style_links 既**重绘得出**前者, 又**不去动**后者。
+  ⑬ 1 页: 同一条**折行**长锚出现两次 —— 锁住 [v28.91] 字符级兜底: 引擎的 search_for
+     **不跨行**(前提先验: 它在这页上真的返回空), 而工具仍要数成 **2 处**(两行算 1 次
+     出现, 不是 4 处), 且「第 1/2 处」按阅读序落到上下两条; 页面上没有的锚仍是 0。
+  ⑭ 2 页: 概念锚在第 1、2 页各一次 —— 锁住 --count-hits 的**三口径**读数
+     (hits=当前口径 / hits_page / hits_doc): 面板「本页就这 1 处 · 全篇还有」靠它。
+  ⑮ 1 页: 页上写**全角**标点(`模型：（1）遗留` / `[13]。`), 锚是**ASCII** 版 —— 锁住
+     [v28.92] 标点折叠: 先验 search_for 为空(证明折叠真在干活), 折后要数得对(两次出现
+     = 2 处), 而**内容**不同(数字改了)仍旧 0(折叠只放行"宽度差异", 不放行"内容差异"),
+     且包围盒仍只盖那一行(折叠会改长度, 下标映射错了框就会盖歪)。
+  ⑯ 1 页: 两个**相隔 600pt 的块**, 流里拼得出 `束模` —— 锁住 [v34] 版面连续性守卫:
+     先验流里真有这个串(所以不拦就会命中), 而版面上隔着大半页就不许算一次出现。
+     ⑬ 是它的**正对照**: 真折行(相邻两行)必须仍然命中, 守卫不能把正常换行也砍掉。
+  ⑰ [v35] 定位: `--count-hits` 的 hits_pos(每一处的 页+矩形, 阅读序) + `--render-page`
+     的荧光黄块 —— 锁住"◀▶ 指的那一处 **就是** occurrence 装进成品的那一处"(两处各算一套
+     会静默装错), dual 页码回写成 mono 页码(否则报一个用户翻不到的页号), 渲染只读
+     (成品 md5 不变)且黄块只涂在给定矩形的位置上。
 """
 
 import hashlib
@@ -71,6 +87,26 @@ Y_X1, Y_X2 = 300.0, 400.0                # p2 上引文号锚的两次出现
 
 SPACED = "GelSight Mini"                 # 带空格的锚(面板点选的**整行**文字常带空格)
 Y_SPACED1, Y_SPACED2 = 150.0, 250.0      # 它在本页的两次出现(基线 y, 按 y 升序数)
+# 折行锚([v28.91] 字符级兜底的靶子): 30 字, 塞进 228pt 宽的框里必然折成两行
+WRAPPED = "实现可持续性感知的硅系统设计探索与架构碳工具评估框架"
+Y_W1, Y_W2 = 100.0, 300.0                # 两条折行锚的**框顶**(textbox 左上游标)
+SWITCH_Y = 250.0                         # 判"上/下"那条的分界线(取两条中间的空档)
+# 标点宽度用例([v28.92]): 页上全角, 锚是 ASCII 版的同一个串
+FULLW = "模型：（1）遗留"                  # 页上写全角
+FULLW_ASCII = "模型:(1)遗留"              # 侧车/用户手里的 ASCII 版(去空白后)
+CITED = "见文献[13]。"                    # 页上全角句号
+CITED_ASCII = "见文献[13]."               # ASCII 句点
+NEG = "模型:(2)遗留"                      # 内容不同(数字) —— 折了标点也不该命中
+Y_FW1, Y_FW2, Y_FW3 = 150.0, 250.0, 350.0
+# [v34] 折叠**不该**放行的三类: 内容型兼容字(①按 <circle> 分解成 1) + 两个不是"宽窄写法"
+# 的标点(顿号、间隔号)。每一对是 (页上写的, 锚), 期望 0 命中 —— 折了就是把"内容不同"
+# 当成了"宽度不同", 于是链接会静默挂到别处。
+FOLD_DENY = [
+    ("①定义", "1定义"),                 # <circle> 兼容分解 -> 折了 ① 就等于 1
+    ("模型、遗留", "模型,遗留"),           # 顿号(并列) != 逗号(停顿)
+    ("CuSO4·5H2O", "CuSO4.5H2O"),      # 间隔号(人名/分子式分隔) != 句点
+]
+Y_FW4, Y_FW5, Y_FW6 = 400.0, 450.0, 500.0
 # 变蓝用例的两处锚: 横向锚(非嵌入 Helvetica) / 旋转行(模拟页边戳)
 RECT_H = pymupdf.Rect(70, 384, 140, 406)
 RECT_R = pymupdf.Rect(285, 542, 306, 602)
@@ -151,6 +187,75 @@ def make_blue(path):
     return path
 
 
+def make_wrapped(path):
+    """1 页: 同一条**折行**长锚出现两次(上一条框顶 Y_W1, 下一条 Y_W2), 供 ⑬。
+
+    为什么必须用 insert_textbox 而不是 insert_text: insert_text 不折行, 整串排成
+    一行 —— 那就落在 search_for 能搜到的那一档上, 兜底那档**根本没被走到**,
+    测试会"通过"却什么也没验。
+    """
+    doc = pymupdf.open()
+    p = doc.new_page(width=PAGE[0], height=PAGE[1])
+    for y in (Y_W1, Y_W2):
+        left = p.insert_textbox(pymupdf.Rect(72, y, 300, y + 90), WRAPPED,
+                                fontsize=12, fontname="china-s")
+        if left < 0:                     # 没排下 -> 后面的"折行"前提就不成立
+            raise AssertionError("折行锚没排进框里(left=%.1f)" % left)
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def make_fullwidth(path):
+    """1 页: 同一条锚在**全角/半角**两侧各写一遍 —— 供 ⑮ 验 [v28.92] 标点折叠。
+
+    为什么非造这一页: 侧车 trans 用 ASCII 标点(`(1)`、`.`), 渲染后的成品页是全角
+    (`（1）`、`。`) —— 面板"点整段"取的是**侧车那一侧**, 页面上写的是另一侧, 于是用户
+    点自己眼前那行字却被告知"找不到"(实测 Lee 篇 8/117 段全这一类)。
+    同一页里并排造**正例**(只差宽窄 -> 该命中)与**反例**(差内容 -> 一个字都不许命中),
+    折叠一旦被放宽成模糊匹配, 反例那三条会立刻变红。
+    """
+    doc = pymupdf.open()
+    p = doc.new_page(width=PAGE[0], height=PAGE[1])
+    p.insert_text((72, Y_FW1), FULLW, fontsize=12, fontname="china-s")
+    p.insert_text((72, Y_FW2), FULLW, fontsize=12, fontname="china-s")
+    p.insert_text((72, Y_FW3), CITED, fontsize=12, fontname="china-s")
+    for (on_page, _), y in zip(FOLD_DENY, (Y_FW4, Y_FW5, Y_FW6)):
+        p.insert_text((72, y), on_page, fontsize=12, fontname="china-s")
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def make_phantom(path):
+    """1 页: 上下隔了 600pt 的两个块, 流里却拼得出 `束模` —— 供 ⑯(版面连续性守卫)。
+
+    第③档是拿 rawdict 的**块序**串出一条流再找子串, 于是"流里相邻"被当成了"版面上挨着"。
+    真实语料里这发生在"整页被切成几十块"的图形页上(实测 Lee 篇 2 段, 框纵向跨
+    132.7 / 215.6 pt)。这里把它缩成最小可控形态: 两次 insert_text 各成一块, 上块收笔
+    `束`、下块起笔 `模` —— 流里是 `文字束模型`,`束模` 连得上, 版面上却隔着大半页。
+    """
+    doc = pymupdf.open()
+    p = doc.new_page(width=PAGE[0], height=PAGE[1])
+    p.insert_text((72, 100), "文字束", fontsize=12, fontname="china-s")
+    p.insert_text((72, 700), "模型", fontsize=12, fontname="china-s")
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def make_count(path):
+    """2 页: 概念锚在第 1、2 页各一次 —— 供 ⑭ 验三口径(hits / hits_page / hits_doc)。"""
+    doc = pymupdf.open()
+    for _ in range(2):
+        doc.new_page(width=PAGE[0], height=PAGE[1])
+    doc[0].insert_text((72, Y_C1), CONCEPT, fontsize=12, fontname="china-s")
+    doc[1].insert_text((72, Y_C1), CONCEPT, fontsize=12, fontname="china-s")
+    doc.save(path)
+    doc.close()
+    return path
+
+
 def blue_in(path, pno, rect, limit=4):
     """矩形里有没有"链接蓝"像素 —— style_links 的重绘到底发生了没有。
 
@@ -172,6 +277,30 @@ def blue_in(path, pno, rect, limit=4):
     return False
 
 
+def mark_pixels(png, x0, y0, x1, y1, step=2):
+    """PNG 画素范围内"荧光黄块"的点数 —— --render-page 标的到底画在哪。
+
+    判据 = **黄度**(R-B 与 G-B 都够大), 不是"某一种纯色":
+    黄块是 fill=(1,1,0) 配 fill_opacity=0.4 叠上去的, 落在白底与落在黑字上叠出的绝对色
+    完全不同(白底 ≈ (255,255,153), 纯黑字上 ≈ (102,102,0)), 拿某个 RGB 精确值去比会
+    在"字上没涂到"和"底色没涂到"之间只能认一边。黄度对两者都成立, 对白/黑/灰一律为 0。
+    [边界] 底色本来就偏黄/橙时会误判 —— 本用例的合成页是黑白字, 不受影响; 真页面上这张
+    图是给人看的, 面板不靠像素判定任何东西, 所以这条边界只关本案。
+    直接读 Pixmap 而不是 open(png)(后者会把 DPI 当尺度重排, 坐标对不上):
+    PNG 是 pixmap.save 出来的 1:1 位图, 画素坐标 = PDF 点 × zoom。
+    """
+    pm = pymupdf.Pixmap(png)
+    n = 0
+    for y in range(int(y0), int(y1) + 1, step):
+        for x in range(int(x0), int(x1) + 1, step):
+            if x >= pm.width or y >= pm.height:
+                continue
+            r, g, b = pm.pixel(x, y)
+            if r - b >= 60 and g - b >= 60:
+                n += 1
+    return n
+
+
 def write_spec(path, obj):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(obj, f, ensure_ascii=False)
@@ -184,6 +313,28 @@ def run(*args):
     return (proc.returncode,
             proc.stdout.decode("utf-8", "replace"),
             proc.stderr.decode("utf-8", "replace"))
+
+
+def count_hits(target, anchor, page=None, scope="本篇", dual=False):
+    """跑 --count-hits, 回 (rc, obj, out); obj 解析不出来就是 None(调用方据此判 FAIL)。
+
+    为什么单独包一层: 面板的「第几处」读的就是这一问的 JSON(见 panel.py 的 ulCount),
+    字段名(hits / hits_page / hits_doc / where)是前后端之间的**契约** —— 改了名字
+    面板不会报错, 只会静默显示成"—"。故这里把整包 JSON 都断到。
+    [v35] hits_pos(每一处的 {page, rect})同样是契约: 面板的 ◀▶ 靠它定位与画框。
+    """
+    args = [USER_LINKS, "--target", target, "--count-hits",
+            "--anchor", anchor, "--scope", scope]
+    if page:
+        args += ["--page", str(page)]
+    if dual:
+        args.append("--dual")
+    rc, out, _ = run(*args)
+    try:
+        obj = json.loads(out.strip().splitlines()[0])
+    except Exception:
+        obj = None
+    return rc, obj, out
 
 
 def links(path, pno):
@@ -466,6 +617,181 @@ def main():
     # 所以"重绘发生了"= 锚串出现 2 次; 旋转戳若也被重绘, 它的串同样会变成 2 次。
     check("⑫ 横向锚确实被重绘(文本层里 ANCHOR1 出现 2 次)", t.count("ANCHOR1") == 2, t)
     check("⑫ 旋转行未被重绘(ROTATE1 只出现 1 次)", t.count("ROTATE1") == 1, t)
+
+    # ================= ⑬ 折行锚(字符级兜底, [v28.91]) =================
+    # 面板最常用的动作是"点右列中文取**整段**", 而整段在成品页上几乎必然折行 ——
+    # search_for 不跨行, 于是用户点自己眼前那行字, 工具却说"找不到"(实测 Lee: 44 字整锚
+    # 命中 0, 6 字短锚命中 6)。兜底就是为这一档做的, 但它带来的最大风险是**一次出现被
+    # 数成两次**(按行各返回一个框), occurrence 的语义会当场错掉 —— 故这里两头都断。
+    print("[13] 折行锚")
+    m = make_wrapped(os.path.join(tmp, "m13.pdf"))
+    d = pymupdf.open(m)
+    engine_hits = d[0].search_for(WRAPPED)
+    d.close()
+    # 前提先验: 这一页真的折了行(引擎口径为空)。若这里非空, 说明用例没造出折行,
+    # 后面那几条全是在验 search_for —— "通过"了却一个字都没验兜底。
+    check("⑬ 前提成立: search_for 搜不到折行锚(所以才非兜底不可)",
+          engine_hits == [], repr(engine_hits))
+    rc, obj, out = count_hits(m, WRAPPED, page=1)
+    check("⑬ 折行锚算 2 处(两行 = 1 次出现; 按行计数会数成 4)",
+          rc == 0 and obj and obj["hits"] == 2, repr((rc, obj, out)))
+    rc, obj, out = count_hits(m, WRAPPED, scope="全局")
+    check("⑬ 全局口径同为 2 处(occ_list 与本篇走同一个 find_hits)",
+          rc == 0 and obj and obj["hits_doc"] == 2, repr((rc, obj, out)))
+    for occ, where in ((1, "上"), (2, "下")):
+        f = make_wrapped(os.path.join(tmp, "m13_%d.pdf" % occ))
+        sp = spec("s13_%d.json" % occ, {"tasks": {"t1": [
+            {"anchor": WRAPPED, "url": URL_OWN, "page": 1, "occurrence": occ}]}})
+        rc, out, _ = run(USER_LINKS, "--target", f, "--spec", sp, "--task", "t1")
+        u = uris(f)
+        y0 = u[0][2].y0 if len(u) == 1 else -1.0
+        check("⑬ 第 %d 处按阅读序落到%s面那条(y0=%.0f)" % (occ, where, y0),
+              rc == 0 and len(u) == 1 and ((y0 < SWITCH_Y) if occ == 1 else (y0 > SWITCH_Y)),
+              repr((rc, out, u)))
+    h = 0.0
+    u = uris(os.path.join(tmp, "m13_1.pdf"))
+    if len(u) == 1:
+        h = u[0][2].y1 - u[0][2].y0
+    check("⑬ 热区是整条锚的包围盒(盖住两行, 高 %.0fpt)" % h, h > 20, repr(u))
+    rc, obj, out = count_hits(m, "这段字页面上根本没有", page=1)
+    check("⑬ 页面上没有的锚仍是 0 命中(兜底不凭空造命中)",
+          rc == 0 and obj and obj["hits"] == 0, repr((rc, obj, out)))
+
+    # ================= ⑭ --count-hits 三口径(面板「第几处」的读数) =================
+    # 面板的「第几处」是**自动填**的, 依据就是这一问的 JSON。三个口径必须分得开:
+    # hits=当前口径 / hits_page=本页 / hits_doc=全篇 —— 少一个, 面板就答不上
+    # "为什么全篇只有 1 处我来问第几处"(那正是用户实测提过的问题)。
+    print("[14] --count-hits 三口径")
+    m = make_count(os.path.join(tmp, "m14.pdf"))
+    rc, obj, out = count_hits(m, CONCEPT, page=1)
+    check("⑭ 本篇 p1: hits=1 而 hits_doc=2(面板据此提示切「全局」)",
+          rc == 0 and obj and obj["hits"] == 1 and obj["hits_page"] == 1
+          and obj["hits_doc"] == 2 and obj["where"] == "第 1 页", repr((rc, obj, out)))
+    rc, obj, out = count_hits(m, CONCEPT, scope="全局")
+    check("⑭ 全局: hits=hits_doc=2 且 hits_page 为 null(全篇口径没有「本页」)",
+          rc == 0 and obj and obj["hits"] == 2 and obj["hits_doc"] == 2
+          and obj["hits_page"] is None and obj["where"] == "全篇", repr((rc, obj, out)))
+    rc, obj, out = count_hits(m, CONCEPT, page=3)
+    check("⑭ 页码越界 -> 退 1(不静默按别的页算)", rc == 1 and "越界" in out, out)
+    rc, obj, out = count_hits(m, "   ")
+    check("⑭ 空锚 -> 退 1", rc == 1 and "需要 --anchor" in out, out)
+
+    # ================= ⑮ 标点折叠只放行"宽度差异"([v28.92] + [v34] 收紧) ==========
+    # 折叠是"两侧走同一把尺子"; 尺子越粗, 两个**不同**的串越容易被折成同一个 -> 链接
+    # 静默挂到别处(门禁过、链接装上、读者点开才知道)。故正反两头都断: 正例证明折叠真在
+    # 干活(先验 search_for 为空), 反例证明它没被放宽成模糊匹配。文件头 docstring 早就
+    # 这么写着, 但代码里从没有过断言(grep `_fold` 零命中) —— 等于没有东西挡着别人改宽。
+    print("[15] 标点折叠(正例 + 反例)")
+    m = make_fullwidth(os.path.join(tmp, "m15.pdf"))
+    d = pymupdf.open(m)
+    eng_fw = d[0].search_for(FULLW_ASCII)
+    eng_ci = d[0].search_for(CITED_ASCII)
+    d.close()
+    # 前提先验: 引擎口径真的搜不到(否则后面验的是 search_for, 不是折叠)
+    check("⑮ 前提成立: 全角页上 search_for 搜不到 ASCII 锚(折叠才有活干)",
+          eng_fw == [] and eng_ci == [], repr((eng_fw, eng_ci)))
+    rc, obj, out = count_hits(m, FULLW_ASCII, page=1)
+    check("⑮ 全角页配 ASCII 锚 -> 命中 2 处(只差宽窄: （）： 都是 <wide>)",
+          rc == 0 and obj and obj["hits"] == 2, repr((rc, obj, out)))
+    rc, obj, out = count_hits(m, CITED_ASCII, page=1)
+    check("⑮ `。` vs `.` 也认(句号无兼容分解, 靠手列的表) -> 命中 1 处",
+          rc == 0 and obj and obj["hits"] == 1, repr((rc, obj, out)))
+    rc, obj, out = count_hits(m, NEG, page=1)
+    check("⑮ 内容不同(数字 (2) vs (1)) 仍 0 命中 —— 折叠不放行内容差异",
+          rc == 0 and obj and obj["hits"] == 0, repr((rc, obj, out)))
+    for (on_page, anchor), y in zip(FOLD_DENY, (Y_FW4, Y_FW5, Y_FW6)):
+        rc, obj, out = count_hits(m, anchor, page=1)
+        check("⑮ 页上 %r 配锚 %r -> 0 命中(不是宽窄写法, 不许折)" % (on_page, anchor),
+              rc == 0 and obj and obj["hits"] == 0, repr((rc, obj, out)))
+    # 折叠会**改长度**(`…` 类一旦被折, 一个原字映到多个折叠字), 下标映射错了框就会盖歪;
+    # 故正例装上以后要核: 第 1/2 处分别落在上下两条, 且框只盖一行。
+    f = make_fullwidth(os.path.join(tmp, "m15_a.pdf"))
+    sp = spec("s15.json", {"tasks": {"t1": [
+        {"anchor": FULLW_ASCII, "url": URL_OWN, "page": 1, "occurrence": 1}]}})
+    rc, out, _ = run(USER_LINKS, "--target", f, "--spec", sp, "--task", "t1")
+    u = uris(f)
+    hh = (u[0][2].y1 - u[0][2].y0) if len(u) == 1 else -1.0
+    check("⑮ 折后第 1 处落上一条(y0=%.0f)且框只盖一行(高 %.0fpt)" %
+          (u[0][2].y0 if len(u) == 1 else -1.0, hh),
+          rc == 0 and len(u) == 1 and u[0][2].y0 < Y_FW2 - 40 and hh < 24,
+          repr((rc, out, u)))
+
+    # ================= ⑯ 版面连续性守卫: 流里相邻 != 版面上挨着([v34]) ==============
+    # 第③档的"命中"只说明**流里**连着; 整页被切碎成几十块的图形页上, 流里紧接着的两个字
+    # 版面上可能一个在页眉一个在页脚 —— 于是拼出一个页面上并不存在的串, 热区横跨大半页。
+    # ⑬ 是正对照(真折行必须仍命中), 这里断的是反向: 隔着大半页的两个块不许拼成一次出现。
+    print("[16] 版面连续性守卫")
+    m = make_phantom(os.path.join(tmp, "m16.pdf"))
+    d = pymupdf.open(m)
+    flat = "".join(d[0].get_text("text").split())
+    d.close()
+    check("⑯ 前提成立: 页面的字符流里确实拼得出『束模』(所以非守卫不可)",
+          "束模" in flat, repr(flat))
+    rc, obj, out = count_hits(m, "束模", page=1)
+    check("⑯ 隔 600pt 的两个块不许拼成一次命中 -> 0 处",
+          rc == 0 and obj and obj["hits"] == 0, repr((rc, obj, out)))
+
+    # ================= ⑰ [v35] 定位: hits_pos + --render-page 荧光黄 ==================
+    # 用户按 ◀▶ 要的不是"第 3 处"这个数字, 而是**文章里的哪一处**。这一节锁三件事:
+    #   a) hits_pos 的顺序 = 阅读序, 且 **hits_pos[N-1] 就是 occurrence=N 装进成品的那一处**
+    #      —— 两处各算一套的下场是"图上涂第 3 处、链接装在第 2 处", 而且静默;
+    #   b) dual 下页码**回写成 mono 页码**(不回写就报一个用户翻不到的页号);
+    #   c) --render-page 把荧光黄涂在该矩形的画素位置上, 且成品**一个字节都没动**。
+    print("[17] hits_pos 定位 + --render-page 荧光黄")
+    m = make_count(os.path.join(tmp, "m17.pdf"))
+    rc, obj, out = count_hits(m, CONCEPT, page=1)
+    pos = (obj or {}).get("hits_pos") or []
+    check("⑰ 本篇: hits_pos 条数 = hits(1), 页号 1, 框住那一行(y=%.0f)" % Y_C1,
+          rc == 0 and len(pos) == 1 and pos[0]["page"] == 1
+          and abs(pos[0]["rect"][1] - (Y_C1 - 12.5)) < 3, repr((rc, obj, out)))
+    rc, obj, out = count_hits(m, CONCEPT, scope="全局")
+    pos = (obj or {}).get("hits_pos") or []
+    check("⑰ 全局: 2 条且按阅读序(第 1 页在前, 第 2 页在后)",
+          rc == 0 and [p["page"] for p in pos] == [1, 2], repr((rc, obj, out)))
+    # 端到端同源: 规格写 occurrence=2, 装好的 URI 必须落在 hits_pos[1] 那个矩形上。
+    f = make_count(os.path.join(tmp, "m17_e2e.pdf"))
+    rc0, obj0, _ = count_hits(f, CONCEPT, scope="全局")
+    sp = spec("s17.json", {"global": [{"anchor": CONCEPT, "url": URL_G, "occurrence": 2}]})
+    rc, out, _ = run(USER_LINKS, "--target", f, "--spec", sp, "--task", "t1")
+    u = uris(f)
+    p2 = [p for p in ((obj0 or {}).get("hits_pos") or []) if p["page"] == 2]
+    check("⑰ 装进成品的第 2 处 == hits_pos[1](◀▶ 指的那处就是它装的那处)",
+          rc == 0 and len(u) == 1 and u[0][0] == 1 and len(p2) == 1
+          and abs(u[0][2].y0 - p2[0]["rect"][1]) < 0.02
+          and abs(u[0][2].x0 - p2[0]["rect"][0]) < 0.02, repr((rc, out, u, obj0)))
+    # dual: 规格页码是 mono 坐标, 位置也必须回写成 mono 页码 —— 第 1 页(不是第 2 页),
+    # 且框必须落在**译文侧**那条(y=Y_X2), 不是原版侧那条(y=Y_X1)。
+    d = make_dual(os.path.join(tmp, "m17_dual.pdf"))
+    rc, obj, out = count_hits(d, CONCEPT, page=1, dual=True)
+    pos = (obj or {}).get("hits_pos") or []
+    check("⑰ dual: 页码回写成 mono 页码(1 而非 2)且框落译文侧(y=%.0f)" % Y_X2,
+          rc == 0 and len(pos) == 1 and pos[0]["page"] == 1
+          and abs(pos[0]["rect"][1] - (Y_X2 - 12.5)) < 3, repr((rc, obj, out)))
+    # --render-page: 荧光黄必须涂在 rect×zoom 的**画素位置**上, 且只涂在那里。
+    png = os.path.join(tmp, "shot17.png")
+    before = md5(m)
+    rc, out, _ = run(USER_LINKS, "--target", m, "--render-page", "--page", "1",
+                     "--out", png, "--rect", "72,88,132,104")
+    check("⑰ --render-page 出图(rc=0 且文件在)", rc == 0 and os.path.exists(png), out)
+    check("⑰ 渲染是只读的: 成品 md5 未变", md5(m) == before)
+    if os.path.exists(png):
+        # zoom=2 -> 点 (72,88,132,104) 落到画素 (144,176,264,208); 取稍外一圈的壳
+        n_in = mark_pixels(png, 140, 170, 268, 214)
+        n_out = mark_pixels(png, 400, 1000, 800, 1400, step=20)
+        check("⑰ 荧光黄涂在给定矩形的位置上(壳内 %d 点黄, 别处 %d 点)" % (n_in, n_out),
+              n_in >= 200 and n_out == 0, repr((n_in, n_out)))
+        # "荧光标记"而不是"描边框": 取矩形**正中间那条横线** —— 描边法在那条线上只会有
+        # 左右两条竖边(且都在取样区间之外), 实心涂黄则是整条都黄。这条判据把"退回描边"卡死。
+        n_mid = mark_pixels(png, 150, 191, 258, 193, step=1)
+        check("⑰ 是实心涂黄而非描边(中线 %d 点全黄)" % n_mid, n_mid >= 100,
+              repr((n_mid, n_in, n_out)))
+    rc, out, _ = run(USER_LINKS, "--target", m, "--render-page", "--page", "1",
+                     "--out", os.path.join(tmp, "shot17b.png"), "--rect", "1,2,3")
+    check("⑰ --rect 不是 4 个数 -> 退 1(不静默不画框)",
+          rc == 1 and "解析不了" in out, out)
+    rc, out, _ = run(USER_LINKS, "--target", m, "--render-page", "--page", "9",
+                     "--out", os.path.join(tmp, "shot17c.png"))
+    check("⑰ 页越界 -> 退 1", rc == 1 and "越界" in out, out)
 
     print("\nuser_links: 通过 %d | 失败 %d" % (passed, failed))
     return 1 if failed else 0

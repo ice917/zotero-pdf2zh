@@ -19,7 +19,7 @@
     实测全语料 13 篇: 文本口径 921 处 → 几何口径只剩 35 处(强 16 / 中 19), **噪音率 96%**
     (Johnson 3 页 23 → 0)。故几何那一道不可省, 且**核验不了就不过滤**(宁可多报)。
 
-本测试锁十段语义, 全部走 CLI (沙箱 + 合成侧车 + pymupdf 合成 PDF):
+本测试锁十四段语义, 全部走 CLI (沙箱 + 合成侧车 + pymupdf 合成 PDF):
   ① 真漏译注入(某段 trans 原样留英文) -> 退出码 1, 且该段进候选清单
   ② 数学字形段(`Pi j`)与纯 `{vN}` 段 -> 不报, 且**不计入参与段**
   ③ 页内文献区块: 标题段(`LITERATURE CITED`)及其后条目段豁免; 标题**之前**的
@@ -36,6 +36,15 @@
      用 `PDF2ZH_LAYOUT_PROBE` 把探针换成受控件, 从而**不依赖版面 onnx 模型**:
        · 假探针吐 2 处切点 -> 进 stats/报告/JSON, 且**判定与其他读数一字不动**;
        · 探针路径不存在 -> 只报一行「版面切点读数不可用」, stats 不写、判定不动。
+  ⑪ [v34] 弱形式(光杆 `Reference`)的上下文守卫: 其后**没有**含年份的条目段 ->
+     不认文献区锚点(否则一个表头单元格会把整页段落豁免掉 -> 该 FAIL 却 PASS)
+  ⑫ [v34] **空侧车 -> 退 2**(判不了), 不许当 PASS: 侧车逐页追写, 刚起步就中断时
+     文件在、一行没有 —— 旧口径下最后一道门禁会对着"什么都没判"的段表举手放行
+  ⑬ [v34] 跳页豁免窗口按**原文真实页数**算: 原文 4 页、段表末页 3(末尾被跳的页不在
+     段表里)、`--skip-last 1` -> 该豁免第 4 页; 按段表最大页算会前移到第 3 页,
+     把第 3 页的真漏译**静默放行**
+  ⑭ [v34] 探针 JSON **形状不符** -> 当「读数不可用」: 旧代码直接 `p["cuts"]` 取字段,
+     探针一改字段名就抛裸 KeyError(退 1, 与"发现未译段"分不开)并破"判定不动"契约
 
 运行: venv python test_seg_check.py, 退出码 0=全过
 """
@@ -321,6 +330,95 @@ def main():
           and all(js_d["stats"][k] == base["stats"][k] for k in (
               "segments", "untranslated", "seam_raw", "seam_cuts")),
           so_d.strip()[-400:])
+
+    # ---- ⑭ [v34] 探针 JSON **形状不符** -> 当「读数不可用」, 不许裸崩 ----
+    # 旧代码把 json.loads 的结果直接交给下游取 p["cuts"], 探针一改字段名就抛裸 KeyError
+    # —— 栈里全是 seg_check 的代码、退出码 1, 与「发现未译段」(也退 1) 在退出码上分不开,
+    # 而它其实是基础设施故障(该退 2), 且会顺手把「判定与其他读数一字不动」这条契约破掉。
+    fake_bad = os.path.join(tmp, "fake_bad_probe.py")
+    with open(fake_bad, "w", encoding="utf-8") as f:
+        f.write("# -*- coding: utf-8 -*-\n"
+                "import json\n"
+                "print(json.dumps([{\"page\": 1, \"wrong_key\": []}]))\n")
+    rc_e, so_e, _ = run(tmp, "--mono", mono, "--sidecar", sc, "--layout-cuts",
+                        env={"PDF2ZH_LAYOUT_PROBE": fake_bad})
+    js_e = payload(so_e)
+    check("⑭ 探针 JSON 形状不符 -> 只报「不可用(形状不符)」, 判定与读数一字不动",
+          rc_e == rc_b == 1 and js_e and "layout_cuts" not in js_e["stats"]
+          and js_e["layout_cuts"] == [] and js_e["verdict"] == base["verdict"]
+          and "形状不符" in so_e
+          and all(js_e["stats"][k] == base["stats"][k] for k in (
+              "segments", "untranslated", "seam_raw", "seam_cuts")),
+          so_e.strip()[-400:])
+
+    # ---- ⑪ [v34] 弱形式(光杆 Reference)的上/下文守卫 ----
+    # 为什么要单开沙箱: 上面那套夹具的段计数被 ①~⑩ 逐条咬住(加页会连带改十几个断言),
+    # 而这里要问的只是 ref_anchor_cut 的一个分支 —— 用"只含两段"的最小侧车最干净。
+    # 形态来自真语料: 表头单元格 `Reference` 单独成段(Melhani 第4页), 它命中整段判据
+    # 就会把其后**整页**段落豁免掉 -> 本该 FAIL 却 PASS。
+    tmp11 = tempfile.mkdtemp(prefix="pdf2zh_segcheck_refweak_")
+    hdr_line = "Table cells list the dimension and the filter type used"
+    sc11a = make_sidecar(os.path.join(tmp11, "hdr.jsonl"), {
+        1: [("Reference", "Reference"), (hdr_line, hdr_line)],
+    })
+    rc11, so11, _ = run(tmp11, "--sidecar", sc11a)
+    js11 = payload(so11)
+    check("⑪ 光杆 Reference + 其后无年份条目 -> 不认文献区锚点(表头形态), 两段照报漏译",
+          rc11 == 1 and js11 and js11["stats"]["ref_segments"] == 0
+          and js11["stats"]["segments"] == 2 and len(js11["untranslated"]) == 2,
+          js11 and js11["stats"])
+
+    sc11b = make_sidecar(os.path.join(tmp11, "ref.jsonl"), {
+        1: [("References", "References"),
+            ("[1] Smith J. 1980. A study of aquatic fungi in culture.",
+             "[1] Smith J. 1980. A study of aquatic fungi in culture.")],
+    })
+    rc12, so12, _ = run(tmp11, "--sidecar", sc11b)
+    js12 = payload(so12)
+    check("⑪ 光杆 References + 其后跟着带年份的条目 -> 仍认文献区锚点(真标题), 全豁免",
+          rc12 == 0 and js12 and js12["stats"]["ref_segments"] == 2
+          and js12["verdict"] == "PASS", js12 and js12["stats"])
+
+    # 强形式不受守卫影响: `LITERATURE CITED` 后面没有任何条形目也照样是锚点
+    # (它不该因为"后面没年份"被降级 —— 守卫只针对光杆 REFERENCES?)
+    sc11c = make_sidecar(os.path.join(tmp11, "lc.jsonl"), {
+        1: [("LITERATURE CITED", "LITERATURE CITED"), (hdr_line, hdr_line)],
+    })
+    rc13, so13, _ = run(tmp11, "--sidecar", sc11c)
+    js13 = payload(so13)
+    check("⑪ 强形式(LITERATURE CITED)不经过守卫: 无年份条目也认锚点",
+          rc13 == 0 and js13 and js13["stats"]["ref_segments"] == 2,
+          js13 and js13["stats"])
+
+    # ---- ⑫ [v34] 空段表 = 判不了(退 2), 不许当通过 ----
+    # 侧车是**逐页追写**的: 翻译刚开始(或刚开始就崩)时文件已存在却一行没有。旧口径下
+    # scan([]) 给「提示: 段表为空」+ verdict PASS + 退 0 —— 最后一道门禁对着一份什么都没判
+    # 的段表举手放行。门禁的语义是"判过了没问题", 不是"没东西可判也算没问题"。
+    tmp12 = tempfile.mkdtemp(prefix="pdf2zh_segcheck_empty_")
+    empty_sc = os.path.join(tmp12, "empty.jsonl")
+    with open(empty_sc, "w", encoding="utf-8"):
+        pass
+    rc14, so14, se14 = run(tmp12, "--sidecar", empty_sc)
+    check("⑫ 空侧车 -> 退 2 并说明(判不了), 不当 PASS",
+          rc14 == 2 and "侧车是空的" in se14 and "no-report" not in se14,
+          "%d %s" % (rc14, se14.strip()[-300:]))
+
+    # ---- ⑬ [v34] 跳页豁免窗口按**原文真实页数**算, 不按"段表里的最大页" ----
+    # 夹具形态取自生产: 末尾被 skipLastPages 跳掉的页**一个字都没送翻** -> 不在段表里。
+    # 原文真 4 页、段表末页 3, `--skip-last 1` 该豁免第 4 页; 若拿段表最大页 3 当总页数,
+    # 窗口就前移到第 3 页 —— 把第 3 页上真正的漏译**静默放行**(门禁放过), 这一条就是锁它。
+    tmp13 = tempfile.mkdtemp(prefix="pdf2zh_segcheck_skippage_")
+    orig13 = make_pdf(os.path.join(tmp13, "o.pdf"),
+                      [[BODY1], [BODY2], [LEAK], []])
+    sc13 = make_sidecar(os.path.join(tmp13, "s.jsonl"), {
+        1: [(BODY1, ZH1)], 2: [(BODY2, ZH2)], 3: [(LEAK, LEAK)],
+    })
+    rc15, so15, _ = run(tmp13, "--pdf", orig13, "--sidecar", sc13, "--skip-last", "1")
+    js15 = payload(so15)
+    check("⑬ 末尾页不在段表里也不许让窗口前移: 第 3 页的漏译照样报(退 1)",
+          rc15 == 1 and js15 and js15["stats"]["skipped_pages"] == 0
+          and {c["page"] for c in js15["untranslated"]} == {3},
+          js15 and js15["stats"])
 
     print("\nseg_check 段表漏译门禁单元测试: %d PASS / %d FAIL" % (passed, failed))
     return 1 if failed else 0

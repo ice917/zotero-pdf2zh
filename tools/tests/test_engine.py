@@ -93,6 +93,14 @@ TOOLS = os.path.dirname(HERE)
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
+# [v34] 台账路径必须在本套件驱动 seg_import(子进程) **之前**改掉 —— 理由与
+# test_seg_rework.py 同一处(那里有完整推导): 台账默认落在**入库文件** tools/lessons.tsv,
+# 单独跑套件会把合成夹具(如 `FAIL #S3 占位符不守恒`)写进生产翻译提示词并顶掉真教训。
+# 本套件走 subprocess 且不传 env=, 继承本进程环境 -> 在这里设一次即可。
+# setdefault: run_all.py 的 P11 已经指到临时文件时以它为准。
+os.environ.setdefault("PDF2ZH_LESSONS_TSV", os.path.join(
+    tempfile.mkdtemp(prefix="pdf2zh_test_lessons_"), "lessons.tsv"))
+
 import engine as EG           # noqa: E402
 import adopt as AD            # noqa: E402  模块级只定义常量/函数, 导入不写库
 

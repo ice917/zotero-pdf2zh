@@ -6,9 +6,13 @@ v28.60 给面板加过一条"心跳静默 IDLE_LIMIT(1800s) = 窗口已关"的�
 30 分钟根本不够 —— 一个"估出来的"时限只会把正常干活的人当死窗口处理。**整条腿删掉**。
 
 [v28.79+] 删掉之后留了个窟窿: 浏览器崩了发不出告别, 进程就一直占着 60642(DETACHED
-进程, 服务器终端 Ctrl+C 也带不走)。用户给的解法不是把时限加回来, 而是换成**确定性信号**:
-**⑤ 出稿成功且这一篇该做的都出齐了 → 面板自己收摊**(退出腿②)。失败、还有块没出稿,
-一律不退 —— 那时要改稿重贴、或接着把表格做完。
+进程, 服务器终端 Ctrl+C 也带不走)。当时的解法不是把时限加回来, 而是换成**确定性信号**:
+**⑤ 出稿成功且这一篇该做的都出齐了 → 面板自己收摊**(退出腿②)。
+
+[v36.4] 那条自动腿**已删**: 它恰好在"成品刚出来的那一刻"开火, 而概念链接**必须先有
+成品才能做** —— 等于把动线掐在第一步。现在**退出腿② 由人点「完工, 关面板」触发**
+(触发器从"⑤ 这个条件"换成"一次点击", 关的那套机器没变)。于是"整篇齐了"只剩一个用途:
+在出稿日志与响应里说一句"这一篇齐了", 不驱动任何自动行为。
 
 本套件逐条锁死现在的契约:
   ① 看门狗: 只剩告别腿 —— 心跳静默多久都不自灭(这条是"删掉兜底"的**行为**证据);
@@ -21,8 +25,9 @@ v28.60 给面板加过一条"心跳静默 IDLE_LIMIT(1800s) = 窗口已关"的�
      落在哪个端口(sandbox 的对应一半在 test_pause_adopt.py 的 D 段);
   ⑤ 60642 旧实例: 只识别、**绝不代杀** —— 本套件只做静态守卫, 不真发告别
      (用户的活面板可能就挂在 60642 上, 真发一次就把它关了);
-  ⑥ 退出腿②(收摊): 判据是"**整篇齐了**"而不是"这一步过了"; 出稿失败/还有块没出稿
-     绝不收; 关的是自己那个服务器对象, 不是杀进程。
+  ⑥ 退出腿②(关面板): [v36.4] **没有任何自动收摊** —— 整篇齐了也不退, 退只由人点
+     「完工, 关面板」触发; paper_done 的判据照旧, 但只剩"说一句齐了"这个用途
+     (done 字段照发); close_panel 关的是自己那个服务器对象, 不是杀进程。
 
 运行: venv python test_panel_idle.py, 退出码 0=全过
 """
@@ -314,21 +319,26 @@ def main():
     check("⑤ 起不来时明说落在随机端口, 不假装占了 60642",
           "60642 没腾出来" in src)
 
-    # ---- ⑥ 退出腿②: ⑤ 出稿且**整篇出齐** -> 自己收摊 ----
-    # 判据是"整篇齐了", 不是"这一步过了": 面板是多格的(正文 + 表格正文/表注), 顺序随人 ——
-    # 正文出完稿、表格还没做就关窗, 等于把人手里的活收走。
+    # ---- ⑥ 退出腿②: 出稿**不再**自动收摊, 关面板交给人 ----
+    # [v36.4] 判据还留着(paper_done), 但它现在**不驱动任何自动行为** —— 只用来在出稿日志
+    # 与响应里说一句"这一篇齐了"。原因是那条自动腿与概念链接区天生冲突: 链接必须在成品
+    # 出来之后做, 而"整篇出齐"恰在成品刚出来的那一刻。所以本段锁两件事:
+    #   ① paper_done 的判据本身不变(多格、顺序随人、foreign 不算本篇欠的);
+    #   ② **齐不齐都不收摊** —— 收摊只由 close_panel 那次点击触发。
     t_body = {"label": "正文 X", "short": "正文", "state": "done", "self": True, "foreign": False}
     t_tbl = {"label": "表格 X", "short": "表格", "state": "todo", "self": False, "foreign": False}
     t_old = {"label": "表注 X", "short": "表注", "state": "stale", "self": False, "foreign": False}
     t_other = {"label": "表格 Y", "short": "表格", "state": "todo", "self": False, "foreign": True}
-    check("⑥ 只有正文、已出稿 -> 齐了, 收摊", PN.paper_done([t_body]) is True)
-    check("⑥ 还有表格没出稿 -> 没齐(不收摊, 让你接着做)",
+    check("⑥ 只有正文、已出稿 -> 齐了(这只是个判据, 不再驱动收摊)",
+          PN.paper_done([t_body]) is True)
+    check("⑥ 还有表格没出稿 -> 没齐(但也不收摊, 让你接着做)",
           PN.paper_done([t_body, t_tbl]) is False)
     check("⑥ stale(装配过新一轮要重做) 也算没齐", PN.paper_done([t_body, t_old]) is False)
     check("⑥ foreign(烙着别篇的表) 不算本篇欠的", PN.paper_done([t_body, t_other]) is True)
-    check("⑥ 没有正文任务(列表空) -> 谈不上齐, 不收摊", PN.paper_done([]) is False)
+    check("⑥ 没有正文任务(列表空) -> 谈不上齐", PN.paper_done([]) is False)
 
-    # 接线: 只有"出稿成功 + 整篇齐了"才收; 失败、没齐都不退(那两件都还得你在面板上做)。
+    # 接线: [v36.4] **任何一条路都不收摊**。把 close_panel 换成记录器 —— 谁要是再把自动
+    # 收摊塞回 _commit(不管挂在"齐了"还是"失败"上), 这里的 n 就会非 0 而报红。
     class _WCStub:
         class LedgerFailed(Exception):
             pass
@@ -364,12 +374,12 @@ def main():
     JOB = {"label": "正文 X", "render": True}
 
     def commit(todos, out="D:\\tmp\\out.pdf"):
-        """跑一次 ⑤(_commit), 返回 (响应, 收摊被叫了几次)。"""
+        """跑一次 ⑤(_commit), 返回 (响应, 关面板被叫了几次)。"""
         calls = []
         resp = _Resp()
         stub = _WCStub(out)
         with swap(wc=stub, paper_tasks=lambda: list(todos),
-                  stop_after_done=lambda *a: calls.append(1), os=_OsStub()):
+                  close_panel=lambda *a: calls.append(1), os=_OsStub()):
             with PN.LOCK:
                 PN.STATE["checked"] = (JOB, ["S1"], {"S1": "你好。"})
                 PN.STATE["sha"] = PN._sha("回包文本")
@@ -377,15 +387,15 @@ def main():
         return resp.seen[-1], len(calls)
 
     r, n = commit([t_body])
-    check("⑥ 出稿成功且整篇齐了 -> 响应带 done 且安排收摊",
-          r.get("ok") and r.get("done") is True and n == 1, (r, n))
+    check("⑥ 出稿成功且整篇齐了 -> 响应带 done, 但**不安排收摊**(n=0)",
+          r.get("ok") and r.get("done") is True and n == 0, (r, n))
     r, n = commit([t_body, t_tbl])
-    check("⑥ 还有没出稿的 -> 照旧出稿但**不收摊**(只提醒)",
+    check("⑥ 还有没出稿的 -> 照旧出稿、不收摊(只提醒)",
           r.get("ok") and r.get("done") is False and n == 0 and r.get("warn"), (r, n))
     r, n = commit([t_body], out=False)          # run_job 返回假值 = 门禁未过/排版失败
-    check("⑥ 出稿失败 -> 绝不收摊(要改稿重贴)", r.get("ok") is False and n == 0, (r, n))
+    check("⑥ 出稿失败 -> 更不收摊(要改稿重贴)", r.get("ok") is False and n == 0, (r, n))
     r, n = commit([t_body], out=None)           # 底片没做成 -> 拦在出稿前
-    check("⑥ 底片没做成(拦在出稿前) -> 收摊没被叫", r.get("ok") is False and n == 0, (r, n))
+    check("⑥ 底片没做成(拦在出稿前) -> 关面板没被叫", r.get("ok") is False and n == 0, (r, n))
 
     class _Srv:
         def __init__(self):
@@ -396,19 +406,21 @@ def main():
 
     fake = _Srv()
     with swap(SRV={"h": fake}):
-        PN.stop_after_done(0.05)                # 宽限本身是给"响应回到页面"留的, 测试里缩短
+        PN.close_panel(0.05)                    # 宽限本身是给"响应回到页面"留的, 测试里缩短
         time.sleep(0.6)
-    check("⑥ 收摊关的是自己那个服务器对象(不是杀进程)", fake.calls == 1, fake.calls)
+    check("⑥ 人点了关面板 -> 关的是自己那个服务器对象(不是杀进程)", fake.calls == 1, fake.calls)
 
     fake2 = _Srv()
     with swap(SRV={"h": fake2}):
-        PN.stop_after_done()
+        PN.close_panel()
         time.sleep(0.2)
         n_now = fake2.calls
-    check("⑥ 不是立刻关: 留几秒把「✓ 已出稿」送回到页面上", n_now == 0, n_now)
-    check("⑥ 页面收到 done -> 横幅说清楚 + 顺手试关窗",
-          "r.done" in pg and "window.close()" in pg)
-    check("⑥ main() 把服务器对象交给收摊腿(不交就关不掉自己)",
+    check("⑥ 不是立刻关: 留几秒把那句回话送回到页面上", n_now == 0, n_now)
+    check("⑥ 页面收到 done -> 只说清楚, **不再**自作主张关窗",
+          "r.done" in pg and "window.close()" not in pg)
+    check("⑥ 页面有关面板这颗按钮(退出入口交到人手上)",
+          "ulCloseBtn" in pg and "/api/ulclose" in pg)
+    check("⑥ main() 把服务器对象交给关面板腿(不交就关不掉自己)",
           'SRV["h"] = srv' in src)
 
     print(f"\n结果: {passed} passed, {failed} failed")

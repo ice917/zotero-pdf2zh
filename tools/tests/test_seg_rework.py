@@ -43,6 +43,16 @@ SCRIPT = os.path.join(TOOLS, "seg_import.py")
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
+# [v34] 台账路径必须在本套件驱动 seg_import **之前**改掉。
+# 为什么: 本套件会走到 seg_import.write_rework_note -> lessons.record(), 而台账默认路径是
+# **入库文件** tools/lessons.tsv —— 单独跑一次本套件(不经 run_all.py)就把合成夹具写进
+# 生产翻译提示词。实测 2026-09-26 送审前审计: 台账里混进了 10 行 `{v1}` / `FAIL 缺段: [2]`
+# / `Alpha ok done…` 之类夹具, 其中 GLYPH `{v1}` 那条等于教豆包"把占位符原样写进译文",
+# 且它们按 MAX_KEEP 顶掉了真教训。run_all.py 有 P11 兜底, 但单独跑套件是常规动作。
+# setdefault: run_all.py 已经把路径指到临时文件时以它为准(同一份环境传下去)。
+os.environ.setdefault("PDF2ZH_LESSONS_TSV", os.path.join(
+    tempfile.mkdtemp(prefix="pdf2zh_test_lessons_"), "lessons.tsv"))
+
 import seg_import as SI  # noqa: E402
 
 NAME = "demo2026"

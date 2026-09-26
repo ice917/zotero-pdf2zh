@@ -731,8 +731,8 @@ def spelt_numbers(text):
 # 数词表里。实测 Hagihara 那篇 #S10/#S11 因此被拒(留空/半截/错位带全 0, 只这 2 条), 报告
 # 把改法指向数字, 而两段一个数字没丢。
 #
-# 豁免要**窄**: 只在月份名附近(±_MONTH_NEAR 字符内)出现数字时才算日期 —— 否则
-# "may be true" 里的 may 会白白把数字 5 放进豁免表, 幻觉数字就从那儿溜过去。
+# 豁免要**窄**: 只在月名**紧邻**数字(日或年)时才算日期 —— 否则 "may be true" 里的 may
+# 会白白把数字 5 放进豁免表, 幻觉数字就从那儿溜过去。
 _MONTH_NUM = {
     "january": 1, "february": 2, "march": 3, "april": 4, "may": 5, "june": 6,
     "july": 7, "august": 8, "september": 9, "october": 10, "november": 11,
@@ -741,27 +741,38 @@ _MONTH_NUM = {
     "sep": 9, "sept": 9, "oct": 10, "nov": 11, "dec": 12,     # PDF 日期行常写缩写
 }
 # 长的排前面: 否则 "march" 会先被 "mar" 吃掉一半(全文替换靠 \b 挡住 remarkable 这类)
-_MONTH_RE = re.compile(r"\b(?:%s)\b"
-                       % "|".join(sorted(_MONTH_NUM, key=len, reverse=True)))
-_MONTH_NEAR = 12        # 月名前后多少字符内有数字, 才算"日期里的月"
+_MONTH_L = "|".join(sorted(_MONTH_NUM, key=len, reverse=True))
+# [v34] 判据从「月名 ±_MONTH_NEAR(12) 字符内有任意数字」收紧成「数字**紧邻**月名」
+# (中间最多 _MONTH_GAP 个空白/标点)。旧口径的洞是可复现的:
+#   `In March we tested 3 configurations` —— "3" 落在 march 后 12 字符内, 于是 `3` 被
+#   放进豁免表 → 交付里**任何**一个冒出(幻觉)的 `3` 都不再被报。一个月的正文段落里
+#   顺带出现几个数字是常态, 这个洞不小; 新的两条判据都要求数字与月名之间**不能隔着词**:
+#     · 数字在前: `24 February` / `2019 September`
+#     · 数字在后: `February 2022` / `Feb. 24, 2022`
+#   覆盖学术稿前置信息里占绝大多数的三种写法(DD Month YYYY / Month DD, YYYY / Month YYYY)。
+#   已知**不再覆盖**的写法(实测语料未出现, 且方向是"多报一例让译者看一眼", 不是放过幻觉):
+#   `3rd of March`(序数+of)、`February the 24th`(the)——那两种的日期数字与月名之间隔着词。
+_MONTH_GAP = 3
+_MONTH_BEFORE = re.compile(r"(?P<d>\d{1,4})[\s.,\-/]{0,%d}(?P<m>%s)\b"
+                           % (_MONTH_GAP, _MONTH_L), re.I)
+_MONTH_AFTER = re.compile(r"\b(?P<m>%s)[\s.,\-/]{0,%d}(?P<d>\d{1,4})"
+                          % (_MONTH_L, _MONTH_GAP), re.I)
 
 
 def month_numbers(text):
     """载荷里**字母写的月份名**对应的月号(字符串集合), 供"日期汉化"豁免用。
 
-    只折算**日期上下文里**的月名: 月名 ±_MONTH_NEAR 字符内得有数字(日或年) ——
-    "may be"、"March forward" 这类普通用词不算, 免得把 5 / 3 白白放进豁免表。
+    只折算**日期上下文里**的月名: 数字必须**紧邻**月名(中间最多 _MONTH_GAP 个空白/标点)。
+    判据与取舍见上方常量处的推导 —— 关键一条是**不许隔着词**: "may be"、
+    "March forward"、"March we tested 3 configurations" 里的月名一概不折算。
     """
     t = text or ""
-    low = t.lower()
     out = set()
-    for m in _MONTH_RE.finditer(low):
-        v = _MONTH_NUM.get(m.group(0))
-        if v is None:
-            continue
-        lo, hi = max(0, m.start() - _MONTH_NEAR), min(len(low), m.end() + _MONTH_NEAR)
-        if NUM_TOK.search(low[lo:hi]):
-            out.add(str(v))
+    for rx in (_MONTH_BEFORE, _MONTH_AFTER):
+        for m in rx.finditer(t):
+            v = _MONTH_NUM.get(m.group("m").lower())
+            if v is not None:
+                out.add(str(v))
     return out
 
 

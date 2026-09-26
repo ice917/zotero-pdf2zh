@@ -248,6 +248,21 @@ class TranslateConverter(PDFConverterEx):
 
     # [v29 扫描件清底] 判据与参数
     RASTER_COVER_RATIO = 0.5   # 位图面积/页面积 ≥ 此值 → 视为「覆盖式位图」(扫描件)
+    # [v34] 文字层落在覆盖式位图内的比例下限。**只用位图面积判扫描件是不够的**:
+    # 原生数字页上放一张占半页的大图(论文插图/整页图表/出版社把某页做成位图再压文字层),
+    # 一样满足 ≥0.5 —— 于是这页被当成扫描件, 后果是**永久丢内容**:
+    #   · 段落级: pcls<=-1(图/表区)的段整段不重绘, 而 ops_base 已滤掉全部 T 系列文字指令
+    #     -> 该段文字在成品里**一个字都不剩**(它并不在位图里, 位图只覆盖半页);
+    #   · 组级: 同理(见 :1226);
+    #   · 清底: 把重绘行框的白色矩形铺在被文字压住的那半张图上 -> 图被抹白。
+    # 扫描件与原生页的真正分野是**文字层的位置**: 扫描件的文字层是位图的隐形 OCR 复本,
+    # 逐字落在位图之内(整页位图 -> 比例 ~100%); 原生页的正文在位图**之外**。
+    # 故加这一条: 文字层绝大部分落在位图内才算扫描件。
+    # 阈值 0.9 的余量: 实测扫描件 100%(整页位图), 原生页正文占多数时远低于此;
+    # 留 10% 容差是为了"扫描页 + 数字页眉/页脚"这类混合页仍判扫描件(它们确需清底)。
+    # 一页一个字都没有(纯图页/位图整页): 退化为只看位图面积(与旧口径一致) ——
+    # 无字可重绘, 清底与跳段都无事可做, 判哪边都不改变产物。
+    RASTER_INSIDE_RATIO = 0.9
     WHITEN_PAD = 1.0           # 清底矩形外扩(磅), 兜住墨迹溢出行框
     RUN_GAP_EM = 2.0           # 行内墨迹框合并的最大字间水平间隙(倍字号)
     RUN_VOV_RATIO = 0.4        # 行内墨迹框合并所需的最小纵向重叠(占较矮框高度)
@@ -255,12 +270,32 @@ class TranslateConverter(PDFConverterEx):
     # 该区字符在**扫描页**上不重绘: 可见内容本来就在位图里, 文字层是隐形 OCR 复本。
     GRAPHIC_CLS = -1
 
+    @staticmethod
+    def _page_chars(ltpage) -> list:
+        """页内**全部**字符(递归进 LTFigure)。
+
+        为什么必须递归: 位图常被包在 LTFigure 里, 图区文字也常在里面 —— 只数顶层
+        会漏掉半页字符, 比例就失真了。迭代而非递归调用, 免得深嵌套页爆栈。
+        """
+        out, stack = [], list(ltpage)
+        while stack:
+            it = stack.pop()
+            if isinstance(it, LTChar):
+                out.append(it)
+            elif isinstance(it, LTFigure):
+                stack.extend(it)
+        return out
+
     def _raster_covers_page(self, ltpage) -> bool:
         """本页是否有「覆盖式位图」= 扫描件的整页墨迹。
 
         为什么看位图: pdfinterp 组装成品页时是 `q {ops_base}Q ... cm {ops_new}` —— ops_base
         为原页内容流**滤掉 T* 文字指令**后的产物(pdfinterp.py「过滤 T 系列文字指令」), 位图照留。
         所以「某段底下有没有删不掉的墨迹」== 「本页有没有大幅位图」。有 → 重绘时先清底。
+
+        [v34] 判据 = 大幅位图 **且** 文字层基本落在这张位图内(见 RASTER_INSIDE_RATIO
+        处的推导)。两条缺一不可: 只看面积会把"原生页 + 半页大图"误判成扫描件, 那页的
+        图/表区段落会被整段跳过(成品里永久缺字), 压在图上方的正文行框还会被清底抹白。
 
         旁路: 环境变量 PDF2ZH_WHITEN_SCAN=0 关闭本特性(出问题可秒关, 也用于 A/B 对照)。
         """
@@ -271,6 +306,7 @@ class TranslateConverter(PDFConverterEx):
             page_area = abs((px1 - px0) * (py1 - py0))
             if page_area <= 0:
                 return False
+            rasters = []
             for item in ltpage:
                 if isinstance(item, LTImage):
                     imgs = [item]
@@ -281,7 +317,22 @@ class TranslateConverter(PDFConverterEx):
                 for im in imgs:
                     (x0, y0, x1, y1) = im.bbox
                     if abs((x1 - x0) * (y1 - y0)) / page_area >= self.RASTER_COVER_RATIO:
-                        return True
+                        rasters.append((min(x0, x1), min(y0, y1),
+                                        max(x0, x1), max(y0, y1)))
+            if not rasters:
+                return False
+            chars = self._page_chars(ltpage)
+            if not chars:               # 无字可重绘: 两边的产物一样, 保持旧口径
+                return True
+            n_in = 0
+            for c in chars:
+                cx = (c.x0 + c.x1) / 2.0
+                cy = (c.y0 + c.y1) / 2.0
+                for bx0, by0, bx1, by1 in rasters:
+                    if bx0 <= cx <= bx1 and by0 <= cy <= by1:
+                        n_in += 1
+                        break
+            return n_in / len(chars) >= self.RASTER_INSIDE_RATIO
         except Exception:
             log.debug("raster cover 判定失败, 本页不清底", exc_info=True)
         return False

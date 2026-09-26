@@ -854,6 +854,25 @@ def main():
                                  "结果可能有 5 处噪声")) == 1,
           AD.diff_invariants("results may be noisy and repeatable", "结果可能有 5 处噪声"))
 
+    # [v34] 收紧「±12 字符内任意数字」-> 「数字必须紧邻月名」后新增的三条:
+    # 旧口径下 `In March we tested 3 configurations` 里的 `3` 落在 march 后 12 字符内,
+    # 于是 `3` 进豁免表 —— 那一段交付里**任何**一个幻觉的 `3` 都不再被报。
+    check("㉗m′ 月名与数字之间隔着词 -> 不折算(March we tested 3)",
+          AD.month_numbers("In March we tested 3 configurations") == set(),
+          AD.month_numbers("In March we tested 3 configurations"))
+    check("㉗m′ 紧邻的日/年仍折算(24 February / February 2022 / 2019 September)",
+          AD.month_numbers("Received: 24 February 2022") == {"2"}
+          and AD.month_numbers("Published February 2022") == {"2"}
+          and AD.month_numbers("2019 September") == {"9"},
+          (AD.month_numbers("Received: 24 February 2022"),
+           AD.month_numbers("Published February 2022"),
+           AD.month_numbers("2019 September")))
+    check("㉗m′ 段里有 March(隔着词)时, 译文冒出 3 仍判不符",
+          len(AD.diff_invariants("In March we tested many configurations and repeated it",
+                                 "3 月我们测了很多配置并重复了一遍, 共 3 次")) == 1,
+          AD.diff_invariants("In March we tested many configurations and repeated it",
+                             "3 月我们测了很多配置并重复了一遍, 共 3 次"))
+
     # ㉗n 月份豁免不许盖住同一段的真漏(年份丢了仍要抓)
     check("㉗n 月份豁免放行, 同一段丢了年份仍判不符",
           len(AD.diff_invariants("Received: 24 February 2022", "收到：2月24日")) == 1,

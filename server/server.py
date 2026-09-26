@@ -187,7 +187,11 @@ def _cache_skeleton_rows(pdf_path):
                 ("%" + fp + "%",)).fetchone()
         finally:
             con.close()
-    except Exception:
+    except Exception as e:
+        # [v34] 不静默: 退化成 (0,0) 是**故意**的(见 docstring: 护栏宁可漏拦, 不因自身
+        # 故障把人挡在门外), 但"护栏这次瞎了"必须留一句 —— 不然下一回又出整篇英文 PDF
+        # 时, 现场只剩"护栏放行了", 没人知道它当时压根没读到库(v28.80 那次就是这种现场)。
+        print(f"⚠️ [骨架行护栏] 读缓存库失败, 本次**放弃这条判据**(按 0 行处理, 可能漏拦): {e}")
         return 0, 0
     return int(row[1] or 0), int(row[0] or 0)
 

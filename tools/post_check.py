@@ -151,6 +151,21 @@ REF_ENTRY = re.compile(r"(?m)^\s*\[\d{1,3}\]")
 REF_HEADING = re.compile(
     r"^\s*(?i:LITERATURE\s+CITED|REFERENCES?\s+CITED|REFERENCES?|BIBLIOGRAPHY"
     r"|WORKS\s+CITED|参考文献|引用文献)(?![A-Za-z\u4e00-\u9fff])\s*[.:：]?\s*$")
+# [v34] 上面那条里有一类**弱**形式: 光杆 `REFERENCES?`（不含 CITED）。
+# 为什么单列出来: `REFERENCES?` 是唯一一个"既是章节标题、又是常见英语单词"的臂
+# （`Bibliography`/`参考文献` 都不会单独出现在表格里）。实测误报形态是**表头单元格**
+# 单独成段 —— Melhani 第4页的表头 `Reference | Dim. | Filter type | …` 一旦被提取器
+# 拆成单段, 就只剩 `Reference`, 上面那条整段判据照样命中。而区域判据的代价是
+# **其后整页段落全部豁免漏译判定**, 于是一整页的英文回显被判 PASS(族 3: 本该 FAIL 却 PASS)。
+# 所以弱形式要加**上下文守卫**(在消费者 seg_check.ref_anchor_cut 里, 那里能看到后续段):
+# 必须是"标题 + 后面紧跟带年份的条目"才算文献区锚点。判据文本仍只有这一处
+# (谁弱、谁强由这里定义), 消费者不另写词表。
+#
+# [v34] 弱形式的判据文本（附列；`REF_HEADING` 的严格子集，供消费者问"这条命中是弱形式吗"）。
+# 刻意**不含**光杆 LITERATURE —— "LITERATURE REVIEW" 是正文章节标题(见上)。
+REF_HEADING_WEAK = re.compile(r"^\s*(?i:REFERENCES?)(?![A-Za-z\u4e00-\u9fff])\s*[.:：]?\s*$")
+# 文献条目的客观特征: 4 位年份。用来给弱形式做上下文守卫(见上)。
+REF_ENTRY_YEAR = re.compile(r"(?:1[6-9]|20)\d{2}")
 # 注: 本判据只给**区域级**消费者用（tools/seg_check.py 的页内文献段豁免）。
 # 刻意不接进 is_ref_page —— 那是**页级**判据, 供断言1/断言4 用: 一个"正文占
 # 九成、末尾挂文献块"的页一旦被当成文献页, 断言4 会在该页正文的中文上跑

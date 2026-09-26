@@ -2,25 +2,6 @@
 # 格式: 类型<TAB>证据<TAB>上下文<TAB>日期
 # 类型: GLYPH=字形整块 / MOVE=断点两侧错位 / OTHER=编号与空段类
 # 删掉某行即不再注入; 清空本文件即回到纯静态规则。
-GLYPH	.72,43–58(1983).	… activation of calcium and chloride channels. J. Membr. Biol.72,43–58…	2026-09-25
-GLYPH	29.	29. Lunevsky, V. Z., Zherelova, O. M., Vostrikov, I. Y. & Beres…	2026-09-25
-GLYPH	116,26066–26071(2019).	…oves like wounded Mimosa pudica. Proc. Natl. Acad. Sci. USA 116,26066…	2026-09-25
-GLYPH	30.	30. Kurenda, A., Nguyen, C. T., Chételat, A., Stolz, S. & Farme…	2026-09-25
-GLYPH	é	30. Kurenda, A., Nguyen, C. T., Chételat, A., Stolz, S. & Farmer, E. E…	2026-09-25
-GLYPH	10178–10183(2018).	…gnaling in a wounded plant. Proc. Natl. Acad. Sci. USA 115, 10178–101…	2026-09-25
-GLYPH	115,	…al signaling in a wounded plant. Proc. Natl. Acad. Sci. USA 115, 1017…	2026-09-25
-GLYPH	31.	31. Nguyen, C. T., Kurenda, A., Stolz, S., Chételat, A. & Farme…	2026-09-25
-GLYPH	88611(2014).	… method for the sensitive plant Mimosa pudica. PLoS ONE 9, e88611(201…	2026-09-25
-GLYPH	32.	32. Mano, H., Fujii, T., Sumikawa, N., Hiwatashi, Y. & Hasebe, …	2026-09-25
-GLYPH	9,	…tion method for the sensitive plant Mimosa pudica. PLoS ONE 9, e88611…	2026-09-25
-GLYPH	211–220(2011).	…onomic and evolutionary implications. Plant Syst. Evol.291, 211–220(2…	2026-09-25
-GLYPH	.291,	…ytotaxonomic and evolutionary implications. Plant Syst. Evol.291, 211…	2026-09-25
-GLYPH	33.	33. Dahmer, N. et al. Chromosome numbers in the genus Mimosa L.…	2026-09-25
-GLYPH	35–42(2006).	…’ cDNA ends from ampliﬁed cDNA templates. Biotechniques 41, 35–42(200…	2026-09-25
-GLYPH	34.	34. Polidoros, A. N., Pasentsis, K. & Tsaftaris, A. S. Rolling …	2026-09-25
-GLYPH	41,	…nd 3’ cDNA ends from ampliﬁed cDNA templates. Biotechniques 41, 35–42…	2026-09-25
-GLYPH	.21,375–382(2008).	…ne silencing in Lotus japonicus. Mol. Plant Microbe Interact.21,375–3…	2026-09-25
-GLYPH	35.	35. Maekawa, T. et al. Polyubiquitin promoter-based binary vect…	2026-09-25
 GLYPH	36.	36. Komari, T., Hiei, Y., Saito, Y., Murai, N. & Kumashiro, T. …	2026-09-25
 GLYPH	86,51–61(1973).	…smission of action potentials in Biophytum. Bot. Mag. Tokyo 86,51–61(…	2026-09-25
 GLYPH	165–174(1996).	…n of transformants free from selection markers. Plant J.10, 165–174(1…	2026-09-25
@@ -52,3 +33,12 @@ GLYPH	2+]cyt	…he following statistical analyses. The velocities of the [Ca2+]c
 GLYPH	50	… by a two-tailed Wilcoxon matched-pairs signed rank test. IC50 for th…	2026-09-25
 GLYPH	3+	…airs signed rank test. IC50 for the inhibitory effects of La3+ was es…	2026-09-25
 GLYPH	1	…s were represented in the main text and Supplementary Table 1 for the…	2026-09-25
+GLYPH	ManufacturingLocationCarbon(kg)Δ(kg)Δ(%)	ManufacturingLocationCarbon(kg)Δ(kg)Δ(%) Taiwan(Baseline)1518.2—— Sout…	2026-09-25
+GLYPH	100	…first cut set of ACT3 specifications from more than several 100 cutti…	2026-09-25
+GLYPH	25/105(˜25%)	…nd validate the results, we randomly sample and cross-check 25/105(˜2…	2026-09-25
+GLYPH	LogicArea-basedDiearea,processnode,yield,GPAFabrication,Packaging	ModelInputDriverKeyParametersEmittedSourceTypes LogicArea-basedDiearea…	2026-09-25
+GLYPH	IMECLogicArea-basedDiearea,processnode,yieldFabrication,Packaging	…rea-basedDiearea,processnode,yield,GPAFabrication,Packaging IMECLogic…	2026-09-25
+GLYPH	Flash(SSD)Capacity-basedStoragecapacity(GB)Fabrication,Packaging	… DRAMCapacity-basedStoragecapacity(GB)Fabrication,Packaging Flash(SSD…	2026-09-25
+GLYPH	$4.80	…er kWh). For carbon emissions credits, ACT3 will default to $4.80 per…	2026-09-25
+GLYPH	(a)Bycarbonemissionssourcetype.(b)Bydevicecategorytype.(c)Bydevicesubsystemhierarchy.	…er,2026VincentT.Lee,BilgeAcun,ZacharyLewis,andCarole-JeanWu (a)Bycarb…	2026-09-25
+GLYPH	ModelInputDriverKeyParametersEmittedSourceTypes	ModelInputDriverKeyParametersEmittedSourceTypes LogicArea-basedDiearea…	2026-09-25

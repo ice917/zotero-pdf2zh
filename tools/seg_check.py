@@ -115,7 +115,6 @@ import argparse
 import datetime
 import glob
 import hashlib
-import io
 import json
 import logging
 import os
@@ -124,8 +123,13 @@ import subprocess
 import sys
 import warnings
 
+# [v34] 用 reconfigure 而不是 `sys.stdout = io.TextIOWrapper(...)`: 后者每执行一次就多包
+# 一层, 而上一层的包装器被回收时会**关掉同一个底层 buffer** —— 于是"谁 import 本模块"
+# 谁就在之后打印时报 closed file(实测形态与 user_links.py 头注释里记的同一例)。
+# reconfigure 就地改编码, 重复执行是幂等的。本模块目前没人 import, 但把它当**库**用
+# (例如单元测 `scan()`)是迟早的事, 这个坑不该留着。
 try:
-    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
     pass
 warnings.filterwarnings("ignore")
@@ -215,10 +219,28 @@ def ref_anchor_cut(segs):
 
     标题段本身也算文献区（含在豁免内）：标题常常同样保持英文（`LITERATURE
     CITED` 原样回显），不该因此报"漏译"。
+
+    [v34] **弱形式加上下文守卫**：光杆 `Reference(s)` 是一条**整段**判据，而它同时是
+    表格里常见的表头单元格（Melhani 第4页 `Reference | Dim. | Filter type | …` 被拆成
+    单段就只剩 `Reference`）。命中它的代价是**其后整页段落全部豁免漏译判定** ——
+    实测族 3「本该 FAIL 却 PASS」正是这条通道。故弱形式再要求一条客观证据：
+    它**后面**得跟着像文献条目的段（含 4 位年份）。守卫只收紧"是不是锚点"，
+    判据文本仍只有 post_check 一处（谁算弱形式由那里定义，这里不另写词表）。
+    方向性：真文献区若一条年份都没有，守卫会失手 -> **多报**一个漏译段（噪音，看得见），
+    而不是少报（危险）—— 与模块头 ③ 的取舍一致。页级 is_ref_page（密度）不经过这里。
+
+    只往后看（`segs[i+1:]`）而不是全页找年份：锚点**之前**的段属于正文，正文里出现
+    年份是常态；把"之前有年份"当证据等于没守卫（表头那页照旧被豁免）。
     """
     for i, s in enumerate(segs):
-        if _PC.is_ref_heading(literal(s.get("raw"))):
-            return i
+        raw = literal(s.get("raw"))
+        if not _PC.is_ref_heading(raw):
+            continue
+        if _PC.REF_HEADING_WEAK.match(raw or "") and not any(
+                _PC.REF_ENTRY_YEAR.search(literal(t.get("raw")) or "")
+                for t in segs[i + 1:]):
+            continue                     # 更像表头单元格: 不当锚点
+        return i
     return None
 
 
@@ -336,6 +358,29 @@ PROBE = (os.environ.get("PDF2ZH_LAYOUT_PROBE")
          or os.path.join(os.path.dirname(os.path.abspath(__file__)), "layout_probe.py"))
 
 
+def probe_schema_err(obj):
+    """探针 JSON 的形状核验 -> 不符的原因（符合返回 None）。
+
+    [v34] 为什么非要核:**下游直接取字段** —— `layout_cut_finding` 取 `p["page"]`/`p["cuts"]`,
+    main 取 `p["cuts"]`/`c.get("keep_side")`。探针一改字段名(或哪天 --json 改成吐对象),
+    这里就抛**裸 KeyError/TypeError** —— main 不接这一类, 于是表现为「门禁自己崩了」:
+    栈里全是 seg_check 的代码、退出码 1, 与「发现未译段」(也是退 1) 在**退出码上分不开**,
+    而它其实是**基础设施故障**(该退 2)。核过形状再往回传, 把这种错钉在"探针读数不可用"
+    这一档 —— 与本函数上方「拿不到就报一行不可用, 其他读数一字不动」同一条口径。
+    """
+    if not isinstance(obj, list):
+        return "顶层不是数组（%s）" % type(obj).__name__
+    for i, p in enumerate(obj):
+        if not isinstance(p, dict) or "page" not in p or "cuts" not in p:
+            return "第 %d 项缺 page/cuts" % i
+        if not isinstance(p["cuts"], list):
+            return "第 %d 项的 cuts 不是数组" % i
+        for j, c in enumerate(p["cuts"]):
+            if not isinstance(c, dict):
+                return "第 %d 项的第 %d 个 cut 不是对象" % (i, j)
+    return None
+
+
 def layout_cuts(pdf, timeout=1800):
     """转调 `tools/layout_probe.py --cuts --json` -> (逐页读数, None) 或 (None, 原因)。
 
@@ -360,9 +405,13 @@ def layout_cuts(pdf, timeout=1800):
         line = line.strip()
         if line.startswith("["):             # 模型加载会往 stdout 吐杂音，只认 JSON 那行
             try:
-                return json.loads(line), None
+                obj = json.loads(line)
             except ValueError:
                 continue
+            bad = probe_schema_err(obj)      # [v34] 形状不符 -> 当"读数不可用"，不带进下游
+            if bad:
+                return None, "探针 JSON 形状不符（%s）" % bad
+            return obj, None
     return None, "探针没有吐出可解析的 JSON"
 
 
@@ -404,7 +453,7 @@ def archived_sidecar(pdf):
     return p if os.path.isfile(p) else None
 
 
-def load_sidecar(path):
+def load_sidecar(path, n_pages=None):
     """侧车 jsonl -> 逐页记录 [{"page": 真实页码, "segs": [...]}]（按页归并，保序）。
 
     · 真实页码 = pageid + 1（见模块头「页数口径」）；无 pageid 时回落 page。
@@ -412,15 +461,37 @@ def load_sidecar(path):
       另起一页（backfill_pages 踩过这个坑，实测 Zhang 漂 11 页）。
     · 同页内**完全相同的 (raw, trans) 对去重**：图内文字会被回调两次
       （end_figure 与 end_page 各一次），不去重会让同一段被数两次。
+    · [v34] pageid 越界（`n_pages` 给了才算）只**告警不丢弃** —— 见下方推导。
     """
     order, seen, out = {}, {}, []
+    n_bad, samples = 0, []
     for line in open(path, encoding="utf-8"):
         line = line.strip()
         if not line:
             continue
         o = json.loads(line)
         pid = o.get("pageid")
-        pg = (int(pid) + 1) if pid is not None else o.get("page")
+        # [v34] pageid 是**唯一**权威页码口径（见模块头），但它一直没有边界核验, 且回落路线
+        # 的 `page` 还得是整数才能当排序键 —— 侧车里一条坏记录有两种形态:
+        #   ① pageid 写成越界值(0 基负数 -> 页 0/-1, 或错位 -> 页数百): 凭空多出一"页",
+        #      既不在文献页豁免集里(文献条目会按未译报出), 又会抬高 main 里 n_side =
+        #      max(page) —— pdf 读不到页数时这条就是跳页窗口的上界, **窗口整段前移**,
+        #      末尾真页的真漏译被静默放行。
+        #   ② page 缺失/非整数: 记录 page=None, 末尾 out.sort 拿 None 与 int 比 -> TypeError
+        #      （裸崩, 与"发现未译段"同为退 1, 分不出来）。
+        # 处置:**只告警、不丢弃**。丢了是往"少报"方向走(漏译被放行), 而这条口径一贯是
+        # "宁多报不漏报"; 留着最坏也只是报告里多几行看着不对的页码 —— 且下面点名说清了。
+        try:
+            pg = (int(pid) + 1) if pid is not None else int(o.get("page"))
+        except (TypeError, ValueError):
+            n_bad += 1
+            if len(samples) < 3:
+                samples.append("pageid=%r page=%r" % (pid, o.get("page")))
+            continue
+        if n_pages and not (1 <= pg <= n_pages):
+            n_bad += 1
+            if len(samples) < 3:
+                samples.append("pageid=%r -> 页 %d（原文 %d 页）" % (pid, pg, n_pages))
         if pg not in order:
             order[pg] = len(out)
             out.append({"page": pg, "segs": []})
@@ -435,6 +506,13 @@ def load_sidecar(path):
             seen[pg].add((raw, tr))
             slot.append({"raw": raw, "trans": tr})
     out.sort(key=lambda r: r["page"])
+    if n_bad:
+        extra = "（另有 %d 条同类未列出）" % (n_bad - len(samples)) if n_bad > len(samples) else ""
+        print("⚠ 侧车有 %d 条页记录的页码不可信：%s%s\n"
+              "     · 页码非整数（pageid/page 都缺或不是数）的**已丢弃** —— 它连排序键都不成立；\n"
+              "     · 页码越界的**已保留**（本口径宁多报不漏报）：它们可能让「文献页豁免」与\n"
+              "       「跳页窗口」失准 —— 先核对这份侧车是不是这一篇/这一轮，再读下面的清单。"
+              % (n_bad, "；".join(samples), extra), file=sys.stderr)
     return out
 
 
@@ -462,8 +540,12 @@ def load_pages(sidecar="", pdf="", engine_name="", name=""):
         for s in _ENG.read_tracking_segments(path):
             by_page.setdefault(s["page"], []).append(
                 {"raw": s["src"], "trans": s["dst"], "err": s["err"]})
-        return ([{"page": pg, "segs": by_page[pg]} for pg in sorted(by_page)],
-                "段表 %s" % path, _mtime(path))
+        recs = [{"page": pg, "segs": by_page[pg]} for pg in sorted(by_page)]
+        # [v34] 与下面侧车路线同一条口径: 空段表不是"通过", 是"判不了"(见那里的推导)
+        if not recs:
+            raise IOError("段表是空的（%s）—— 一条页记录都没有, 本口径无从判定。"
+                          "别当通过看" % path)
+        return recs, "段表 %s" % path, _mtime(path)
 
     arch = archived_sidecar(pdf)
     src = sidecar or arch or prof.sidecar
@@ -474,7 +556,16 @@ def load_pages(sidecar="", pdf="", engine_name="", name=""):
     if not sidecar and not arch:
         how += ("  ⚠ 身份未核验: latest.jsonl 是单文档假设, 换论文即覆盖; 本次没能按原文"
                 "内容散列认领归档件 —— 若刚翻过别的篇, 下面的读数可能是别的篇的")
-    return load_sidecar(src), how, _mtime(src)
+    recs = load_sidecar(src, n_pages=pdf_page_count(pdf))
+    # [v34] **空段表不许当通过**。侧车是**逐页追写**的：翻译刚开始(或刚开始就崩)时文件
+    # 已存在却一行没有 —— 旧口径下 scan([]) 会给出「提示: 段表为空」+ verdict PASS + 退 0,
+    # 也就是**最后一道门禁对着一份什么都没判的段表举手放行**。门禁的语义是"判过了没问题",
+    # 不是"没东西可判也算没问题"；判不了就得说判不了(退 2)，与"拿不到段表"同一档。
+    if not recs:
+        raise IOError("侧车是空的（%s）—— 一条页记录都没有, 本口径无从判定。"
+                      "侧车是逐页追写的: 这通常意味着翻译刚起步就中断了, 别当通过看"
+                      % src)
+    return recs, how, _mtime(src)
 
 
 # ---------------------------------------------------------------- 扫描
@@ -636,8 +727,24 @@ def exempt_pages_from(original, n_pages):
         r = PdfReader(original)
         return {i + 1 for i in range(min(n_pages, len(r.pages)))
                 if _PC.is_ref_page(_PC.page_features(r, i))}
-    except Exception:
+    except Exception as exc:
+        # [v34] 不吞: 拿不到原文时**返回空集**是安全的(方向是"多报"——文献条目会按
+        # 未译段报出来, 是看得见的噪音), 但"为什么豁免没生效"必须说出来 —— 静默的
+        # except 会让人以为"这篇没有文献页", 于是拿噪音当故障查。
+        print("⚠ 文献页豁免不可用（%s）—— 文献条目段会按未译段报出（噪音, 非故障）"
+              % exc, file=sys.stderr)
         return set()
+
+
+def pdf_page_count(pdf):
+    """原文 PDF -> 真实总页数（拿不到/读不了返回 None）。"""
+    if not pdf or not os.path.isfile(pdf):
+        return None
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(pdf).pages)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------- 报告
@@ -837,7 +944,18 @@ def main():
         print("❌ 拿不到段表: %s" % exc, file=sys.stderr)
         return 2
 
-    n_pages = max((r["page"] for r in pages), default=0)
+    n_side = max((r["page"] for r in pages), default=0)
+    # [v34] 跳页豁免窗口必须按**原文真实页数**算, 不能用"段表里的最大页"代替:
+    # 段表只记**有文字回调**的页, 而末尾被 skipLastPages 跳掉的那几页本来就一个字都没送翻
+    # -> 不在段表里。拿段表最大页当总页数, 整个窗口就**往前挪**(实测形态: 原文真 11 页、
+    # 段表末页 9, 该豁免 10/11 却去豁免 8/9), 于是正文章节里真正的漏译**在窗口内被静默
+    # 放行** —— 门禁放过。post_check 的同一参数用的是译文页特征数(= 原文真实页数), 这里对齐它。
+    n_pdf = pdf_page_count(pdf)
+    n_pages = n_pdf or n_side
+    if args.skip_last > 0 and n_pdf is None:
+        print("⚠ 读不到原文页数（--pdf 没给或读不了）—— 跳页窗口按段表最大页 %d 算, "
+              "末尾被跳的页若不在段表里, 窗口会前移。要精确请给 --pdf" % n_side,
+              file=sys.stderr)
     ref_pages = exempt_pages_from(pdf, n_pages)
     # 接缝切点的几何核验器（第二道）：拿原文坐标把「行/块边界」从候选里滤掉。
     # 拿不到原文 / 没装 pymupdf → verifier 为 None → 退回纯文本口径（报告里会写明）。
