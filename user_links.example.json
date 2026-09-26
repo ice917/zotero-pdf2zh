@@ -1,5 +1,6 @@
 {
   "_readme": [
+    "本文件是模板: 复制成 user_links.json 再用(那一份不入库 —— 里面会有你的译文锚文本)。",
     "用户自定义概念链接: 把『选中的那段字』绑到你自己的网址, 由 tools/user_links.py 装进成品 PDF。",
     "结构: global = 跨篇通用(不许带 page); tasks.<任务名> = 本篇(必须带 page, 1 基 mono 坐标)。",
     "字段: anchor 锚文本(必填) / url(必填, http(s) 开头) / occurrence 第几次出现(命中多处时必填)",

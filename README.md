@@ -482,7 +482,8 @@ python tools\style_links.py --target $out --sidecar $sc
 原版超链接是**继承来的**——读者只能点原书给的那几个。而"读到这里我需要一点背景知识"
 这类需求原书不会替你想到，位置该由读者定：把**选中的那段字**绑到**你自己给的网址**。
 
-两种入口，改的是同一个规格文件 `user_links.json`：
+两种入口，改的是同一个规格文件 `user_links.json`（**这份不入库** —— 里面会有你的译文锚文本；
+首次用先 `Copy-Item user_links.example.json user_links.json`）：
 
 - **控制面板「概念链接」区**（推荐）：先从译文页点选一行文字当锚，再填网址；提交前自动跑
   一次 `--check` 预检，装上与否先告诉你看不看得到。
@@ -618,7 +619,8 @@ python tools\term_verify.py <清单.md> --source all               # 全源合�
 ## 许可与致谢
 
 - 本仓库基于 [guaguastandup/zotero-pdf2zh](https://github.com/guaguastandup/zotero-pdf2zh) v4.1.7 改造，
-  依 **AGPL-3.0** 同协议开源；上游改动之外的新文件由仓库作者贡献。
+  依 **AGPL-3.0** 同协议开源（协议正文见仓库根 `LICENSE`）；上游改动之外的新文件由仓库作者贡献。
+  相对上游的改动明细见 `改动记录.md`。
 - 底层翻译引擎：[PDFMathTranslate (pdf2zh)](https://github.com/Byaidu/PDFMathTranslate)（AGPL-3.0）。
 - 译文引擎推荐任意能通读全文的网页 AI（本机当前用豆包桌面版，基础对话免费）；本仓库与任何 AI 厂商无隶属关系。
 - 仅供学习研究；请勿翻译、传播受版权保护的出版物全文。

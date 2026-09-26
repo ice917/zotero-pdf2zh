@@ -44,8 +44,14 @@ tools/tests/test_strategist.py
 zotero-pdf-2-zh-*.xpi
 
 # 密钥红线: 含真实 key 的配置 (模板 *.example 不受影响)
+server/config/config.json
 server/config/config.toml
 server/md-translate/config.json
+
+# 用户数据红线: 概念链接规格里有本机的译文锚文本(模板见 user_links.example.json)
+#   [2026-09-26 发布准备] 原先是入库的; 里面唯一那条真条目带着一篇论文的译文片段,
+#   属本项目自订的"绝不放版权译文"红线 -> 移出库(盘上那份一个字节没动)。
+/user_links.json
 
 # 本机路径与个人文件 (开源红线): 本地保留不入库
 server/config/local_paths.json
