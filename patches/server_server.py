@@ -819,10 +819,22 @@ _QC_SEMAPHORE = threading.Semaphore(2)
 
 # [自研补丁 2026-09-03] 同名任务幂等去重(报告 🔴4): 上传与产物都是确定性
 # 文件名, 重复点击/异步重试会让后到请求截断正在被子进程读取的输入文件、
-# 产物互相覆盖。接收请求即在此登记 fileName->taskId, 同文件名的并发请求
-# 直接复用进行中的任务; 任务结束(成功/失败)释放。
+# 产物互相覆盖。接收请求即在此登记 fileName->{'op':..., 'taskId':...},
+# 同文件名的并发请求直接复用进行中的任务; 任务结束(成功/失败)释放。
+#
+# [自研补丁 2026-09-28] 登记值升级为 op 感知(报告 🔴4 收尾): 原实现只覆盖
+# /translate, 且只按文件名判重 —— 各端点产物同名(都落 translated/)会互相
+# 覆盖, 而"翻译中"被"对照"请求按同名复用会拿回牛头不对马嘴的产物。现在
+# /crop、/crop-compare、/compare 一并纳管, 并按 op 区分: 只有同 op 的在途
+# 任务才可复用, 跨 op 的同名请求一律拒绝。
 _SUBMIT_LOCK = threading.Lock()
 _INFLIGHT_FILES = {}
+
+# op 取值: translate / crop / crop-compare / compare
+_OP_TRANSLATE = 'translate'
+_OP_CROP = 'crop'
+_OP_CROP_COMPARE = 'crop-compare'
+_OP_COMPARE = 'compare'
 
 __version__ = "4.1.7"
 update_log = "远程/Docker 优先 HTTP 挂附件；新旧插件协议兼容；进度条显示翻译百分比；加固附件文件名；补齐额外字段白名单，可从下拉添加 *_enable_json_mode（默认关闭）。请同时更新插件和 Server。"
@@ -1097,7 +1109,7 @@ class PDFTranslator:
     def _success_files_response(self, paths):
         return jsonify(self._success_files_payload(paths)), 200
 
-    def _build_task_info(self, task_id, input_path, config, engine, start_time, status='开始处理'):
+    def _build_task_info(self, task_id, input_path, config, engine, start_time, status='开始处理', op=None):
         output_types = []
         if config.mono: output_types.append('mono')
         if config.dual: output_types.append('dual')
@@ -1140,6 +1152,7 @@ class PDFTranslator:
             'taskId': task_id,
             'active': True,
             'finished': False,
+            'op': op,
             'fileName': os.path.basename(input_path),
             'engine': engine,
             'service': config.service,
@@ -1294,35 +1307,46 @@ class PDFTranslator:
     ############################# 核心逻辑 #############################
     # 翻译 /translate
     @staticmethod
-    def _active_task_id_for_file(file_name):
-        """[自研补丁 2026-09-03] 同文件名且仍在进行中的任务 ID(无则 None)"""
+    def _active_task_id_for_file(file_name, op=None):
+        """[自研补丁 2026-09-03] 同文件名且仍在进行中的任务 ID(无则 None)。
+
+        [自研补丁 2026-09-28] 加 op 过滤: op=None 时不过滤(任何操作), 给定
+        op 时只认同一操作的任务, 避免"翻译中"被"对照"请求误复用。
+        """
         if not file_name:
             return None
         try:
             for task in task_manager.get_active_tasks_list():
                 if (task.get('fileName') == file_name
                         and task.get('active')
-                        and not task.get('finished')):
+                        and not task.get('finished')
+                        and (op is None or task.get('op') == op)):
                     return task.get('taskId')
         except Exception:
             pass
         return None
 
     @staticmethod
-    def _completed_task_id_for_file(file_name):
+    def _completed_task_id_for_file(file_name, op=None):
         """[自研补丁 2026-09-07] 同文件名且已成功完成的最近任务 ID(无则 None)。
 
         背景: 插件挂载靠"自己持有的 taskId 轮询"会话, 外部直提(API/脚本)
         的任务完成后插件无感知; 且去重只查活跃任务 → 插件重提同名文件会
         触发无谓重跑(即使缓存命中也要等排版)。查 history 后, 插件拿到历史
         taskId 轮询 /api/history 直接命中 fileList → 秒级下载挂载, 零重跑。
-        注: history 为内存态, server 重启后自然退回重跑路径(缓存兜底)。"""
+        注: history 为内存态, server 重启后自然退回重跑路径(缓存兜底)。
+
+        [自研补丁 2026-09-28] 加 op 过滤(同 _active_task_id_for_file); 且
+        仅 /translate 走这一层 —— 新纳管的三个端点不给历史复用, 免得把
+        "静默拿到旧产物"的风险扩散过去。
+        """
         if not file_name:
             return None
         try:
             for hist in task_manager.get_history():
                 if (hist.get('fileName') == file_name
                         and hist.get('status') == 'success'
+                        and (op is None or hist.get('op') == op)
                         and (hist.get('fileList') or hist.get('filePaths'))):
                     return hist.get('taskId')
         except Exception:
@@ -1335,32 +1359,97 @@ class PDFTranslator:
         if not file_name:
             return
         with _SUBMIT_LOCK:
-            if _INFLIGHT_FILES.get(file_name) == task_id:
+            cur = _INFLIGHT_FILES.get(file_name)
+            if isinstance(cur, dict) and cur.get('taskId') == task_id:
                 _INFLIGHT_FILES.pop(file_name, None)
 
-    def _register_inflight(self, task_id):
-        """[自研补丁 2026-09-03] 同名任务幂等去重(报告 🔴4)。
-        在落盘上传文件**之前**调用: 命中进行中任务返回 (dup_id, file_name);
-        否则占位登记返回 (None, file_name); 无文件名返回 (None, None)。"""
-        data = request.get_json(silent=True) or {}
-        fname = None
-        if isinstance(data, dict):
-            fname = self._safe_upload_filename(data.get('fileName')) or None
-        if not fname:
-            return None, None
+    @staticmethod
+    def _register_inflight_now(file_name, task_id, op):
+        """[自研补丁 2026-09-28] 立即以本任务占位登记(用于复用任务已失败、
+        需回退到自身流程的场景)。"""
+        if not file_name:
+            return
         with _SUBMIT_LOCK:
-            dup = self._active_task_id_for_file(fname) or _INFLIGHT_FILES.get(fname)
-            if dup and dup != task_id:
-                return dup, fname
-            # [自研补丁 2026-09-07] 已完成同名任务复用: 返回历史 taskId。
-            # 新插件: accepted+taskId → 轮询 /api/history 命中 → 秒挂载;
-            # 旧插件同步协议: _wait_for_task_payload 的 history 分支返回
-            # complete_task 存的 result payload, 同样直达产物。均零重跑。
-            dup_done = self._completed_task_id_for_file(fname)
-            if dup_done:
-                return dup_done, fname
-            _INFLIGHT_FILES[fname] = task_id
-            return None, fname
+            _INFLIGHT_FILES[file_name] = {'op': op, 'taskId': task_id}
+
+    def _peek_upload_filename(self):
+        """[自研补丁 2026-09-28] 只读取请求里的 fileName(容错, 不落盘)。
+
+        在 process_request 落盘**之前**调用, 取不到/非法一律返回 None,
+        交由后续 process_request 正常报错。不做校验副作用的抛错。"""
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return None
+        try:
+            return self._safe_upload_filename(data.get('fileName')) or None
+        except ValueError:
+            return None
+
+    def _claim_inflight(self, task_id, op, allow_reuse, allow_history):
+        """[自研补丁 2026-09-28] 同名任务在途去重登记(报告 🔴4 收尾)。
+
+        在 process_request 落盘之前调用。返回 (state, dup_id, fname):
+          - 'ok'    : 无冲突, 已以本任务(task_id, op) 占位登记;
+          - 'reuse' : 命中同 op 的进行中任务, dup_id 为其 taskId(未登记本任务);
+          - 'done'  : 命中同 op 的历史成功任务(仅 allow_history), dup_id 为其
+                      taskId(未登记本任务), 属"复用旧产物"路径;
+          - 'busy'  : 存在同名在途任务但不可复用(allow_reuse=False 时的任意
+                      同 op/跨 op 占用; 或 allow_reuse 但为跨 op 冲突),
+                      调用方应回 409, 本任务未登记。
+        无文件名时返回 ('ok', None, None)。
+        """
+        fname = self._peek_upload_filename()
+        if not fname:
+            return 'ok', None, None
+        with _SUBMIT_LOCK:
+            cur = _INFLIGHT_FILES.get(fname)
+            cur_id = cur.get('taskId') if isinstance(cur, dict) else None
+            cur_op = cur.get('op') if isinstance(cur, dict) else None
+            active_any = self._active_task_id_for_file(fname)
+            if not allow_reuse:
+                # 同步端点(/crop)无 taskId 可复用: 同名只要有人在跑, 一律拒绝,
+                # 否则后落盘的输入会截断正在被读取的文件、产物互相覆盖。
+                if (active_any and active_any != task_id) or (cur_id and cur_id != task_id):
+                    return 'busy', None, fname
+            else:
+                dup = self._active_task_id_for_file(fname, op=op)
+                if dup and dup != task_id:
+                    return 'reuse', dup, fname
+                if cur_id and cur_op == op and cur_id != task_id:
+                    return 'reuse', cur_id, fname
+                if active_any and active_any != task_id:
+                    # 同名但跨 op 在途: 不能复用(产物不同), 拒绝以免覆盖。
+                    return 'busy', None, fname
+                if allow_history:
+                    dup_done = self._completed_task_id_for_file(fname, op=op)
+                    if dup_done:
+                        return 'done', dup_done, fname
+            _INFLIGHT_FILES[fname] = {'op': op, 'taskId': task_id}
+            return 'ok', None, fname
+
+    def _reuse_inflight_job(self, task_id, dup_id, fname, op):
+        """[自研补丁 2026-09-28] 复用同 op 在途/历史任务的应答。
+
+        新插件 → accepted+dup_id; 旧插件 → 等其完成后返回产物 payload。
+        若复用任务确已失败(等不到产物且已不在活跃列表), 返回 None, 交由
+        调用方登记本任务并继续自身流程。"""
+        print(f"ℹ️ [{op}] 同名文件「{fname}」已有进行中任务 {dup_id}，复用该任务")
+        if self._client_wants_async_job():
+            return jsonify({
+                'status': 'accepted',
+                'taskId': dup_id,
+                'message': '该文件正在处理中，已复用现有任务',
+            }), 200
+        payload = self._wait_for_task_payload(dup_id)
+        if payload and payload.get('status') == 'success':
+            return jsonify(payload), 200
+        if self._active_task_id_for_file(fname, op=op):
+            # 等待超时但任务仍在跑: 不能重提(会覆盖输入), 交回任务列表
+            return jsonify({
+                'status': 'accepted', 'taskId': dup_id,
+                'message': '该文件处理仍在进行中，请稍后在任务列表查看结果',
+            }), 200
+        return None
 
     def _wait_for_task_payload(self, task_id, timeout=1800):
         """[自研补丁] 旧插件同步协议下等待复用任务结束, 返回其 success
@@ -1401,37 +1490,32 @@ class PDFTranslator:
             # 读取的输入文件、产物互相覆盖。
             if _force:
                 print("⚠️ [/translate] force=true: 跳过去重, 强制重新渲染")
-                fname = None
-                if isinstance(_req_data, dict):
-                    fname = self._safe_upload_filename(_req_data.get("fileName")) or None
+                fname = self._peek_upload_filename()
                 if fname:
-                    with _SUBMIT_LOCK:
-                        _INFLIGHT_FILES[fname] = task_id
+                    self._register_inflight_now(fname, task_id, _OP_TRANSLATE)
                     inflight_name = fname
-                dup_id = None
             else:
-                dup_id, fname = self._register_inflight(task_id)
-                if dup_id:
-                    print(f"ℹ️ [/translate] 同名文件「{fname}」已有进行中任务 {dup_id}，复用该任务")
-                    if self._client_wants_async_job():
-                        return jsonify({
-                            'status': 'accepted',
-                            'taskId': dup_id,
-                            'message': '该文件正在翻译中，已复用现有翻译任务',
-                        }), 200
-                    # 旧插件同步协议: 等待复用任务结束后返回它的产物
-                    payload = self._wait_for_task_payload(dup_id)
-                    if payload and payload.get('status') == 'success':
-                        return jsonify(payload), 200
-                    if self._active_task_id_for_file(fname):
-                        # 等待超时但任务仍在跑: 不能重提(会覆盖输入), 交回任务列表
-                        return jsonify({
-                            'status': 'accepted', 'taskId': dup_id,
-                            'message': '该文件翻译仍在进行中，请稍后在任务列表查看结果',
-                        }), 200
+                state, dup_id, fname = self._claim_inflight(
+                    task_id, _OP_TRANSLATE, allow_reuse=True, allow_history=True
+                )
+                if state == 'busy':
+                    print(f"⚠️ [/translate] 同名文件「{fname}」正被其他操作占用，拒绝并发提交")
+                    return jsonify({
+                        'status': 'error',
+                        'errorType': 'OperationInFlight',
+                        'message': f'文件「{fname}」正在被其他操作处理（翻译/裁剪/对照），请稍后再试。',
+                    }), 409
+                if state in ('reuse', 'done'):
+                    if state == 'done':
+                        # [自研补丁 2026-09-28] 历史复用会静默返回旧产物 —— 明示之,
+                        # 需要真正重译请带 force=true。
+                        print(f"ℹ️ [/translate] 同名文件「{fname}」命中历史已完成任务 {dup_id}，"
+                              f"复用其旧产物（如需重译请带 force=true）")
+                    resp = self._reuse_inflight_job(task_id, dup_id, fname, _OP_TRANSLATE)
+                    if resp is not None:
+                        return resp
                     # 复用任务确已失败: 登记本任务重新翻译
-                    with _SUBMIT_LOCK:
-                        _INFLIGHT_FILES.setdefault(fname, task_id)
+                    self._register_inflight_now(fname, task_id, _OP_TRANSLATE)
                     inflight_name = fname
                 else:
                     inflight_name = fname
@@ -1440,7 +1524,8 @@ class PDFTranslator:
             infile_type = self.get_filetype(input_path)
             engine = config.engine
             task_info = self._build_task_info(
-                task_id, input_path, config, engine, start_time, status='开始翻译'
+                task_id, input_path, config, engine, start_time, status='开始翻译',
+                op=_OP_TRANSLATE
             )
 
             if infile_type != 'origin':
@@ -2057,7 +2142,24 @@ class PDFTranslator:
 
     # 裁剪 /crop
     def crop(self):
+        # [自研补丁 2026-09-28] 同名在途去重(报告 🔴4 收尾): /crop 是同步端点,
+        # 无 taskId 可复用, 同名只要有人在跑一律 409, 避免后落盘的输入截断正在
+        # 被读取的文件、产物互相覆盖。
+        claim_id = str(uuid.uuid4())
+        inflight_name = None
         try:
+            state, _, fname = self._claim_inflight(
+                claim_id, _OP_CROP, allow_reuse=False, allow_history=False
+            )
+            inflight_name = fname
+            if state == 'busy':
+                print(f"⚠️ [/crop] 同名文件「{fname}」已有进行中的任务，拒绝并发提交")
+                return jsonify({
+                    'status': 'error',
+                    'errorType': 'OperationInFlight',
+                    'message': f'文件「{fname}」正在被处理中（翻译/裁剪/对照），请稍后再试。',
+                }), 409
+
             input_path, config = self.process_request()
             infile_type = self.get_filetype(input_path)
 
@@ -2085,22 +2187,47 @@ class PDFTranslator:
             return jsonify({'status': 'error', 'message': f'Crop failed: {new_path} not found'}), 500
         except Exception as e:
             return self._handle_exception(e, context='/crop')
+        finally:
+            self._release_inflight(inflight_name, claim_id)
 
     def crop_compare(self):
         task_id = str(uuid.uuid4())
         start_time = datetime.now()
+        inflight_name = None
         try:
+            # [自研补丁 2026-09-28] 同名在途去重(报告 🔴4 收尾): 必须在
+            # process_request 落盘之前判定。
+            state, dup_id, fname = self._claim_inflight(
+                task_id, _OP_CROP_COMPARE, allow_reuse=True, allow_history=False
+            )
+            if state == 'busy':
+                print(f"⚠️ [/crop-compare] 同名文件「{fname}」正被其他操作占用，拒绝并发提交")
+                return jsonify({
+                    'status': 'error',
+                    'errorType': 'OperationInFlight',
+                    'message': f'文件「{fname}」正在被其他操作处理（翻译/裁剪/对照），请稍后再试。',
+                }), 409
+            if state == 'reuse':
+                resp = self._reuse_inflight_job(task_id, dup_id, fname, _OP_CROP_COMPARE)
+                if resp is not None:
+                    return resp
+                # 复用任务确已失败: 登记本任务重新处理
+                self._register_inflight_now(fname, task_id, _OP_CROP_COMPARE)
+            inflight_name = fname
+
             input_path, config = self.process_request()
             infile_type = self.get_filetype(input_path)
             engine = config.engine
 
             if infile_type == 'crop-compare':
+                self._release_inflight(inflight_name, task_id)
                 return jsonify({
                     'status': 'error',
                     'errorType': 'InvalidPDFOperation',
                     'message': '该 PDF 已经是“裁剪后双语对照”结果，无需再次执行 crop-compare。请选择原文或 dual 附件。'
                 }), 409
             if infile_type not in {'origin', 'dual', 'dual-cut'}:
+                self._release_inflight(inflight_name, task_id)
                 return jsonify({
                     'status': 'error',
                     'errorType': 'InvalidPDFOperation',
@@ -2108,17 +2235,27 @@ class PDFTranslator:
                 }), 400
 
             task_info = self._build_task_info(
-                task_id, input_path, config, engine, start_time, status='开始处理'
+                task_id, input_path, config, engine, start_time, status='开始处理',
+                op=_OP_CROP_COMPARE
             )
+
+            def _guarded_job():
+                # [自研补丁 2026-09-28] 任务结束(成功/失败/异常)一定释放在途登记
+                try:
+                    return self._execute_crop_compare_job(
+                        task_id, input_path, config, engine, infile_type
+                    )
+                finally:
+                    self._release_inflight(inflight_name, task_id)
+
             return self._start_accepted_job(
                 task_id,
                 task_info,
-                lambda: self._execute_crop_compare_job(
-                    task_id, input_path, config, engine, infile_type
-                ),
+                _guarded_job,
                 '/crop-compare',
             )
         except Exception as e:
+            self._release_inflight(inflight_name, task_id)
             task_manager.complete_task(task_id, 'failed', str(e), error=failure_brief(e, task_id=task_id))
             return self._handle_exception(e, context='/crop-compare', task_id=task_id)
 
@@ -2166,18 +2303,41 @@ class PDFTranslator:
     def compare(self):
         task_id = str(uuid.uuid4())
         start_time = datetime.now()
+        inflight_name = None
         try:
+            # [自研补丁 2026-09-28] 同名在途去重(报告 🔴4 收尾): 必须在
+            # process_request 落盘之前判定。
+            state, dup_id, fname = self._claim_inflight(
+                task_id, _OP_COMPARE, allow_reuse=True, allow_history=False
+            )
+            if state == 'busy':
+                print(f"⚠️ [/compare] 同名文件「{fname}」正被其他操作占用，拒绝并发提交")
+                return jsonify({
+                    'status': 'error',
+                    'errorType': 'OperationInFlight',
+                    'message': f'文件「{fname}」正在被其他操作处理（翻译/裁剪/对照），请稍后再试。',
+                }), 409
+            if state == 'reuse':
+                resp = self._reuse_inflight_job(task_id, dup_id, fname, _OP_COMPARE)
+                if resp is not None:
+                    return resp
+                # 复用任务确已失败: 登记本任务重新处理
+                self._register_inflight_now(fname, task_id, _OP_COMPARE)
+            inflight_name = fname
+
             input_path, config = self.process_request()
             infile_type = self.get_filetype(input_path)
             engine = config.engine
 
             if infile_type == 'compare':
+                self._release_inflight(inflight_name, task_id)
                 return jsonify({
                     'status': 'error',
                     'errorType': 'InvalidPDFOperation',
                     'message': '该 PDF 已经是双语对照结果，无需再次执行 compare。请选择原文或 dual 附件。'
                 }), 409
             if infile_type not in {'origin', 'dual'}:
+                self._release_inflight(inflight_name, task_id)
                 return jsonify({
                     'status': 'error',
                     'errorType': 'InvalidPDFOperation',
@@ -2185,17 +2345,27 @@ class PDFTranslator:
                 }), 400
 
             task_info = self._build_task_info(
-                task_id, input_path, config, engine, start_time, status='开始处理'
+                task_id, input_path, config, engine, start_time, status='开始处理',
+                op=_OP_COMPARE
             )
+
+            def _guarded_job():
+                # [自研补丁 2026-09-28] 任务结束(成功/失败/异常)一定释放在途登记
+                try:
+                    return self._execute_compare_job(
+                        task_id, input_path, config, engine, infile_type
+                    )
+                finally:
+                    self._release_inflight(inflight_name, task_id)
+
             return self._start_accepted_job(
                 task_id,
                 task_info,
-                lambda: self._execute_compare_job(
-                    task_id, input_path, config, engine, infile_type
-                ),
+                _guarded_job,
                 '/compare',
             )
         except Exception as e:
+            self._release_inflight(inflight_name, task_id)
             task_manager.complete_task(task_id, 'failed', str(e), error=failure_brief(e, task_id=task_id))
             return self._handle_exception(e, context='/compare', task_id=task_id)
 
