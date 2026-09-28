@@ -108,26 +108,33 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
     (底片失败即中止出稿是 [v28.70] 的判, 与本条无关, 仍然硬拦 —— 见 _commit / LedgerFailed。)
 
 网页版特有的两条契约:
-  退出: 两条腿 ——
-        ① **主动告别**: 页面关窗前 sendBeacon 打 /api/bye -> 进 15s 宽限期, 期内有新心跳
-           (F5 刷新 / 别的页面还活着)则告别作废, 否则退出。
-        ② **完工关面板**(v36.4): 概念链接区那颗「完工, 关面板」按钮 -> 关掉自己的服务器。
-           **只有人按了才关**(或关窗走 ①)。
+  退出: **没有自动退出** —— 决定权全在人, 不拿"某某时间内"去猜(那只是保险, 不是判据)。
+        入口两个、一个动作: 表头**「退出面板」**(常驻) / 概念链接区**「完工, 关面板」**
+        -> POST /api/bye -> 过 CLOSE_GRACE=3s 关掉自己的服务器(见 close_panel);
+        `--takeover` 也走这条路。
+        **关窗 ≠ 退出**: 关掉/切换浏览器标签只是收起界面, 后端进程照旧活着(它本就独立跑,
+        浏览器只是它开的一个视图)。想退出就按上面两颗按钮, 或在起它的终端里 Ctrl+C;
+        关窗后要回来, 重开书签 **http://127.0.0.1:60642/** 即可(进程还在, 页面连上就是原样)。
+        [v41] **原先的"腿① 关窗即退"已删**: 页面关窗前 sendBeacon 打 /api/bye、进 15s
+        宽限期、期内无心跳就自退。问题是 pagehide 在规范层**分不清**"真关窗"与"F5 刷新 /
+        同标签导航走", 只好拿 15s 时间窗去猜 —— 这正是"用时间替用户决定": 用户在别处翻
+        长文 / 对比翻译质量(沉浸式自主填写时常见), 或同标签走开一下, 都可能被误杀。
+        与"决定权在用户"相悖, 故整条删除(连同 _watchdog 与 BYE_GRACE)。
         [v36.4] **原先的"⑤ 出稿且整篇出齐 -> 3s 自动收摊"(v28.79)已删掉**。
         理由是它与概念链接区**天生冲突**: 加链接必须在成品出来之后(锚要落在成品印出来的
         中文上、"第几处"要在成品里数), 而"整篇出齐"恰恰就是成品刚出来的那一刻 ——
         留着自动收摊, 这条动线在第一步就被掐断, 人得重开面板才能接着做。
         代价说白: 那条腿原是为了"正常动线走完不留常驻进程", 现在**收场交给人** ——
-        要么点②, 要么关窗(走①)。不肯按也不肯关窗时进程会留着, 这是新口径下的已知代价;
-        不拿"估一个时限"去堵, 理由见下。原判据 paper_done 留着 —— 它现在只用来在出稿
-        日志里说"这一篇齐了", 不再驱动任何自动行为。
+        点「退出面板」/「完工, 关面板」两颗按钮之一。不肯退出时进程会留着, 这是新口径下
+        的已知代价; 不拿"估一个时限"去堵, 理由见下。原判据 paper_done 留着 —— 它现在只用
+        来在出稿日志里说"这一篇齐了", 不再驱动任何自动行为。
         [v28.79] **心跳静默 IDLE_LIMIT=1800s 当"窗口已关"的兜底也早已删掉**。
         它本质是个**估**: 估窄了把"切去豆包翻长文"的用户误杀(30s 实测踩过 ——
         用户切回来服务器已经自杀了, 前端还把连接失败谎报成"剪贴板里没有文本"),
         估宽了窗口真死了还要霸着 60642; 而放宽到多少都只是把同一个错误推远。
         那条兜底真正想近似的东西**不是**"你多久没动静了", 而是"活干完了吧"。v28.79 曾用
         "⑤ 出稿且整篇出齐"这个**确定性信号**接过它, v36.4 又按上面的理由退掉 —— 所以现在
-        这条动线上**没有**任何自动退出: 退出只有①关窗与②按按钮两条, 都得人来。
+        这条动线上**没有**任何自动退出: 退出只有"按按钮"一条(见上 [v41]), 得人来。
         连带的 /api/idle 端点、头部倒计时与暂停按钮一并删除。
   改动作废: /api/check 记下当时文本的 sha1, /api/commit 发现文本变了直接拒绝 ——
             "确认"不可能按在过期内容上(服务器端强制, 不只靠前端禁用按钮)。
@@ -1299,6 +1306,7 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
     <span class="muted idle-time" id="buildTxt" title="本面板吃的代码是哪一版的(panel.py / watch_clip.py / reviewer.py 里最新的改动时间)。60642 上若还挂着自家旧实例, 那个窗显示的会是更早的时间 —— 别对着旧窗找新功能。">—</span>
     <button class="btn small" id="healthBtn" type="button" title="把实测踩过的静默陷阱(术语双表漏同步 / config Ital 吞斜体 / 端口新旧实例共存 / 目录不可写)变成红灯 —— 只读检查, 不动任何文件">体检</button>
     <button class="btn small" id="themeBtn" type="button">切到浅色</button>
+    <button class="btn small" id="exitBtn" type="button" title="我完事了: 关掉面板(服务器一起停)。不碰盘上任何文件。关窗只是收起界面, 不停服务 —— 要退出就按这里, 或在起它的终端里 Ctrl+C">退出面板</button>
   </header>
 
   <section class="glass row sendrow">
@@ -1839,6 +1847,16 @@ $('themeBtn').addEventListener('click',function(){
   theme=theme==='dark'?'light':'dark';applyTheme();
   api('/api/theme',{theme:theme});
 });
+$('exitBtn').addEventListener('click',function(){
+  /* 退出必须是人按的 —— 没有时间窗自动退出(理由见模块头"退出"契约)。关窗只是收起界面,
+     进程不随之退出; 要退出只能按这里(或 Ctrl+C)。与概念链接区那颗共用同一个端点。 */
+  var b=this;b.disabled=true;b.textContent='面板即将关停…';
+  api('/api/bye',{}).then(function(r){
+    if(r&&r.net){b.disabled=false;b.textContent='退出面板';
+      setBanner('idle','连不上本机服务器 —— 面板可能已经退了, 关掉这扇窗即可。');return}
+    setBanner('idle',(r&&r.out)||'面板即将关停。');
+  });
+});
 function applyTheme(){
   document.documentElement.setAttribute('data-theme',theme);
   $('themeBtn').textContent=theme==='dark'?'切到浅色':'切到深色';
@@ -1945,7 +1963,6 @@ document.addEventListener('visibilitychange',function(){
   // 从豆包切回来立即心跳唤醒, 不等被浏览器节流的 setInterval
   if(!document.hidden)ping();
 });
-window.addEventListener('pagehide',function(){navigator.sendBeacon('/api/bye')});
 /* ---- 概念链接: 把"成品里选中的那段字 -> 你自己的网址"装进成品 ----
    动线为什么长这样: 锚文本必须**是成品页面上真正印出来的那段中文**。手打一个中文概念词,
    差一个字就是一条死链, 而"差一个字"光看屏幕看不出来 —— 所以先「载入对照」, 点右边
@@ -2438,9 +2455,9 @@ $('ulOpenBtn').addEventListener('click',function(){
   });
 });
 $('ulCloseBtn').addEventListener('click',function(){
-  /* 关面板必须是人按的: 出稿不再自动收摊(理由见模块头"退出"契约 —— 加链接在出稿之后,
-     自动收摊会把它掐断)。所以退出的入口就摆在这一区, 不藏。 */
-  api('/api/ulclose',{}).then(function(r){
+  /* 关面板必须是人按的: 没有时间窗自动退出(理由见模块头"退出"契约)。这里与表头那颗
+     「退出面板」共用同一个端点 —— 两个入口、一个动作。 */
+  api('/api/bye',{}).then(function(r){
     ulMsg('✓ '+(r.out||'面板即将关停。'),'ulok');
   });
 });
@@ -2563,11 +2580,10 @@ api('/api/state').then(function(s){
 
 # ---------------------------------------------------------------------- 本机服务器(零依赖 stdlib)
 
-BYE_GRACE = 15       # 收到告别后的宽限秒数(退出腿①, 见模块头"退出"契约)
-CLOSE_GRACE = 3      # 点「完工, 关面板」后的宽限秒数(退出腿②): 留几秒让那句回话先回到页面上
-STATE = {"checked": None, "sha": None, "ping": None, "bye_at": None}
+CLOSE_GRACE = 3      # 点「退出面板 / 完工, 关面板」后的宽限秒数: 留几秒让那句回话先回到页面上
+STATE = {"checked": None, "sha": None}
 LOCK = threading.Lock()
-SRV = {"h": None}    # main() 起的那个服务器; 退出腿② 要它才关得掉(见 close_panel)
+SRV = {"h": None}    # main() 起的那个服务器; 退出要它才关得掉(见 close_panel)
 
 
 def build_stamp():
@@ -2649,7 +2665,7 @@ def _sha(text):
 
 # ---------------- 会话台账(L1, v40): ③ 通过的那份会话落到工作目录 ----------------
 # 解决什么: 超长论文上 ③ 一次要跑很久, 用户拿去人工比对译文也很久 —— 这期间面板进程若退了
-# (关窗告别 / Ctrl+C / 息屏被杀), 服务端内存 STATE 与浏览器 DOM **两层记忆都易失**, 回来就得
+# (Ctrl+C / 息屏被杀 / 崩溃), 服务端内存 STATE 与浏览器 DOM **两层记忆都易失**, 回来就得
 # 重贴整篇、重跑 ③。这里把"③ 这一次的会话"(原始回包 + /api/check 载荷 + 单元表)落一份到
 # **工作目录**(数据侧, 不进仓库), 面板重启时给一个[恢复]入口(见 /api/resume)。
 # 纪律(对齐 ledger): 读写异常一律吞掉 —— 会话只是便利, 绝不能带崩 ③ / ⑤;
@@ -2758,8 +2774,6 @@ class H(BaseHTTPRequestHandler):
                         "ready": payload_ready(),  # 页面一开就能看见最近那份载荷就绪标记
                         "session": _session_info()})  # L2: 工作目录里若还留着③通过的会话, 给[恢复]入口
         elif path == "/api/ping":
-            with LOCK:
-                STATE["ping"] = time.time()
             # 心跳顺带把"载荷就绪"捎回去: 前端每 5s 已经在打这个接口, 不必另开一条轮询
             # (服务端响铃时若本面板已在跑, 提到台前那一步只能靠页面自己 —— 见 renderReady)
             self._json({"ok": True, "ready": payload_ready()})
@@ -2783,9 +2797,11 @@ class H(BaseHTTPRequestHandler):
         elif path == "/api/build":
             self._build()
         elif path == "/api/bye":
-            with LOCK:                       # 页面关窗前告别(sendBeacon) -> 进宽限期,
-                STATE["bye_at"] = time.time()  # 不是立即退(F5 刷新/别的页面关闭也会发)
-            self._json({"ok": True})
+            # 显式退出: 表头「退出面板」/ 概念链接区「完工, 关面板」/ --takeover 都走这里。
+            # 不再有"页面关窗前 sendBeacon -> 宽限期"那条腿 —— 退出的决定权在人, 不靠时间窗
+            # (关窗只是收起界面, 不停服务; 理由见模块头"退出"契约)。
+            close_panel()
+            self._json({"ok": True, "out": "面板即将关停(这扇窗可以关了)。"})
         elif path == "/api/check":
             self._check(b)
         elif path == "/api/resume":
@@ -2832,8 +2848,6 @@ class H(BaseHTTPRequestHandler):
             self._ul_apply(b)
         elif path == "/api/ulopen":
             self._ul_open(b)
-        elif path == "/api/ulclose":
-            self._ul_close()
         else:
             self._json({"error": "not found"}, 404)
 
@@ -3179,15 +3193,6 @@ class H(BaseHTTPRequestHandler):
             return
         self._json({"ok": True, "dir": d})
 
-    def _ul_close(self):
-        """退出腿②: 人点了「完工, 关面板」。
-
-        这里**只关面板**, 不碰盘上任何文件 —— 与 close_panel 的纪律一致(只关自己那个
-        服务器对象, 不发信号、不杀进程)。
-        """
-        close_panel()
-        self._json({"ok": True, "out": "面板即将关停(这扇窗可以关了)。"})
-
     def _build(self):
         """重新装配: 在**工作目录**里子进程跑 mk_job.py(它模块层无条件 main()),
         更新 job_doubao.txt / job_manifest.json / job_audit.txt。装错/失败不落盘由
@@ -3448,19 +3453,15 @@ def open_app(url):
 
 
 def close_panel(delay=CLOSE_GRACE):
-    """退出腿②: 人点了「完工, 关面板」-> 过 delay 秒把面板关掉。
+    """显式退出: 人点了表头「退出面板」或概念链接区「完工, 关面板」-> 过 delay 秒关掉面板。
+    --takeover 也走这条路(见 _ask_old_panel_to_quit)。
 
     [v36.4] 由 stop_after_done 改名而来, **触发者变了**: 原先是"⑤ 出稿且整篇出齐"这个
     自动信号, 现在是人的一次点击(理由见模块头"退出"契约 —— 那个条件与概念链接区天生冲突:
-    链接必须在出稿之后做, 而它恰在出稿那一刻触发)。"怎么关"这段机制一个字没改,
-    所以原有三条理由仍然成立:
+    链接必须在出稿之后做, 而它恰在出稿那一刻触发)。"怎么关"这段机制一个字没改。
 
     为什么要 delay: 响应还在路上 —— 立刻 shutdown 会让浏览器收到连接中断, 用户看不到
     "面板即将关停"那一句。
-
-    为什么另起一条腿、不并进 _watchdog: 看门狗 5 秒一跳, 并进去最坏要等 5 秒以上才关,
-    而"点了按钮盯着屏幕等窗口消失"很怪; 而且 ① 段的退出契约测试是靠"看门狗空转"跑的,
-    动它的节拍会把那条用例一起改坏。
 
     只关**自己**那个服务器对象, 不发信号、不杀进程 —— 与 --takeover 同一条纪律:
     这个进程里可能还有一份没出稿的回包, 只有它自己知道什么时候能退。
@@ -3471,42 +3472,6 @@ def close_panel(delay=CLOSE_GRACE):
         if h is not None:
             h.shutdown()
     threading.Thread(target=_go, daemon=True).start()
-
-
-def _watchdog(srv):
-    """退出腿①(主动告别)的看门狗。另一条腿(② 完工关面板)在 close_panel, **不在这里** ——
-    那一条是人点按钮这个确定事件触发的, 塞进这个 5 秒节拍只会变钝(理由见 close_panel)。
-
-    主动 —— 页面关窗前 sendBeacon 打 /api/bye, 进 BYE_GRACE 秒宽限期。宽限内若收到
-            新心跳(F5 刷新后新页面起来 / 还有别的页面活着), 告别作废; 否则退出。
-            不能收到告别就立即退: F5 刷新会发 pagehide, 别的标签页(比如验收用的
-            自动化浏览器)关闭也会发 —— 立即退会把还活着的窗口晾成死页面
-            (2026-09-21 实测踩过)。
-
-    [v28.79] 这里原先还有一条"收过心跳后 IDLE_LIMIT(1800s) 没再收到 = 窗口已关"的兜底,
-    已按用户要求删掉 —— 理由是它本质是个**估**: 估窄了误杀"切去豆包翻长文"的用户
-    (30s 版实测踩过), 估宽了窗口真死了还得霸着 60642, 而用户说"30 分钟远远不够", 放宽到
-    多少都只是把同一个错误推远。同理删掉了配套的 /api/idle 暂停入口与头部倒计时:
-    一条要被用户手动压住的自动行为, 不如不要。
-
-    那条兜底真正想近似的东西(不是"你多久没动静了", 而是"活干完了吧"): v28.79 用"⑤ 出稿且
-    整篇出齐"这个**确定性信号**回答过, v36.4 又按模块头的理由退掉了 —— 因为它与概念链接区
-    天生冲突(链接必须在出稿之后才做)。所以现在**没有**自动退出, 收场是人二选一:
-    点「完工, 关面板」或关窗。剩下能兜的只有"浏览器崩了、回包还没提交过"这种半路夭折 ——
-    处理办法不是再加回一条估算, 而是**让下次启动看得见**: main() 在 60642 被自家旧实例
-    占住时会点出 PID 与构建时间, 并给出 --takeover(见模块头)。"""
-
-    while True:
-        time.sleep(5)
-        with LOCK:
-            p, bye_at = STATE["ping"], STATE["bye_at"]
-        if bye_at is not None:
-            if p is not None and p > bye_at:
-                with LOCK:                   # 告别后仍有心跳 -> 有活页面, 告别作废
-                    STATE["bye_at"] = None
-            elif time.time() - bye_at > BYE_GRACE:   # 宽限期内毫无心跳 -> 真关窗了
-                srv.shutdown()
-                return
 
 
 # ---------------------------------------------------------------------- 入口
@@ -3562,11 +3527,11 @@ def _old_panel_pids():
 
 
 def _ask_old_panel_to_quit(timeout=20.0):
-    """请 60642 上的自家旧实例走 —— 走它自己的告别腿: POST /api/bye, 它 15s 宽限后自退。
+    """请 60642 上的自家旧实例走 —— POST 它的 /api/bye(显式退出端点), 它关掉自己后自退。
     轮询到端口真的空出来为止; 返回 "" 表示已腾空, 否则返回失败原因。
 
     为什么是"请它走"而不是 taskkill: 那扇旧窗里可能正压着一份**还没出稿的回包**(内容
-    只在浏览器 DOM 里), 从上往下杀会把它一起丢掉; 而告别本来就是它设计好的退场方式,
+    只在浏览器 DOM 里), 从上往下杀会把它一起丢掉; 而显式退出本来就是它设计好的退场方式,
     顺带也不会多造一条"杀进程"的路径。
     """
     import urllib.request
@@ -3575,7 +3540,7 @@ def _ask_old_panel_to_quit(timeout=20.0):
                                      headers={"Content-Type": "application/json"})
         urllib.request.urlopen(req, timeout=3).read()
     except Exception as e:                       # noqa: BLE001
-        return "告别没送到旧实例上(%r)" % e
+        return "退出请求没送到旧实例上(%r)" % e
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(1)
@@ -3602,13 +3567,13 @@ def main():
         print("⚠️ 60642 上已经有本面板的实例(PID %s, 构建 %s)。"
               % (pids, old.get("build") or "未知"))
         if takeover:
-            print("   --takeover: 先请它走(走它自己的告别腿)…")
+            print("   --takeover: 先请它走(打它的 /api/bye)…")
             why = _ask_old_panel_to_quit()
             print(("   ✗ %s —— 旧窗里可能还压着没出稿的回包, 本实例这次落随机端口。"
                    % why) if why else "   ✓ 旧实例已退, 60642 腾空。")
         else:
             print("   它吃的就是那一版代码; 那扇窗里若还压着没出稿的回包, 先在它上面出稿。")
-            print("   要换成本实例(含最新改动): 关掉旧窗后重跑本命令, 或加 --takeover。")
+            print("   要换成本实例(含最新改动): 先在它上面点「退出面板」再重跑本命令, 或加 --takeover。")
             print("   本实例这次会落在随机端口 —— 表头的「构建」时间对得上就是新的。")
     sock = socket.socket()
     try:
@@ -3621,10 +3586,9 @@ def main():
     srv = ThreadingHTTPServer(("127.0.0.1", port), H)
     url = "http://127.0.0.1:%d/" % port
     announce_port(announce, port)   # 先回话再看门: 服务端在等着这个端口号(见 announce_port)
-    SRV["h"] = srv                  # 退出腿② 要它才关得掉本进程的服务器(见 close_panel)
-    threading.Thread(target=_watchdog, args=(srv,), daemon=True).start()
+    SRV["h"] = srv                  # 退出要它才关得掉本进程的服务器(见 close_panel)
     print("翻译中继面板 v3  %s   (构建 %s)" % (url, build_stamp()))
-    print("关窗即退出; 也可以点概念链接区的「完工, 关面板」。也可 Ctrl+C。")
+    print("关窗只是收起界面, 不停服务; 退出点表头「退出面板」, 或在本终端 Ctrl+C。")
     if not os.environ.get("P2Z_PANEL_NO_OPEN"):  # 冒烟测试时关掉自动开窗
         open_app(url)
     try:

@@ -10,24 +10,32 @@ v28.60 给面板加过一条"心跳静默 IDLE_LIMIT(1800s) = 窗口已关"的�
 **⑤ 出稿成功且这一篇该做的都出齐了 → 面板自己收摊**(退出腿②)。
 
 [v36.4] 那条自动腿**已删**: 它恰好在"成品刚出来的那一刻"开火, 而概念链接**必须先有
-成品才能做** —— 等于把动线掐在第一步。现在**退出腿② 由人点「完工, 关面板」触发**
-(触发器从"⑤ 这个条件"换成"一次点击", 关的那套机器没变)。于是"整篇齐了"只剩一个用途:
-在出稿日志与响应里说一句"这一篇齐了", 不驱动任何自动行为。
+成品才能做** —— 等于把动线掐在第一步。现在**退出由人点按钮触发**。于是"整篇齐了"只剩一个
+用途: 在出稿日志与响应里说一句"这一篇齐了", 不驱动任何自动行为。
+
+[v41] **"关窗即退"也删了**。原先那条腿: 页面 pagehide 时 sendBeacon 打 /api/bye -> 服务器
+记 bye_at -> 看门狗在 BYE_GRACE(15s) 内收不到心跳就自灭。问题是 pagehide 在规范层**分不清**
+"真关窗"与"F5 刷新 / 同标签导航走", 只好拿时间窗去猜 —— 那就是"用时间替用户决定", 与这个
+产品"沉浸式自主填写、决定权在人"相悖。删后: **没有任何自动退出**, 退只由人点表头「退出面板」
+或概念链接区「完工, 关面板」(一个动作、一个端点 /api/bye); 关窗只是收起界面, 进程照旧活着,
+重开书签 127.0.0.1:60642 即可。
 
 本套件逐条锁死现在的契约:
-  ① 看门狗: 只剩告别腿 —— 心跳静默多久都不自灭(这条是"删掉兜底"的**行为**证据);
+  ① 退出: **没有任何自动退出腿**(v41) —— 关窗即退(告别腿)与心跳静默兜底都没了;
+     行为层已无对象可测, 故本段只做**静态守卫**(模块属性 + 页面源码形态), 谁塞回来就报红;
   ② 载荷就绪标记: payload_ready() 认 inbox 里最新那份 .ready.json, 坏文件不抛;
   ③ 构建戳: build_stamp() 取三份关键文件里最新的 mtime(表头那行"构建 09-23 20:15"),
      用来一眼认出"60642 上那扇窗跑的是旧进程";
   ④ HTTP 契约 + 页面接线: /api/state 给 build/ready 且**不再有 idle**, /api/idle 下线,
-     页面有构建时间位、载荷就绪时自己 window.focus(); 面板把**实际端口**写进回话文件
-     (--announce, v28.79+) —— 服务端是分离进程拉起它的, 全靠这个文件才知道它起没起、
-     落在哪个端口(sandbox 的对应一半在 test_pause_adopt.py 的 D 段);
-  ⑤ 60642 旧实例: 只识别、**绝不代杀** —— 本套件只做静态守卫, 不真发告别
+     页面有构建时间位、载荷就绪时自己 window.focus()、且送出去的页面里再无关窗告别;
+     面板把**实际端口**写进回话文件(--announce, v28.79+) —— 服务端是分离进程拉起它的,
+     全靠这个文件才知道它起没起、落在哪个端口(sandbox 的对应一半在 test_pause_adopt.py 的 D 段);
+  ⑤ 60642 旧实例: 只识别、**绝不代杀** —— 本套件只做静态守卫, 不真发退出
      (用户的活面板可能就挂在 60642 上, 真发一次就把它关了);
-  ⑥ 退出腿②(关面板): [v36.4] **没有任何自动收摊** —— 整篇齐了也不退, 退只由人点
-     「完工, 关面板」触发; paper_done 的判据照旧, 但只剩"说一句齐了"这个用途
-     (done 字段照发); close_panel 关的是自己那个服务器对象, 不是杀进程。
+  ⑥ 退出(关面板): [v36.4] **没有任何自动收摊** —— 整篇齐了也不退, 退只由人点按钮触发;
+     paper_done 的判据照旧, 但只剩"说一句齐了"这个用途(done 字段照发); close_panel 关的是
+     自己那个服务器对象, 不是杀进程; [v41] 两颗按钮(表头「退出面板」/概念链接区「完工,
+     关面板」)都打同一个端点 /api/bye。
 
 运行: venv python test_panel_idle.py, 退出码 0=全过
 """
@@ -37,9 +45,7 @@ import re
 import subprocess
 import sys
 import tempfile
-import threading
 import time
-import types
 import urllib.error
 import urllib.request
 
@@ -61,40 +67,6 @@ for k, v in (("P2Z_PROJ", _TMP), ("P2Z_TABLE_DIR", _TMP), ("P2Z_INBOX", INBOX),
     os.environ[k] = v
 
 import panel as PN      # noqa: E402
-
-
-class FakeSrv:
-    """替身服务器: 只关心"有没有被叫去 shutdown"。"""
-
-    def __init__(self):
-        self.calls = 0
-
-    def shutdown(self):
-        self.calls += 1
-
-
-def probe(ping_age=None, bye_age=None, window=1.0):
-    """跑一次 _watchdog, 返回它是否自灭了。
-
-    真实节拍是 5s 一睡, 一条用例就要干等 5 秒 —— 把 panel 里的 time 换成"不睡的替身",
-    于是循环瞬间空转, 用 1 秒真实窗口收结论(把"等得久"换成"判得准")。
-    """
-    real_time = PN.time
-    srv = FakeSrv()
-    with PN.LOCK:
-        PN.STATE["ping"] = None if ping_age is None else time.time() - ping_age
-        PN.STATE["bye_at"] = None if bye_age is None else time.time() - bye_age
-    PN.time = types.SimpleNamespace(time=time.time, strftime=time.strftime,
-                                    sleep=lambda *_: None)
-    try:
-        t = threading.Thread(target=PN._watchdog, args=(srv,), daemon=True)
-        t.start()
-        t.join(window)                      # 空转窗口: 有结论就该在这一秒内出
-    finally:
-        PN.time = real_time
-        with PN.LOCK:
-            PN.STATE.update({"ping": None, "bye_at": None})
-    return srv.calls
 
 
 class swap:
@@ -217,18 +189,24 @@ def main():
             failed += 1
             print(f"  FAIL {name} {detail}")
 
-    # ---- ① 看门狗: 只剩告别一条腿 ----
-    with PN.LOCK:
-        PN.STATE.update({"ping": None, "bye_at": None})
-    n = probe(ping_age=10)
-    check("① 心跳静默 10s -> 不自灭(倒计时兜底已删)", n == 0, f"shutdown {n} 次")
-    n = probe(ping_age=1800 + 600)          # 远超过旧的 IDLE_LIMIT
-    check("① 心跳静默 40min -> 仍不自灭", n == 0, f"shutdown {n} 次")
-    n = probe(ping_age=None, bye_age=PN.BYE_GRACE + 5)
-    check("① 从没心跳 + 已告别过宽限期 -> 自灭", n >= 1, f"shutdown {n} 次")
-    n = probe(ping_age=0, bye_age=PN.BYE_GRACE + 5)
-    check("① 告别后仍有心跳 -> 告别作废(不误杀 F5 刷新)", n == 0, f"shutdown {n} 次")
-    check("① 倒计时那套已经从模块里消失",
+    # ---- ① 退出: **没有自动退出这条腿**(v41) ----
+    # [v41] 原先的"腿① 关窗即退"整条删掉: 页面关窗前 sendBeacon 打 /api/bye -> 服务器记
+    # bye_at -> 看门狗 BYE_GRACE(15s) 内收不到心跳就自灭。删它的理由是 pagehide 在规范层
+    # **分不清**"真关窗"与"F5 刷新 / 同标签导航走", 只好拿时间窗去猜 —— 那就是"用时间替用户
+    # 决定", 与这个产品"沉浸式自主填写、决定权在人"相悖。
+    # 行为层已无对象可测(线程/常量都没了), 故本段改做**静态守卫**: 属性层 + 源码层两路取证,
+    # 谁把自动退出塞回来(改个名也算 —— 只要 STATE 里再冒出心跳/告别时间戳)这里就报红。
+    src0 = open(os.path.join(TABLE_PIPE, "panel.py"), encoding="utf-8").read()
+    check("① 看门狗线程已从模块里消失(_watchdog)", not hasattr(PN, "_watchdog"))
+    check("① 告别宽限期常量已从模块里消失(BYE_GRACE)", not hasattr(PN, "BYE_GRACE"))
+    check("① 心跳/告别时间戳不再进 STATE(无从判'多久没动静')",
+          "ping" not in PN.STATE and "bye_at" not in PN.STATE, sorted(PN.STATE.keys()))
+    check("① 页面源码里再无 pagehide 告别 beacon(只认代码形态, 不被文档里那句解释误伤)",
+          "'pagehide'" not in src0 and '"pagehide"' not in src0
+          and "sendBeacon(" not in src0)
+    check("① 旧的 /api/ulclose 路由已并进 /api/bye(退出只剩一个动作)",
+          "/api/ulclose" not in src0)
+    check("① 倒计时那套也从模块里消失",
           not hasattr(PN, "IDLE_LIMIT") and not hasattr(PN, "idle_state")
           and not hasattr(PN, "set_idle_off") and "idle_off" not in PN.STATE,
           [k for k in ("IDLE_LIMIT", "idle_state", "set_idle_off") if hasattr(PN, k)])
@@ -289,6 +267,8 @@ def main():
               'id="idleTxt"' not in pg and 'id="idleBtn"' not in pg)
         check("④ 载荷就绪时页面自己 focus + 落横幅",
               "/api/bye" in pg and "renderReady" in pg and "window.focus()" in pg)
+        check("④ 送到浏览器的页面里没有任何关窗告别(v41: 关窗 ≠ 退出)",
+              "pagehide" not in pg and "sendBeacon" not in pg)
         pi = http_json(base + "api/ping")
         check("④ 心跳顺带捎回载荷就绪(不另开轮询)",
               pi.get("ok") and (pi.get("ready") or {}).get("name") == "payload_live", pi)
@@ -313,7 +293,7 @@ def main():
     # 所以认的是带引号的命令字面量。
     for bad in ('"taskkill', "'taskkill", '"TerminateProcess', '"os.kill'):
         check("⑤ 源码里没有 %s(不代杀旧实例)" % bad.lstrip("\"'"), bad not in src)
-    check("⑤ --takeover 走的是旧实例自己的告别腿",
+    check("⑤ --takeover 走的是旧实例自己的显式退出端点(打它的 /api/bye)",
           "--takeover" in src and "_ask_old_panel_to_quit" in src
           and "/api/bye" in src)
     check("⑤ 起不来时明说落在随机端口, 不假装占了 60642",
@@ -418,8 +398,9 @@ def main():
     check("⑥ 不是立刻关: 留几秒把那句回话送回到页面上", n_now == 0, n_now)
     check("⑥ 页面收到 done -> 只说清楚, **不再**自作主张关窗",
           "r.done" in pg and "window.close()" not in pg)
-    check("⑥ 页面有关面板这颗按钮(退出入口交到人手上)",
-          "ulCloseBtn" in pg and "/api/ulclose" in pg)
+    check("⑥ 页面两颗退出按钮都在, 且都打同一个端点(退出入口全在人手上)",
+          'id="exitBtn"' in pg and "ulCloseBtn" in pg
+          and "/api/bye" in pg and "/api/ulclose" not in pg)
     check("⑥ main() 把服务器对象交给关面板腿(不交就关不掉自己)",
           'SRV["h"] = srv' in src)
 
