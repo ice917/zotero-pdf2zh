@@ -574,7 +574,10 @@ def _ratio(orig, zh):
 
 
 def sandbox_gates(job, ids, got):
-    """在**临时目录**里跑**同一份**门禁代码 -> (ok, 输出行)。
+    """在**临时目录**里跑**同一份**门禁代码 -> (verdict, 输出行, 返工单)。
+
+    verdict 是三值("PASS"/"FAIL"/"UNVERIFIED"), 由门禁退出码按契约(dnt.json)翻译 ——
+    面板不自己把 rc 压成 bool, 否则 UNVERIFIED(证据不足)会被当成 FAIL 一并吞掉。
 
     检查阶段不落任何文件: manifest 与回包都拷进 tmp, 子进程的 P2Z_TABLE_DIR 指向 tmp,
     于是它回填的 zh TSV / check_report.txt / notes_zh.json 全落在 tmp 里, 随后整目录删掉。
@@ -602,16 +605,17 @@ def sandbox_gates(job, ids, got):
         p = subprocess.run(job["cmd"](), cwd=tmp, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env)
         out = (p.stdout or "").splitlines()
+        verdict = wc.verdict_of_rc(p.returncode)
         # [v28.79] 正文若走 adopt 回路, ③ 这里只跑得到第一道门(seg_import); 出稿那一步
         # 还有第二道门(deliver/import: ⋮ 断点 / 只译半截 / 逐段不变量)。不点一句, 用户
         # 会以为"③ 过了"就是全过。
-        if p.returncode == 0 and wc.argv_list(job.get("gate_after")):
+        if verdict == "PASS" and wc.argv_list(job.get("gate_after")):
             out.append("  · 注: ③ 只跑第一道门; ⑤ 确认出稿时还会另过 adopt 的"
                        " deliver/import(⋮ 断点对账 / 只译半截 / 逐段不变量)。")
         note = ""
-        if p.returncode != 0:
+        if verdict != "PASS":
             out, note = _persist_rework(tmp, out)
-        return p.returncode == 0, out, note
+        return verdict, out, note
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -627,15 +631,31 @@ _TOOL_FAIL_MARK = ("未接线", "找不到载荷原文", "读不到", "Traceback
                    "manifest", "sidecar", "无法校验")
 
 
-def blame_of(gate_out, ok):
-    """失败归谁: "翻译方" / "工具" / ""(没失败)。
+def _as_verdict(v):
+    """把三值 verdict 与历史 bool 统一成 verdict 字符串。
+
+    sandbox_gates 现返回 "PASS"/"FAIL"/"UNVERIFIED"; 旧调用方(测试注入)传 True/False ——
+    True->PASS, False->FAIL。字符串原样透传, 便于新旧调用方共存。
+    """
+    if isinstance(v, str):
+        return v
+    return "PASS" if v else "FAIL"
+
+
+# 三值 verdict 的中文短标签: 台账/日志/卡片共用一处, 免得各处各写一遍、漏掉 UNVERIFIED。
+_VERDICT_ZH = {"PASS": "过", "FAIL": "未过", "UNVERIFIED": "未定"}
+
+
+def blame_of(gate_out, verdict):
+    """失败归谁: "翻译方" / "工具" / ""(没失败或未确认)。
 
     判据顺序要紧: 先看有没有**译者侧的 FAIL 行**(译者侧 = 带 FAIL 前缀、且行内不含
     工具标记), 有就是翻译方的; 再看工具标记。反过来先扫全局工具标记会误判 ——
     正常的 PASS 路径日志里也常出现 "读 manifest 完成" 这种行, 一旦和 FAIL 行同时
     出现, 全局扫描会把翻译方的错报成工具故障(实测这条误判过), 用户就被误导去查环境。
+    UNVERIFIED 不归任何一方: 证据不足时点名"翻译方/工具"都是臆测, 应留空交人工判。
     """
-    if ok:
+    if _as_verdict(verdict) != "FAIL":
         return ""
     lines = [ln.strip() for ln in (gate_out or [])]
     for ln in lines:
@@ -690,8 +710,9 @@ def _persist_rework(tmp, lines):
 def analyse(text):
     """纯逻辑, 不碰 Tk(便于 --selftest): 识别任务 -> 沙箱跑门禁 -> 算待看清单。
 
-    返回 {"error": ...} 或 {"ok", "job", "ids", "got", "rows", "median", "items",
+    返回 {"error": ...} 或 {"ok", "verdict", "job", "ids", "got", "rows", "median", "items",
                           "n_dup", "n_incons", "last_ratio", "gate_out", "last"}
+    verdict 是三值("PASS"/"FAIL"/"UNVERIFIED"); ok = (verdict == "PASS") 保留给旧调用方。
     items 每项 = (级别, 类型, 说明, 单元号串)；**只放源串自锚的判据**(见 docstring [v30.5])——
     长度比一类**读数**一律不进 items, 只作 rows / median / last_ratio 显示给人看。
     rows 按 manifest 顺序(文档序), 不按读数排序。
@@ -717,7 +738,9 @@ def analyse(text):
 
     job, ids, got = hit
     orig = {u["id"]: u["orig"] for u in wc.manifest_units(job)}
-    ok, out, note = sandbox_gates(job, ids, got)
+    v, out, note = sandbox_gates(job, ids, got)      # 只跑一次(门禁有副作用/开销)
+    verdict = _as_verdict(v)
+    ok = (verdict == "PASS")
 
     rows = [(_ratio(orig[i], got[i]), i, orig[i], got[i]) for i in ids]   # 文档序, 不排序
     med = statistics.median(r[0] for r in rows) if rows else 0.0
@@ -744,10 +767,11 @@ def analyse(text):
                       % (k[:60], len(gids), len(zh), "  /  ".join(zh)), " ".join(gids)))
 
     items.sort(key=lambda x: 0 if x[0] == "高" else 1)     # 稳定排序: 高在前, 组内保原序
-    return {"ok": ok, "job": job, "ids": ids, "got": got, "rows": rows, "median": med,
+    return {"ok": ok, "verdict": verdict, "job": job, "ids": ids, "got": got,
+            "rows": rows, "median": med,
             "items": items, "n_dup": len(dup), "n_incons": len(incons),
             "last_ratio": last_r, "gate_out": out, "rework": note,
-            "blame": blame_of(out, ok),
+            "blame": blame_of(out, verdict),
             "last": (last_id, orig[last_id], got[last_id])}
 
 
@@ -1720,10 +1744,13 @@ $('seg').addEventListener('click',function(e){
   var b=e.target.closest('button');if(b)showTab(b.getAttribute('data-tab'));
 });
 function render(r){
-  setBanner(r.ok?'ok':'err',
-    (r.ok?'✓ ':'✗ ')+r.job+' '+r.n+'/'+r.n+' · 门禁'+(r.ok?'全过':'未过')
+  var VZ={PASS:{ic:'✓',w:'全过'},FAIL:{ic:'✗',w:'未过'},UNVERIFIED:{ic:'?',w:'未定(证据不足)'}};
+  var vz=VZ[r.verdict]||VZ.FAIL;
+  var bk=r.ok?'ok':(r.verdict==='UNVERIFIED'?'warn':'err');
+  setBanner(bk,
+    vz.ic+' '+r.job+' '+r.n+'/'+r.n+' · 门禁'+vz.w
     +' · 重复原文 '+r.n_dup+' 组/不一致 '+r.n_incons+' · '+r.items.length+' 条待你核');
-  log((r.ok?'✓ ':'✗ ')+'「'+r.job+'」回包 '+r.n+' 单元; 门禁'+(r.ok?'全过':'未过')
+  log(vz.ic+' 「'+r.job+'」回包 '+r.n+' 单元; 门禁'+vz.w
       +' · 翻译方 '+vendor+' (已记台账)');
   showRework(r);
   (r.gate_out||[]).forEach(function(l){log('   '+l)});
@@ -1764,6 +1791,8 @@ function render(r){
     commitBtn.disabled=false;
     commitBtn.textContent='⑤ 确认写入并出稿'+(r.items.length?'（还有 '+r.items.length+' 条待看）':'');
     showTab('look');
+  }else if(r.verdict==='UNVERIFIED'){
+    log('   门禁未定(证据不足), 未写入 —— 需人工确认后再继续。');
   }else{
     log('   门禁未过, 不写入。修正后重新粘贴再检查。');
   }
@@ -3113,14 +3142,14 @@ class H(BaseHTTPRequestHandler):
             self._json({"error": r["error"], "diag": r.get("diag", [])})
             return
         ledger("检查", r["job"]["label"], len(r["ids"]), len(r["items"]),
-               "过" if r["ok"] else "未过", r.get("blame", ""))
+               _VERDICT_ZH.get(r["verdict"], "未过"), r.get("blame", ""))
         lid, lo, lz = r["last"]
         if r["ok"]:
             with LOCK:                        # 记住"这次检查"的内容指纹, commit 时必须对得上
                 STATE["checked"] = (r["job"], r["ids"], r["got"])
                 STATE["sha"] = _sha(text)
         self._json({
-            "ok": r["ok"], "job": r["job"]["label"], "n": len(r["ids"]),
+            "ok": r["ok"], "verdict": r["verdict"], "job": r["job"]["label"], "n": len(r["ids"]),
             "vendor": _load_vendor(),
             "median": round(r["median"], 3), "n_dup": r["n_dup"], "n_incons": r["n_incons"],
             "last": {"id": lid, "orig": lo, "zh": lz}, "gate_out": r["gate_out"],
@@ -3343,9 +3372,11 @@ def selftest(path):
         for d in r.get("diag", []):
             print("   " + d)
         return 1
+    icon = {"PASS": "✓", "FAIL": "✗", "UNVERIFIED": "?"}.get(r["verdict"], "✗")
+    word = {"PASS": "全过", "FAIL": "未过", "UNVERIFIED": "未定(证据不足)"}.get(r["verdict"], "未过")
     print("%s %s %d/%d · 门禁%s · 重复原文 %d 组/不一致 %d · %d 条待你核"
-          % ("✓" if r["ok"] else "✗", r["job"]["label"], len(r["ids"]), len(r["ids"]),
-             "全过" if r["ok"] else "未过", r["n_dup"], r["n_incons"], len(r["items"])))
+          % (icon, r["job"]["label"], len(r["ids"]), len(r["ids"]),
+             word, r["n_dup"], r["n_incons"], len(r["items"])))
     lid, lo, lz = r["last"]
     print("末条 %s: %r -> %r  (长度比 %.2f, 中位 %.2f)" % (lid, lo, lz, r["last_ratio"], r["median"]))
     for lv, kind, msg, uids in r["items"]:
@@ -3354,7 +3385,7 @@ def selftest(path):
         print("  (待看清单为空)")
     for ln in r["gate_out"]:
         print("   " + ln)
-    return 0 if r["ok"] else 1
+    return wc.exit_code_of_verdict(r["verdict"])     # PASS=0 / FAIL=1 / UNVERIFIED=3(契约)
 
 
 PANEL_PORT = 60642     # 固定端口: 用户/自检都记这个地址

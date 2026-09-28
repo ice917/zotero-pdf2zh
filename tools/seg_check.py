@@ -137,6 +137,7 @@ logging.getLogger("pypdf").setLevel(logging.ERROR)
 
 import engine as _ENG                       # noqa: E402  引擎接缝（1.x 侧车 / next 段表）
 import post_check as _PC                    # noqa: E402  CJK 判据 / 文献页判据 / review 目录
+import dnt_contract as _DNT                 # noqa: E402  退出码真源(契约): PASS=0/FAIL=1/UNVERIFIED=3
 
 try:
     import pymupdf as _FITZ                 # 接缝切点的几何核验；缺了退化成文本口径
@@ -1037,7 +1038,9 @@ def main():
                          ref_pages, args.skip_last, lag, seams, layout), title))
     print("🟢 门禁判定: PASS" if verdict == "PASS"
           else "🔴 门禁判定: FAIL（存在未译段）")
-    return 0 if verdict == "PASS" else 1
+    # [本质修 2026-09-28] 退出码不再在此硬编码 —— 走契约(dnt.json: PASS=0/FAIL=1/
+    # UNVERIFIED=3), 与 post_check 同源。改契约即改退出码, 本模块不各自抄一份。
+    return _DNT.exit_code(verdict)
 
 
 if __name__ == "__main__":

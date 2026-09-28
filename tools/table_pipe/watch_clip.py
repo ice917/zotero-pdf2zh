@@ -58,6 +58,31 @@ D = os.environ.get("P2Z_TABLE_DIR") or SD                # 工作目录(数据�
 PY = sys.executable
 DOCX = os.path.join(D, "appendix_tables_zh.docx")
 
+# 退出码真源: tools/contracts/dnt.json(经 dnt_contract 读)。本模块不硬编码 0/1/3 ——
+# 门禁的"值域"由该契约声明, 消费方(此处的判定/文案)随契约, 不各自抄一份。
+if TOOLS not in sys.path:
+    sys.path.insert(0, TOOLS)
+import dnt_contract as _DNT                              # noqa: E402
+
+
+def verdict_of_rc(rc):
+    """门禁退出码 -> 契约 verdict; 未登记码(含保留的 2) -> "FAIL"(fail-closed)。"""
+    return _DNT.verdict_for_exit_code(rc) or "FAIL"
+
+
+def exit_code_of_verdict(verdict):
+    """verdict -> 契约退出码(PASS=0/FAIL=1/UNVERIFIED=3); 未知 verdict -> 1(fail-closed)。"""
+    return _DNT.exit_code(verdict)
+
+
+def _log_block(rc, stage, log=print):
+    """判定非 PASS 时按 verdict 分档说清 —— 值域是三值, 文案不能只有"未过"一种。"""
+    if verdict_of_rc(rc) == "UNVERIFIED":
+        log("  ⚠ %s判定 UNVERIFIED(证据不足, 未放行) —— 需人工确认后重跑。" % stage)
+    else:
+        log("  ✗ %s未过, 未出稿。修正后重新粘贴即可。" % stage)
+
+
 # 正文任务的路径约定(与 tools/engine.py / adopt.py 同一套环境变量):
 #   P2Z_PROJ      项目根(缺省 D:\zotero-pdf2zh)
 #   P2Z_INBOX     载荷目录(缺省 <PROJ>\inbox)
@@ -867,8 +892,8 @@ def run_job(job, ids, got, log=print):
                        encoding="utf-8", errors="replace")
     for ln in (p.stdout or "").splitlines():
         log("  " + ln)
-    if p.returncode != 0:
-        log("  ✗ 门禁未过, 未出稿。修正后重新粘贴即可。")
+    if verdict_of_rc(p.returncode) != "PASS":
+        _log_block(p.returncode, "门禁", log=log)
         return None
 
     # [v28.79] 第二道门(gate_after): 只读/不写缓存库的收尾门禁。正文走 adopt 时是
@@ -879,7 +904,7 @@ def run_job(job, ids, got, log=print):
                            encoding="utf-8", errors="replace")
         for ln in (a.stdout or "").splitlines():
             log("  " + ln)
-        if a.returncode != 0:
+        if verdict_of_rc(a.returncode) != "PASS":
             log("  ✗ 出稿门禁 %d 未过, 未出稿:\n%s" % (i + 1, (a.stderr or "")[-800:]))
             return None
 
@@ -891,7 +916,7 @@ def run_job(job, ids, got, log=print):
                            encoding="utf-8", errors="replace")
         for ln in (a.stdout or "").splitlines():
             log("  " + ln)
-        if a.returncode != 0:
+        if verdict_of_rc(a.returncode) != "PASS":
             log("  ✗ 出稿工序 %d 失败:\n%s" % (i + 1, (a.stderr or "")[-800:]))
             return None
     out = job.get("out")
