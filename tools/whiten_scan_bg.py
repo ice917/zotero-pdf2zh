@@ -175,13 +175,20 @@ def pix_diff(a, b, rects_px):
     return ins, out
 
 
-def drawn_images(doc, pno):
-    """该页所有"画面"位图 -> [(xref, Pixmap, filter 名)]; 跳过 mask/smask。"""
+def drawn_images(doc, pno, errs=None):
+    """该页所有"画面"位图 -> [(xref, Pixmap, filter 名)]; 跳过 mask/smask。
+
+    errs 传入 list 时, "读不出的位图"会被记进去 —— [门禁 fail-closed] 落盘后读不出的
+    底图没法参与自检比对, 不能像以前那样静默丢弃(那等于把"读不出"当"这页没有这张图",
+    越界就再也查不出来)。自检据此把该页判为不可交付。
+    """
     out = []
     for x in doc[pno].get_images(full=True):
         try:
             px = fitz.Pixmap(doc, x[0])
-        except Exception:                                 # noqa: BLE001
+        except Exception as e:                            # noqa: BLE001
+            if errs is not None:
+                errs.append("xref=%s 读不出(%s)" % (x[0], e))
             continue
         if px.colorspace is None:
             continue
@@ -202,6 +209,7 @@ def process_one(inp, srcp, out, pad, inflate, dry):
     tot_masked = 0
     marks = []                        # (页序, rects, 遮白前的区内墨迹占比, 区内像素数)
     painted = []                      # (页序, 遮白前的底图 Pixmap, 图上遮白矩形)
+    pre_unver = {}                    # 页序 -> 遮白**前**就有位图读不出的原因(不可交付)
     for i in range(doc.page_count):
         page = doc[i]
         rs = mask_rects(src[i], page, pad, inflate)
@@ -211,12 +219,14 @@ def process_one(inp, srcp, out, pad, inflate, dry):
         b, npx = dark_ratio(page.get_pixmap(dpi=DPI), rs)   # 改图之前先量
         imgs = page.get_images(full=True)
         painted_here = 0
+        unread_here = 0
         for x in imgs:
             xref = x[0]
             try:
                 pix = fitz.Pixmap(doc, xref)
             except Exception as e:                        # noqa: BLE001
                 print("    (p%d xref=%s 读不出位图: %s)" % (i + 1, xref, e))
+                unread_here += 1
                 continue
             if pix.colorspace is None:                    # mask/smask, 不是画面
                 continue
@@ -233,6 +243,8 @@ def process_one(inp, srcp, out, pad, inflate, dry):
                  len(imgs), painted_here, b * 100, npx))
         tot_masked += len(rs)
         marks.append((i, rs, b, npx))
+        if unread_here:
+            pre_unver[i] = "遮白前 %d 张位图读不出, 既没遮也没法验" % unread_here
     if dry:
         print("\n[dry] 合计遮白矩形 %d —— 未落盘" % tot_masked)
         return 0
@@ -247,33 +259,57 @@ def process_one(inp, srcp, out, pad, inflate, dry):
     # 自检两条: ① 区内墨迹显著下降(剩下的正是不该被遮的中文笔画);
     #           ② **底图**逐像素比对 —— 区外必须为 0, 证明遮白只动了遮白区。
     doc2 = fitz.open(out)
-    stat = {}
+    stat = {}                 # 页序 -> 底图差异(区内, 区外)
+    verified = set()          # 已确实比对成功的页序
+    unver = {}                # 页序 -> 该比对而没能比对的原因(不可交付)
     for i, pix0, rpx in painted:
+        if not rpx:           # 没定位到落点矩形 = 这一处没被真正遮过, 无从判越界
+            unver.setdefault(i, "位图未定位到任何落点矩形")
+            continue
+        errs = []
         p2 = None
-        for _x, px, _f in drawn_images(doc2, i):
+        for _x, px, _f in drawn_images(doc2, i, errs):
             if (px.width, px.height, px.n) == (pix0.width, pix0.height, pix0.n):
                 p2 = px
                 break
-        if p2 is None:
-            print("  (p%d 比对跳过: 落盘后找不到同尺寸底图)" % (i + 1))
+        if p2 is None:        # 落盘后读不出/找不到底图 -> 没证据, 不是"没问题"
+            unver.setdefault(i, "; ".join(errs) if errs
+                             else "落盘后找不到同尺寸同通道的底图")
             continue
         ins, out_ = pix_diff(pix0, p2, rpx)
+        if ins < 0:           # 尺寸/通道对不上, pix_diff 判不可比 -> 同属没证据
+            unver.setdefault(i, "遮白前后底图尺寸/通道不一致")
+            continue
         a, bb = stat.get(i, (0, 0))
         stat[i] = (a + ins, bb + out_)
+        verified.add(i)
     bad = 0
     for i, rs, b0, npx in marks:
         b1, _ = dark_ratio(doc2[i].get_pixmap(dpi=DPI), rs)
         ins, out_ = stat.get(i, (0, 0))
+        # [门禁 fail-closed] 三态分清楚, 不能混: ① 比对过 -> 由 out_ 说了算;
+        # ② 该页有底图、该比对却没比对成 -> 不可交付(旧版 stat.get 默认 (0,0) 把
+        # "没数据"当成"区外 0", 正是静默放行); ③ 该页压根没有底图可遮 -> 无越界一说,
+        # 但要在日志里点名, 不冒充"已验"。
         if out_:
             bad += 1
             tail = "  <== 区外被动过, 不可交付"
+        elif i in unver:
+            bad += 1
+            tail = "  <== 未能比对(%s), 不可交付" % unver[i]
+        elif i in pre_unver:
+            bad += 1
+            tail = "  <== %s, 不可交付" % pre_unver[i]
+        elif i not in verified:
+            tail = "  (该页无底图可遮, 无需比对)"
         else:
             tail = ""
         print("  自检 p%d: 区内墨迹 遮前 %.1f%% -> 遮后 %.1f%% (%d px) | 底图差异 "
               "区内 %d / 区外 %d%s" % (i + 1, b0 * 100, b1 * 100, npx, ins, out_, tail))
     doc2.close()
     if bad:
-        print("\nFAIL: %d 页底图出现区外像素差异 —— 遮白越界" % bad)
+        print("\nFAIL: %d 页未能证明「遮白未越界」(区外差异非 0, 或该比对却没比对成) "
+              "—— 不交付" % bad)
         return 1
     print("\nPASS: 底图区外像素差异为 0 —— 遮白只动了该动的地方")
     return 0

@@ -2024,6 +2024,10 @@ class PDFTranslator:
                     status = 'PASS'
                 elif proc.returncode == 1:
                     status = 'FAIL'
+                elif proc.returncode == 3:
+                    # [本质修 2026-09-28] 三值门禁: rc=3 = UNVERIFIED(证据不足,
+                    # 如 post_check 断言 4 无 DNT 声明), 不等于基础设施故障 2。
+                    status = 'UNVERIFIED'
                 else:
                     status = f'异常退出码 {proc.returncode}'
                 out = (proc.stdout or '').strip()

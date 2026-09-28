@@ -238,14 +238,24 @@ def body_out():
 # ---------------------------------------------------------- 正文出稿: 走 adopt 还是老路
 
 def body_ledger():
-    """这一篇的 adopt 台账(PROJ/logs/adopt/<名>.json); 没有/读不动返回 None。
-    落点与判据都跟 adopt.py 同源(它就是这么写、这么读的), 不另起一套。"""
-    try:
-        with io.open(os.path.join(PROJ, "logs", "adopt", BODY_NAME + ".json"),
-                     encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:                       # noqa: BLE001 —— 台账不是本步的必需品
+    """这一篇的 adopt 台账(PROJ/logs/adopt/<名>.json); 确无该文件返回 None。
+    落点与判据都跟 adopt.py 同源(它就是这么写、这么读的), 不另起一套。
+
+    [门禁 fail-closed] 只有"确无台账"才返回 None(手动 seg_export 的老载荷走老路是
+    设计内的)。文件在、却读不动(JSON 损坏/权限)时**不静默降级** —— 降级会切到没有
+    deliver 三道内容门的老路(见 body_use_adopt), 把"读不出"当成"没有"就是一次无声
+    放行。此时抛错, 由调用方报出来让人先修台账。
+    """
+    path = os.path.join(PROJ, "logs", "adopt", BODY_NAME + ".json")
+    if not os.path.exists(path):
         return None
+    try:
+        with io.open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:                  # noqa: BLE001 —— 读不动要炸, 不降级
+        raise RuntimeError(
+            "adopt 台账存在但读不出(%s): %s —— 不静默降级到无内容门的老路, "
+            "请修复该台账或删除它后重试。" % (path, e))
 
 
 def body_use_adopt():
@@ -284,9 +294,12 @@ def body_gate_after():
     """
     if not body_use_adopt():
         return []
+    # 不带 --force: --force 会绕过 adopt 的顺序门与 import 的侧车身份守卫(sha1 对账,
+    # 见 adopt.stage_import) —— 那正是这条动线要过的内容门。前置在本步天然成立(export
+    # 已 ok 才走到这里; 两步按序跑、任一步非 0 即停), 不需要用 --force 把它跳过去。
     return [[PY, os.path.join(TOOLS, "adopt.py"), "deliver",
-             "--name", BODY_NAME, "--text", BODY_NAME + "_response.tsv", "--force"],
-            [PY, os.path.join(TOOLS, "adopt.py"), "import", "--name", BODY_NAME, "--force"]]
+             "--name", BODY_NAME, "--text", BODY_NAME + "_response.tsv"],
+            [PY, os.path.join(TOOLS, "adopt.py"), "import", "--name", BODY_NAME]]
 
 
 def body_after():
@@ -309,7 +322,9 @@ def body_after():
                  "--imported", body_imported(),
                  "--manifest", body_manifest(),
                  "--sidecar", body_sidecar()], rerender]
-    return [[PY, os.path.join(TOOLS, "adopt.py"), "inject", "--name", BODY_NAME, "--force"],
+    # 不带 --force: 走 adopt 时 inject 的顺序门要求 import 已 ok —— 上一步 gate_after
+    # 刚跑过且非 0 即停, 前置天然成立; 用 --force 跳过只会掩盖"出稿工序跑在了门禁之前"。
+    return [[PY, os.path.join(TOOLS, "adopt.py"), "inject", "--name", BODY_NAME],
             rerender]
 
 

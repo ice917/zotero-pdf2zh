@@ -19,12 +19,19 @@ tools/post_check.py —— 翻译后质检门禁（零 API 成本，只读）
                      定阈的蒙特卡洛依据见 WHOLE_DOC_CJK_FAIL 注释
     2. 引用完整性    原文与译文的 [n] 引用标号数量逐页对账，
                      偏差超限 → 版面错乱/文献混排（参考文献页事故
-                     的典型特征就是标号丢失或重复）
+                     的典型特征就是标号丢失或重复）。原文全文无 [n]
+                     标记（上标数字/作者-年份/括号数字体例，或文本
+                     提取受损）时本断言无判据可拦，以**提示**级报
+                     "未生效"——不再静默跳过（V6a，2026-09-28）
     3. 占位符残留    译文中残留 {vN} 公式占位符 → 公式回填失败
     4. 文献区禁汉化  原文的参考文献页（编号制行首 [n] 条目密集，或
-                     作者-年份制条目密集，判据见 REF_DENSITY）
+                     作者-年份制条目密集，判据见 REF_DENSITY；或
+                     「文献表标题锚 + 行首 [n] 条目 ≥ REF_HEADING_PAGE_MIN」
+                     的第三臂，收密度被同页正文摊薄的首/半文献页）
                      在译文中被中文化（人名/期刊名/标题被翻成中文）
                      → 学术文献表不可用。文献条目必须整条原样保留。
+                     有标题却无条目锚的无编号体例页：断言4 无判据，
+                     以提示级报"请人工抽查"，不假称通过（V9，2026-09-28）
     5. 渲染残渣      译文中出现"原文整篇都没有的"标签残渣（如渲染层
                      内部标记 </style…>、<span class=…> 被当页面文字
                      画了出来）→ 读者会直接在版面上看到这些字符。
@@ -56,6 +63,7 @@ tools/post_check.py —— 翻译后质检门禁（零 API 成本，只读）
 import argparse
 import datetime
 import glob
+import json
 import logging
 import os
 import re
@@ -63,6 +71,15 @@ import sys
 import warnings
 
 from pypdf import PdfReader
+
+# [A1 契约] 文献区禁汉化判据的唯一真源(先于实现、独立于实现): 生产端 seg_export
+# 与消费端本模块**平级**从此取值 —— 改契约即改行为, 无需改代码。加载失败响亮报错,
+# 不静默降级(fail-closed)。本模块被 pre_render_check/seg_check 导入时, 调用方已把
+# TOOLS 插入 sys.path; 直接脚本运行时脚本目录即 sys.path[0]。此处再兜底一次。
+_TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+import dnt_contract as _DNT      # noqa: E402 文献区禁汉化契约(先于实现)
 
 # 老 PDF 字体表(CMap)损坏的解析警告对质检无贡献，静音
 logging.getLogger("pypdf").setLevel(logging.ERROR)
@@ -88,7 +105,11 @@ MIN_SUBSTANTIAL = 500    # 原文页可提取字符数超过该值才算"实质�
 CITE_TOL_ABS = 5         # 引用标号数量对账的绝对容差
 CITE_TOL_REL = 0.2       # 引用标号数量对账的相对容差（20%）
 # [自研补丁 2026-09-19] 第四断言(文献区禁汉化)口径
-REF_ZH_MIN = 2           # 单页"被汉化的文献条目"数达到该值 → 该页文献被翻成中文
+# [V7 修 2026-09-28] 门槛 2 -> 1: 文献条目"整条原样保留"是**存在性**硬要求, 不是数量配额。
+#   原口径"单页被汉化的条目数 >= 2 才判事故"会静默放过"只译了 1 条"的页 —— 而哪怕 1 条被
+#   汉化, 那一条文献就已经不可用于回溯了。改 1 后 zh_n >= 1 即"存在即事故"。
+# [A1 2026-09-28] 该门槛已抽为**契约** thresholds.zh_min(tools/contracts/dnt.json),
+#   由 check_ref_zh 经 _DNT.zh_min() 现取 —— 不再在此留同名常量(避免双源)。
 REF_DENSITY = 2.5        # 文献页判据: 原文每千字的**文献条目**数达到该值。
                          # 条目按引用体例取其一: 编号制数行首 [n], 作者-年份制
                          # 数"姓名 (年)"(见 REF_AY) —— 两种体例同阈值。
@@ -166,11 +187,23 @@ REF_HEADING = re.compile(
 REF_HEADING_WEAK = re.compile(r"^\s*(?i:REFERENCES?)(?![A-Za-z\u4e00-\u9fff])\s*[.:：]?\s*$")
 # 文献条目的客观特征: 4 位年份。用来给弱形式做上下文守卫(见上)。
 REF_ENTRY_YEAR = re.compile(r"(?:1[6-9]|20)\d{2}")
-# 注: 本判据只给**区域级**消费者用（tools/seg_check.py 的页内文献段豁免）。
-# 刻意不接进 is_ref_page —— 那是**页级**判据, 供断言1/断言4 用: 一个"正文占
-# 九成、末尾挂文献块"的页一旦被当成文献页, 断言4 会在该页正文的中文上跑
-# count_zh_ay_blocks（姓名锚切块）而误报"文献区被汉化", 断言1 也会整页豁免。
-# 页级与区域级是同一件事的两个粒度, 判据文本同源, 阈值语义各自成立。
+# [V9 修 2026-09-28] 页级第三臂阈值: 「标题锚 + 行首 [n] 条目数 >= 4」即认文献页。
+# 实测 22 篇语料: 6 个首/半文献页密度臂全部漏认(Bisicchia p48 8条 / Jiang p7 15 /
+# Kim p9 6 / Melhani p42 5 / Rupchin p19 7 / Vaswani p10 4, 密度 1.29~2.18 全在
+# 阈值 2.5 之下), 全部满足「标题锚 + >=4 条目」; 全语料不存在"正文页带标题锚且
+# >=4 行首条目"的误收候选。取 4 = 实测最小值(Vaswani p10)。
+REF_HEADING_PAGE_MIN = 4
+# 注: REF_HEADING 判据曾只给**区域级**消费者用（tools/seg_check.py 的页内文献段
+# 豁免）。[V9 修] 起以带守卫的形式接进 is_ref_page —— 当初刻意不接的顾虑逐条核销:
+#   · 断言4 的误报臂 count_zh_ay_blocks 只在该页 o["ref_ay_density"]>=REF_DENSITY
+#     时才启用(见 check_ref_zh), 编号制混排页 ay 密度实测恒 0.00 → 新臂页面不触发;
+#   · 断言1 的文献页豁免只作用于 cjk_low 页(译文无汉字, 见 run_checks), 正文翻译
+#     正常时豁免不发生; 残留漏放面 = "整页漏译 + 标题锚 + >=4 行首[n]"三者同时
+#     成立, 语料实测零例;
+#   · 无编号体例(Johnson 第三体例 / Nature 上标 / Hagihara 等 ref_entries==0)
+#     刻意仍不收 —— 无条目锚则断言4 无从切块, 收进来只会产出假"通过"; 那些页改由
+#     check_ref_zh 出"无判据"提示(可见、不阻断)。
+# 页级与区域级仍是同一件事的两个粒度, 判据文本同源, 阈值语义各自成立。
 
 # [自研补丁 2026-09-20] 引用标号判据要容忍**提取空隙**: 同一份 PDF 的两侧
 # (原文 vs 译文)提取形态可以不一样 —— 原文里 `[22]` 是公式字体里的字形对象,
@@ -179,7 +212,12 @@ REF_ENTRY_YEAR = re.compile(r"(?:1[6-9]|20)\d{2}")
 # 逐页对账变成"原文 69 / 译文 88, 差 19 判 FAIL"—— 差的不是引用, 是空格。
 # 放宽的是**两侧同样放宽**(同一正则对原文与译文各跑一遍), 不是只放过译文;
 # 两侧形态一旦一致(都不带空隙)行为与旧判据完全相同。
-CITE_ANY = re.compile(r"\[\s*\d{1,3}\s*\]")
+# [V6b 修 2026-09-28] 多引形态 `[n,m]` / `[n;m]` / `[n-m]` / `[n–m]`(逗号/分号/
+# 连字符/en 破折号/em 破折号分隔)也认, 按**组**计(一组一个计数): 语料实测 22 篇
+# 里 14 篇带此形态(最高 Brody 38 处), 旧正则全部漏计 —— 两侧对称漏计虽不产
+# 误报, 却让断言2 对"多引整组丢失"结构性失明。超三位数([1234])与含非数字
+# 分隔([a,b]/[0.5])仍不认; 两侧同正则对称, 对账语义不变。
+CITE_ANY = re.compile(r"\[\s*\d{1,3}\s*(?:[,;–—-]\s*\d{1,3}\s*)*\]")
 CJK = re.compile(r"[\u4e00-\u9fff]")
 # [自研补丁 2026-09-19] 第五断言(渲染残渣)口径。
 # 事故: 官方 BabelDOC 2.9.0 的产物第 2 页真印出了 `</style\x01id='25'>`
@@ -271,7 +309,7 @@ def text_features(text, page_no):
     又变成翻前翻后各说各话。
     """
     feat = {"page": page_no, "chars": 0, "cjk": 0, "alnum": 0, "cites": 0,
-            "ref_entries": 0, "ref_density": 0.0,
+            "ref_entries": 0, "ref_density": 0.0, "ref_heading": False,
             "ref_ay_entries": 0, "ref_ay_density": 0.0,
             "ref_zh_blocks": 0, "ref_zh_blocks_ay": 0,
             "placeholders": 0, "residues": [], "error": None}
@@ -280,6 +318,10 @@ def text_features(text, page_no):
     feat["alnum"] = len(re.findall(r"[A-Za-z0-9]", text))
     feat["cites"] = len(CITE_ANY.findall(text))
     feat["ref_entries"] = len(REF_ENTRY.findall(text))
+    # [V9 修] 页上是否出现「文献表标题」行(is_ref_heading): 页级第三臂的锚
+    # (见 REF_HEADING_PAGE_MIN), 也供 check_ref_zh 对"有标题无条目锚"的无编号
+    # 体例页报"无判据"提示。逐行判, 与 seg_check 的区域级消费同源。
+    feat["ref_heading"] = any(is_ref_heading(ln) for ln in text.splitlines())
     feat["ref_ay_entries"] = len(REF_AY.findall(text))
     if feat["chars"]:
         feat["ref_density"] = feat["ref_entries"] * 1000.0 / feat["chars"]
@@ -313,8 +355,13 @@ def is_ref_page(feat):
 
     [自研补丁 2026-09-19] 两种体例共用 REF_DENSITY。判据只认原文页 ——
     译文页的条目被汉化/换标点后, 行首 [n] 与年份都会被 pypdf 拆散。
+    [V9 修 2026-09-28] 第三臂: 「标题锚 + 行首 [n] 条目 >= REF_HEADING_PAGE_MIN」
+    —— 首/半文献页的密度被同页正文摊薄后, 靠"文献表标题就在本页"兜底
+    (守卫分析见 REF_HEADING_PAGE_MIN 注释)。
     """
-    return max(feat["ref_density"], feat["ref_ay_density"]) >= REF_DENSITY
+    return (max(feat["ref_density"], feat["ref_ay_density"]) >= REF_DENSITY
+            or (feat.get("ref_heading")
+                and feat.get("ref_entries", 0) >= REF_HEADING_PAGE_MIN))
 
 
 def is_ref_heading(text):
@@ -331,8 +378,42 @@ def is_ref_heading(text):
     return bool(REF_HEADING.match(text or ""))
 
 
+def load_dnt_manifest(path):
+    """读 seg_export 的 manifest -> (dnt_pages, covered_pages, declared)。
+
+    **声明式契约的入口**: 门禁据此**比对**, 不再从产物启发式反推该豁免谁 ——
+    后者覆盖域恒为"已知坏形态的子集"(黑名单), 永远追加不完, 且"未命中"被静默
+    读成"通过"(见 check_ref_zh 的[本质修]说明)。
+
+    返回:
+      dnt_pages     —— 声明为禁翻(true_page)的真实 PDF 页码集合(可为空 = 空声明);
+      covered_pages —— 本次导出覆盖到的全部真实页码(声明只有在此范围内才说得上话);
+      declared      —— manifest 是否带 dnt_declared 顶层布尔。用来区分"声明为空
+                       (确实无 DNT)"与"未声明(legacy 载荷)" —— 前者可判空真通过,
+                       后者只能判未验证, 二者不可混作一谈。
+
+    读不出/坏文件 -> 抛异常, 由调用方转成基础设施错(rc=2), 不静默当"无声明"。
+    """
+    with open(path, encoding="utf-8") as f:
+        man = json.load(f)
+    # 字段名取自契约(A1): 生产端 seg_export 用同一契约写, 两侧同步跟随契约变更。
+    item_flag = _DNT.manifest_item_flag()
+    top_flag = _DNT.manifest_top_level_flag()
+    dnt_pages, covered = set(), set()
+    for it in man.get("items") or []:
+        _dnt = bool(it.get(item_flag))
+        for part in it.get("parts") or []:
+            tp = part.get("true_page")
+            if tp is None:
+                continue
+            covered.add(int(tp))
+            if _dnt:
+                dnt_pages.add(int(tp))
+    return dnt_pages, covered, bool(man.get(top_flag))
+
+
 # ---------------------------------------------------------------- 断言
-def check_ref_zh(orig_feats, trans_feats):
+def check_ref_zh(orig_feats, trans_feats, dnt_pages=None, covered_pages=None):
     """第 4 断言「参考文献区不得汉化」→ 返回 findings 列表。
 
     [自研补丁 2026-09-19] 从 run_checks 里抽出来, 让**渲染前预检**
@@ -340,29 +421,95 @@ def check_ref_zh(orig_feats, trans_feats):
     的意义: 这 5 篇历史 FAIL 当初全是"PDF 出来了才发现文献区被汉化", 而重出
     PDF 要占服务端一轮 —— 在 render 之前就判死, 那一轮直接省掉。
 
-    只在原文侧判文献页(见 is_ref_page), 译文侧只负责数"被汉化的条目"。
+    [本质修 2026-09-28] 判据从「启发式反推」改为「比对声明」。
+    旧口径(密/标题锚 + 条目计数)有三层病:
+      L1 代理量≠契约量: 用"密度/条目数"这类**代理量**回答"该页该不该禁翻"这个
+         **契约量**问题(范畴错误) —— 代理命中不等于该豁免, 代理未命中不等于没漏译;
+      L2 黑名单非白名单: 增臂/调阈的覆盖域恒为"已知坏形态的子集", 永远追加不完,
+         语料一换就有新形态落空(实测 22 篇里 6 个首/半文献页密度臂全漏认);
+      L3 二值把"未命中"读成"通过": n_ref_pages==0 时零输出、verdict 二值 → 漏认即
+         静默放行(不可逆信息丢失)。
+    修法: 契约先于产物 —— seg_export 用 --dnt-refs/--dnt-seg 写出**声明**(写进
+    manifest 与载荷), 门禁拿着声明比对。据此:
+      · dnt_pages is None(无声明/legacy) -> 判「未验证」, **绝不签发"通过"**;
+      · 声明页 -> 逐页核验条目是否被汉化(违声明=高, 硬 FAIL);
+      · 独立信号(is_ref_page 密度臂, 与生产侧的标题锚**不同源**)命中却未声明
+        -> 判「未验证」(声明与独立信号不一致, 无法二选一, 交人工);
+      · 声明页却未被独立判据认作文献页 -> 提示(声明予信任, 但留痕);
+      · 有标题锚却无条目锚的无体例页(V9 修) -> 仍出提示, 不退化为静默。
+
+    粒度: 声明是**段级**(manifest 逐段 dnt:true), 核验按**页级**(取声明的
+    true_page 并集)。covered_pages 界定声明的管辖范围 —— 范围外的文献页不判
+    "未验证"(那时声明根本没对它说话), 以提示留痕。
     """
-    zh_ref_pages, zh_ref_why, n_ref_pages = [], [], 0
-    for o, t in zip(orig_feats, trans_feats):
-        if o["error"] or t["error"] or not is_ref_page(o):
-            continue
-        n_ref_pages += 1
-        zh_n = t["ref_zh_blocks"]
-        if o["ref_ay_density"] >= REF_DENSITY:
-            zh_n += t["ref_zh_blocks_ay"]
-        if zh_n >= REF_ZH_MIN:
-            zh_ref_pages.append(t["page"])
-            zh_ref_why.append(f"第{t['page']}页({zh_n}条)")
-    if zh_ref_pages:
+    if dnt_pages is None:
         return [(
-            "高", f"第{','.join(map(str, zh_ref_pages))}页",
-            "文献区汉化断言失败：原文的参考文献条目在译文中被翻译成中文"
-            f"（{('、'.join(zh_ref_why))}）。文献条目必须整条原样保留——"
-            "人名/标题/期刊名被汉化后文献表不可用，且无法据此回溯原文")]
-    if n_ref_pages:
-        return [("通过", "全文",
-                 f"文献区禁汉化检查通过：{n_ref_pages} 个文献页的条目均保持原样")]
-    return []
+            "未验证", "全文",
+            "文献区禁汉化断言未验证：未提供 DNT 声明（--manifest）。本断言不再用"
+            "启发式从译文反推该豁免谁 —— 无声明即无契约可比。请用 seg_export 的"
+            "--dnt-refs（自动判文献区）或 --dnt-seg（显式点名）生成声明后重跑")]
+    declared = set(int(p) for p in dnt_pages)
+    scope = None if covered_pages is None else set(int(p) for p in covered_pages)
+    zh_hits, gaps, offscope, overdecl, blind = [], [], [], [], []
+    for o, t in zip(orig_feats, trans_feats):
+        if o["error"] or t["error"]:
+            continue
+        pg = o["page"]
+        if pg in declared:
+            zh_n = t["ref_zh_blocks"]
+            if o["ref_ay_density"] >= REF_DENSITY:
+                zh_n += t["ref_zh_blocks_ay"]
+            if zh_n >= _DNT.zh_min():
+                zh_hits.append((pg, zh_n))
+            if not is_ref_page(o):
+                overdecl.append(pg)
+            continue
+        if is_ref_page(o):
+            # 独立信号(密度臂)认定文献页, 却没在声明里 —— 声明与信号不一致。
+            if scope is None or pg in scope:
+                gaps.append(pg)            # 在本次导出管辖内 -> 覆盖缺口
+            else:
+                offscope.append(pg)        # 管辖外 -> 留痕, 不判未验证
+        elif o.get("ref_heading"):
+            blind.append(pg)               # 有标题无条目锚: 无判据, 人工抽查
+    findings = []
+    if zh_hits:
+        findings.append((
+            "高", "第%s页" % ",".join(str(p) for p, _ in zh_hits),
+            "文献区汉化断言失败：声明禁翻的文献条目在译文中被翻译成中文"
+            f"（{('、'.join('第%d页(%d条)' % (p, n) for p, n in zh_hits))}）。"
+            "文献条目必须整条原样保留——人名/标题/期刊名被汉化后文献表不可用，"
+            "且无法据此回溯原文"))
+    if gaps:
+        findings.append((
+            "未验证", "第%s页" % ",".join(map(str, gaps)),
+            "文献区覆盖审计未通过：上述页被独立判据（is_ref_page 密度臂）认作文献页，"
+            "却不在禁翻声明中 —— 声明与独立信号不一致，无法判定该页该不该保持原文。"
+            "请人工核查，或经 seg_export --dnt-seg 显式补充声明后重跑"))
+    if offscope:
+        findings.append((
+            "提示", "第%s页" % ",".join(map(str, offscope)),
+            "检出文献页但不在本次导出范围内，未参与本声明；若该页确已被翻译，"
+            "请核查是否需纳入声明"))
+    if overdecl:
+        findings.append((
+            "提示", "第%s页" % ",".join(map(str, overdecl)),
+            "声明禁翻但独立判据未认作文献页；可能是特殊体例或文本提取受损 —— "
+            "该页按声明信任，此处仅留痕"))
+    if blind:
+        findings.append((
+            "提示", "第%s页" % ",".join(map(str, blind)),
+            "检出文献表标题但无条目锚（无编号体例或文本提取受损），条目级"
+            "汉化检测对该页无判据 —— 该页文献表是否被汉化请人工抽查"))
+    if not zh_hits and not gaps:
+        if declared:
+            findings.append(("通过", "全文",
+                             "文献区禁汉化检查通过：禁翻声明覆盖 %d 个页面，"
+                             "条目均保持原样" % len(declared)))
+        else:
+            findings.append(("通过", "全文",
+                             "文献区禁汉化检查通过：空声明，且未检出文献页"))
+    return findings
 
 
 def check_residue(orig_feats, trans_feats):
@@ -404,16 +551,21 @@ def check_residue(orig_feats, trans_feats):
     return [("通过", "全文", "渲染残渣检查通过：译文未出现原文之外的标签残渣")]
 
 
-def run_checks(orig_feats, trans_feats, skip_last=0):
+def run_checks(orig_feats, trans_feats, skip_last=0, dnt_pages=None, covered_pages=None):
     """
     五项断言。返回 (findings, verdict)
-      findings: [(级别, 页码或全局, 描述), ...]  级别: 高/中/提示/通过
-      verdict:  "PASS" / "FAIL"
+      findings: [(级别, 页码或全局, 描述), ...]  级别: 高/中/提示/通过/未验证
+      verdict:  "PASS" / "FAIL" / "UNVERIFIED"
       skip_last: 任务实际配置的 skipLastPages(由服务端传入); 仅末尾连续
                  恰好 skip_last 页且确为原文保留(无汉字)才豁免, 无参数不豁免。
+      dnt_pages / covered_pages: DNT 声明(见 load_dnt_manifest) —— 缺省 None
+                 = 无声明, 断言4 判未验证(不再启发式反推)。
     """
     findings = []
     n = min(len(orig_feats), len(trans_feats))
+    # 声明禁翻的页(真实页码): 断言1 的文献页豁免与之并集 —— 声明的意义正是
+    # "这些页本就应该保持原文", 译文汉字为零是预期, 不该计入漏译读数。
+    _dnt_declared = set(int(p) for p in (dnt_pages or ()))
 
     # ---------- 1. 汉化率断言 ----------
     # [自研补丁 2026-09-03] 豁免只认任务实际跳页数(报告 🔴5): 旧逻辑仅凭
@@ -442,8 +594,8 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
         if o["chars"] < MIN_SUBSTANTIAL:
             continue  # 原文页无实质内容（封面/图表页），不参与断言
         cjk_low = cjk_ratio(t) < CJK_FAIL
-        if cjk_low and is_ref_page(o):
-            ref_pages.append(t["page"])    # 文献页, 英文原样保留属预期
+        if cjk_low and (is_ref_page(o) or o["page"] in _dnt_declared):
+            ref_pages.append(t["page"])    # 文献页/声明禁翻页, 英文原样保留属预期
             continue
         if skip_last > 0 and i >= n - skip_last and cjk_low:
             kept_pages.append(t["page"])   # 任务明确跳过的末尾页, 原文保留
@@ -514,6 +666,17 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
                 "通过", "全文",
                 f"引用完整性对账通过：原文 {o_total} 个 / 译文 {t_total} 个"
                 f"（容差内）"))
+    else:
+        # [V6a 修 2026-09-28] o_total==0 不再静默蒸发: 语料实测 7/22 篇全文
+        # 无 [n] 标记(Nature 上标制/ACS 括号制/作者-年份制/坏提取), 旧逻辑这条
+        # 断言整条跳过、无产物无痕迹 —— "UNKNOWN 静默当 PASS"的同族缺陷。
+        # 提示级不阻断: 该篇确实无判据可拦, 拦了就是误伤; 但必须看得见。
+        findings.append((
+            "提示", "全文",
+            "引用完整性断言未生效：原文未检出 [n] 型引用标记（o_total=0"
+            + (f"，译文却检出 {t_total} 个）" if t_total else "）")
+            + "。常见于上标数字/作者-年份/括号数字体例，或文本提取受损 —— "
+              "本断言对该篇无判据"))
 
     # ---------- 3. 占位符残留 ----------
     ph_total = sum(f["placeholders"] for f in trans_feats if not f["error"])
@@ -541,7 +704,8 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
     # 编号制文献页 + 中文正文: 误报 27/53/17 条)。
     # [自研补丁 2026-09-19] 实现搬进 check_ref_zh(), 与渲染前预检共用同一段
     # 代码 —— 前移这道闸门见 tools/pre_render_check.py。
-    findings.extend(check_ref_zh(orig_feats, trans_feats))
+    findings.extend(check_ref_zh(orig_feats, trans_feats,
+                                 dnt_pages=dnt_pages, covered_pages=covered_pages))
 
     # ---------- 5. 渲染残渣 ----------
     # [自研补丁 2026-09-19] 判据与事故背景见 check_residue / RESIDUE_TAG。
@@ -549,13 +713,23 @@ def run_checks(orig_feats, trans_feats, skip_last=0):
     findings.extend(check_residue(orig_feats, trans_feats))
 
     # ---------- 页数一致性 ----------
+    # [门禁 fail-closed] 页数不一致 = 文档未被完整比对(尾部若干页根本没进对比), 属
+    # "证据不完整", 不能只记"中"放过 —— 按 fail-closed 升为"高"(阻断), 交人工查尾部。
     if len(orig_feats) != len(trans_feats):
         findings.append((
-            "中", "全局",
+            "高", "全局",
             f"页数不一致：原文 {len(orig_feats)} 页 vs 译文 {len(trans_feats)} 页，"
-            f"仅按前 {n} 页对比，请人工核对尾部"))
+            f"仅按前 {n} 页对比，尾部未经任何断言 —— 请人工核对尾部"))
 
-    verdict = "FAIL" if any(f[0] == "高" for f in findings) else "PASS"
+    # [本质修 2026-09-28] verdict 三值: "未命中/无判据"不再被读成"通过"。
+    # 高 -> FAIL(确定有问题); 无高但有"未验证" -> UNVERIFIED(不能签 P(通过));
+    # 其余才是 PASS。FAIL 优先于 UNVERIFIED: 确定失败先修, 未验证项并列可见。
+    if any(f[0] == "高" for f in findings):
+        verdict = "FAIL"
+    elif any(f[0] == "未验证" for f in findings):
+        verdict = "UNVERIFIED"
+    else:
+        verdict = "PASS"
     return findings, verdict
 
 
@@ -565,6 +739,11 @@ def build_report(mono_path, orig_path, n_pages, findings, verdict, skip_last=0):
     skip_line = (f"- 跳页豁免: 末尾 {skip_last} 页（任务 skipLastPages）"
                  if skip_last > 0 else
                  "- 跳页豁免: 无（未传 --skip-last，英文保留页不豁免）")
+    verdict_note = {
+        "PASS": "（可交付）",
+        "FAIL": "（存在高危问题，需处理后交付）",
+        "UNVERIFIED": "（存在未验证项，需人工确认后交付）",
+    }.get(verdict, "")
     lines = [
         "# 翻译后质检报告（门禁）",
         "",
@@ -573,12 +752,12 @@ def build_report(mono_path, orig_path, n_pages, findings, verdict, skip_last=0):
         f"- 质检时间: {now}",
         f"- 对比页数: {n_pages}",
         skip_line,
-        f"- **门禁判定: {verdict}**" + ("（可交付）" if verdict == "PASS" else "（存在高危问题，需处理后交付）"),
+        f"- **门禁判定: {verdict}**{verdict_note}",
         "",
         "## 断言结果",
         "",
     ]
-    icon = {"高": "🔴", "中": "🟡", "提示": "🔵", "通过": "✅"}
+    icon = {"高": "🔴", "中": "🟡", "提示": "🔵", "通过": "✅", "未验证": "🟠"}
     for level, loc, desc in findings:
         lines.append(f"- {icon.get(level, '⚪')} **[{level}]** {loc}：{desc}")
     lines += ["", "## 断言项说明", "",
@@ -589,10 +768,13 @@ def build_report(mono_path, orig_path, n_pages, findings, verdict, skip_last=0):
               "表格/公式页'与'卡死漏译页'，须对照原文人工确认",
               "2. **引用完整性**：原文/译文 [n] 标号逐页对账，超容差=版面错乱",
               "3. **占位符残留**：{vN} 公式占位符未回填即失败",
-              "4. **文献区禁汉化**：原文文献页（编号制行首 [n] 密度，或作者-年份"
-              f"制条目密度 ≥ {REF_DENSITY} 条/千字）的条目在译文中被翻成中文即失败"
-              "（人名/标题/期刊名必须原样保留）；反之文献页译文无汉字属预期，"
-              "不计入汉化率断言",
+              "4. **文献区禁汉化（声明式）**：以 seg_export 的 DNT 声明"
+              "（manifest 的 `dnt_declared`/逐段 `dnt`）为准，核验声明禁翻页的条目"
+              "在译文中是否被翻成中文（是即失败，人名/标题/期刊名必须原样保留）；"
+              "另用独立判据（`is_ref_page` 密度臂）做**覆盖审计**——独立信号认定"
+              "文献页却未在声明中，判**未验证**（声明与信号不一致，交人工）。"
+              "未提供 `--manifest`（无声明）时，本断言判**未验证**而非通过：不再用"
+              "启发式从译文反推该豁免谁；声明禁翻页译文无汉字属预期，不计入汉化率断言",
               "5. **渲染残渣**：译文出现原文整篇都没有的标签残渣（渲染层"
               "内部标记如 `</style…>` 被当成页面文字画了出来）即失败；"
               "与原文同形的标签（如 NLP 论文正文里的 `<EOS>`）不算",
@@ -630,6 +812,15 @@ def find_latest_mono():
 
 
 # ---------------------------------------------------------------- 入口
+def exit_code_for(verdict, default=1):
+    """verdict -> 进程退出码, 口径取自契约(A1)。未登记 verdict 落 default(fail-closed)。
+
+    契约 exit_codes: PASS=0 / FAIL=1 / UNVERIFIED=3; rc=2 保留给基础设施错误
+    (参数非法 / PDF 不可解析)。改契约即改退出码 —— 无需改本模块。
+    """
+    return _DNT.exit_code(verdict, default=default)
+
+
 def main():
     ap = argparse.ArgumentParser(description="翻译后质检门禁（零 API 成本）")
     ap.add_argument("mono", nargs="?", default=None,
@@ -638,10 +829,25 @@ def main():
     ap.add_argument("--skip-last", type=int, default=0, metavar="N",
                     help="任务实际配置的 skipLastPages: 仅豁免末尾连续 N 个"
                          "原文保留页（由服务端自动传入；手工运行按任务设置填写）")
+    ap.add_argument("--manifest", default=None,
+                    help="seg_export 生成的 manifest.json: 提供 DNT 声明, 断言 4 "
+                         "据此比对。不给则断言 4 判「未验证」(绝不静默签发通过)")
     args = ap.parse_args()
     if args.skip_last < 0:
         print("❌ --skip-last 不能为负数", file=sys.stderr)
         sys.exit(2)
+
+    # [本质修 2026-09-28] DNT 声明的消费端: 契约先于产物。manifest 给不出声明
+    # (未提供/坏文件) -> 断言 4 判「未验证」; 提供且带 dnt_declared -> 比对声明。
+    dnt_pages, covered_pages = None, None
+    if args.manifest:
+        try:
+            _dp, _cp, _declared = load_dnt_manifest(args.manifest)
+        except Exception as exc:
+            print(f"❌ --manifest 无法读取/解析: {exc}", file=sys.stderr)
+            sys.exit(2)
+        covered_pages = _cp if _declared else None
+        dnt_pages = _dp if _declared else None
 
     mono_path = args.mono or find_latest_mono()
     if not mono_path or not os.path.isfile(mono_path):
@@ -665,18 +871,29 @@ def main():
     orig_feats = [page_features(r_orig, i) for i in range(n)]
     trans_feats = [page_features(r_trans, i) for i in range(n)]
 
-    findings, verdict = run_checks(orig_feats, trans_feats, skip_last=args.skip_last)
+    findings, verdict = run_checks(orig_feats, trans_feats, skip_last=args.skip_last,
+                                   dnt_pages=dnt_pages, covered_pages=covered_pages)
     content = build_report(mono_path, orig_path, n, findings, verdict,
                            skip_last=args.skip_last)
     report_path = save_report(content, mono_path)
 
     print(f"📄 译文: {os.path.basename(mono_path)} | 对比 {n} 页")
     for level, loc, desc in findings:
-        mark = {"高": "🔴", "中": "🟡", "提示": "🔵", "通过": "✅"}.get(level, "⚪")
+        mark = {"高": "🔴", "中": "🟡", "提示": "🔵", "通过": "✅",
+                "未验证": "🟠"}.get(level, "⚪")
         print(f"{mark} [{level}] {loc}: {desc}")
-    print(f"{'🟢 门禁判定: PASS（可交付）' if verdict == 'PASS' else '🔴 门禁判定: FAIL（需处理）'}")
+    verdict_line = {
+        "PASS": "🟢 门禁判定: PASS（可交付）",
+        "FAIL": "🔴 门禁判定: FAIL（需处理）",
+        "UNVERIFIED": "🟠 门禁判定: UNVERIFIED（未验证，需人工确认后交付）",
+    }.get(verdict, f"🔴 门禁判定: {verdict}")
+    print(verdict_line)
     print(f"📝 报告: {report_path}")
-    sys.exit(0 if verdict == "PASS" else 1)
+    # [本质修 2026-09-28] 退出码三值: PASS=0 / FAIL=1 / UNVERIFIED=3。
+    # rc=2 已被基础设施错误(参数非法/PDF 不可解析)占用, UNVERIFIED 是"判定已出
+    # 但证据不足以放行", 与基础设施故障不是一类, 故不复用 2。
+    # [A1 2026-09-28] 该映射抽为契约 exit_codes(tools/contracts/dnt.json), 见 exit_code_for。
+    sys.exit(exit_code_for(verdict))
 
 
 if __name__ == "__main__":

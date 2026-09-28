@@ -1,0 +1,42 @@
+{
+  "contract": "dnt",
+  "version": 1,
+  "title": "文献区禁汉化（第四断言）",
+
+  "rule": {
+    "id": "REF_NO_SINICIZE",
+    "statement": "译文的参考文献区必须整条原样保留、不得汉化。被声明为禁翻的页面中，若检出被汉化的文献条目，即判事故（存在性：>= zh_min 条即事故，无数量配额）。",
+    "text": "6. 参考文献区不得汉化：行首 [n] 的编号制条目，或行首“姓名 (年份)”的作者-年份制条目，\n   整条原样保留 —— 人名/标题/期刊名/年份/卷期页/DOI/URL 一律不译、不改写、不重排、不换标点；\n   正文中的行内引用照常处理。若某段整段都是文献条目，原样输出该段即可。",
+    "granularity": "page",
+    "verification_granularity": "page",
+    "notes": [
+      "声明是段级（manifest 逐段 manifest_item_flag），核验按页级（取声明段的 true_page 并集）。",
+      "一切判据取原文页形态；译文页不可用——条目一旦被汉化，行首 [n] 会被 pypdf 拆散。",
+      "本契约先于实现声明：seg_export 据此写声明，post_check/adopt 据此比对与定退出码。"
+    ]
+  },
+
+  "declaration": {
+    "modes": ["seg", "refs"],
+    "manifest_top_level_flag": "dnt_declared",
+    "manifest_item_flag": "dnt",
+    "payload_line_prefix": "[禁翻] ",
+    "payload_seg_token_pattern": "^S\\d+$"
+  },
+
+  "verdicts": ["PASS", "FAIL", "UNVERIFIED"],
+
+  "exit_codes": {
+    "PASS": 0,
+    "FAIL": 1,
+    "UNVERIFIED": 3
+  },
+
+  "reserved_exit_codes": {
+    "INFRA": 2
+  },
+
+  "thresholds": {
+    "zh_min": 1
+  }
+}

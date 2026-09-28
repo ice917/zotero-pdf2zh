@@ -591,6 +591,14 @@ def sandbox_gates(job, ids, got):
         env = dict(os.environ, P2Z_TABLE_DIR=tmp)
         if job.get("sidecar"):
             env["P2Z_PROJ"] = tmp
+            # [沙箱 fail-closed] 只 pin P2Z_PROJ 不够 —— seg_import/adopt 的 INBOX 与
+            # LEDGER 各有**独立**的环境变量出口(P2Z_INBOX / P2Z_LEDGER), 只有它们缺省时
+            # 才落到 <PROJ> 下。面板父进程 env 一旦带着这两个(relay 启动脚本就显式设
+            # P2Z_INBOX), 子进程照单全收 → 返工单 / 回锚台账**绕过沙箱写进真实 inbox/日志**,
+            # 与"检查阶段不落任何文件"的承诺相悖。这里一并 pin 进 tmp, 与 P2Z_PROJ 同步。
+            # 返工单不会因此丢失: _persist_rework 在删 tmp 前会把它拷回真实的 wc.INBOX。
+            env["P2Z_INBOX"] = os.path.join(tmp, "inbox")
+            env["P2Z_LEDGER"] = os.path.join(tmp, "logs", "reanchor_ledger.jsonl")
         p = subprocess.run(job["cmd"](), cwd=tmp, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", env=env)
         out = (p.stdout or "").splitlines()

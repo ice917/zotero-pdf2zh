@@ -59,15 +59,21 @@ def norm(s: str) -> str:
 
 
 def load_pages(pdf: str):
-    """[(页码, 归一化文本)], 提取失败的页文本为空。"""
+    """[(页码, 归一化文本, 提取是否成功)]。
+
+    [门禁 fail-closed] 提取抛异常时**不能**把该页文本当空串: 空串会让 --forbid 串
+    "必然找不到"从而假通过(UNKNOWN≠PASS), 也会让 --expect 的 0 命中失去解释力。故
+    单独记 ok=False, 由 main 判 FAIL 并要求人工看这一页。
+    """
     reader = PdfReader(pdf)
     pages = []
     for i, page in enumerate(reader.pages):
         try:
             t = page.extract_text() or ""
+            ok = True
         except Exception:
-            t = ""
-        pages.append((i + 1, norm(t)))
+            t, ok = "", False
+        pages.append((i + 1, norm(t), ok))
     return pages
 
 
@@ -77,7 +83,7 @@ def hits(pages, needle: str):
     if not key:
         return []
     out = []
-    for pno, text in pages:
+    for pno, text, _ok in pages:
         c = text.count(key)
         if c:
             out.append((pno, c))
@@ -109,8 +115,14 @@ def main() -> int:
         return 1
 
     pages = load_pages(pdf)
-    empty = sum(1 for _, t in pages if not t)
+    empty = sum(1 for _, t, _ in pages if not t)
+    bad = [p for p, _, ok in pages if not ok]
     out = [f"PDF: {pdf}", f"页数 {len(pages)}" + (f" / 提取为空 {empty} 页" if empty else ""), ""]
+    if bad:
+        out.append("[FAIL] 文本提取失败 第%s页 —— 无法证明这些页的串有无, 按 fail-closed"
+                   " 判 FAIL(不把'读不出'当'没有'), 请人工核对这些页"
+                   % ",".join(map(str, bad)))
+        out.append("")
 
     failed = 0
     for label, items, want in (("期望", args.expect, True), ("禁止", args.forbid, False)):
@@ -124,11 +136,14 @@ def main() -> int:
     out.append("")
     out.append(f"通过 {len(args.expect) + len(args.forbid) - failed}"
                f" / 共 {len(args.expect) + len(args.forbid)}; FAIL {failed}")
+    if bad:
+        out.append("提示: 有页文本提取失败 —— 该页结论不可信, 已整体判 FAIL, "
+                   "请人工核对该页后再判定。")
     if failed:
         out.append("提示: 强制重渲染要用 force:true 且 config 写全(service/targetLang/"
                    "threadNum/mono/dual/skipSubsetFonts); 仍不生效则 kill 全部 python 后重启。")
     print("\n".join(out))
-    return 1 if failed else 0
+    return 1 if (failed or bad) else 0
 
 
 if __name__ == "__main__":

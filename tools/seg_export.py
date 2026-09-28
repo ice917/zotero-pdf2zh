@@ -58,6 +58,7 @@ sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8")
 import engine as _ENG                                     # noqa: E402
 import lessons as _LES                                    # noqa: E402
 import text_clean as _TC                                  # noqa: E402 不可见字符剥离(两侧同源)
+import dnt_contract as _DNT                               # noqa: E402 文献区禁汉化契约(先于实现)
 _PROF = _ENG.active()
 SIDECAR = _PROF.sidecar or ""
 PROJ = os.environ.get("P2Z_PROJ", r"D:\zotero-pdf2zh")
@@ -94,9 +95,7 @@ RULES = """[文档] {doc}第{pages}页
    自查办法：数一数载荷该段的 ⋮ 个数，再数一数你译文里的 ⋮ 个数，两个数必须相等；
    再确认 ⋮ 左右两侧的内容与载荷 ⋮ 左右两侧一一对应。
 {terms}5. 中文通顺为学术散文，不要翻译腔；段内语序可按中文习惯调整，但事实与数字不得增减。
-6. 参考文献区不得汉化：行首 [n] 的编号制条目，或行首"姓名 (年份)"的作者-年份制条目，
-   整条原样保留 —— 人名/标题/期刊名/年份/卷期页/DOI/URL 一律不译、不改写、不重排、不换标点；
-   正文中的行内引用照常处理。若某段整段都是文献条目，原样输出该段即可。
+{rule6}
 7. 公式片段（变量、符号、运算符、上下标及其紧邻的标点或编号连成的一串）是一整块：
    整块逐字符照抄，块内不得插入中文、不得增删或改动任何一个字符；要调整语序就把中文放在块外。
    宁可读起来别扭、甚至略有冗余，也不要拆开这块去"理顺"。
@@ -315,6 +314,47 @@ def first_word(text):
     return m.group(1) if m else ""
 
 
+def _key_num(key):
+    """'S15' -> 15（声明行按阅读序排稳定用）。"""
+    s = str(key)[1:]
+    return int(s) if s.isdigit() else 0
+
+
+def parse_dnt_seg(spec):
+    """解析 --dnt-seg 的点名列表（逗号分隔, 允许带 # 前缀）-> 集合; 非法记号抛 ValueError。
+
+    显式点名**覆盖** --dnt-refs 的自动判据: 门禁只认这一份声明, 人可纠自动判据的偏。
+    """
+    out = set()
+    for tok in (spec or "").split(","):
+        tok = tok.strip().lstrip("#").strip()
+        if not tok:
+            continue
+        if not re.fullmatch(_DNT.seg_token_pattern(), tok):
+            raise ValueError(tok)
+        out.add(tok)
+    return out
+
+
+def dnt_auto_keys(items):
+    """--dnt-refs 的自动判据: 按阅读序找**首个文献区标题**段, 从它起至末尾全判禁翻。
+
+    与门禁侧判据**同源**（复用 post_check.is_ref_heading / REF_HEADING, 一处定义）,
+    但**粒度/信号不同**: 这里只看标题锚（段级、阅读序）; 门禁的覆盖审计用 is_ref_page
+    （密度臂, 独立于标题锚）—— 两信号不同源, 差异即报 UNVERIFIED。
+    惰性导入 post_check: 常规导出路径（不用 --dnt-refs）不该被 pypdf 拖累。
+    """
+    import post_check as _PC
+    keys, hit = set(), False
+    for it in items:
+        text = "\n".join(p[2] for p in it["parts"])
+        if not hit:
+            hit = any(_PC.is_ref_heading(ln) for ln in text.splitlines())
+        if hit:
+            keys.add(it["key"])
+    return keys
+
+
 def _emit(args, items, merged_log, warnings, pages_str, source=None):
     """载荷 + manifest 落盘与报告 —— **两个引擎共用**(免得两边的编号/manifest 慢慢漂移)。
 
@@ -324,6 +364,29 @@ def _emit(args, items, merged_log, warnings, pages_str, source=None):
     """
     for n, it in enumerate(items, 1):
         it["key"] = "S%d" % n
+
+    # [DNT 声明] 整篇路线的文献区授权: 显式声明哪几段禁翻, 写进载荷与 manifest。
+    # 这是"契约先于产物"——门禁据此比对, 而非从产物反推该豁免谁。--dnt-seg 点名
+    # 覆盖 --dnt-refs 的自动判据; 一律 getattr 取, 防外部构造 args 时不带这两属性。
+    _dnt_seg = getattr(args, "dnt_seg", "") or ""
+    _dnt_refs = bool(getattr(args, "dnt_refs", False))
+    dnt_declared = bool(_dnt_seg) or _dnt_refs
+    try:
+        if _dnt_seg:
+            dnt_keys = parse_dnt_seg(_dnt_seg)
+        elif _dnt_refs:
+            dnt_keys = dnt_auto_keys(items)
+        else:
+            dnt_keys = set()
+    except ValueError as e:
+        print("FAIL: --dnt-seg 非法记号 %r（须形如 S15 或 #S15, 逗号分隔）" % (e.args[0],))
+        return 1
+    _unknown = dnt_keys - {it["key"] for it in items}
+    if _unknown:
+        print("FAIL: --dnt-seg 点名了不存在的段 %s（本次导出共 %d 段）"
+              % (",".join(sorted(_unknown, key=_key_num)), len(items)))
+        return 1
+    dnt_ordered = sorted(dnt_keys, key=_key_num)
 
     doc = args.doc.strip()
     if args.terms == TERMS_CSV and not os.path.exists(TERMS_CSV):
@@ -335,9 +398,15 @@ def _emit(args, items, merged_log, warnings, pages_str, source=None):
     lessons_block = _LES.block()
     lines = [RULES.format(doc=(doc + " ") if doc else "",
                           pages=pages_str,
+                          rule6=_DNT.rule_text(),
                           terms=terms_line(args.terms))
              + (_PH_RULE if source else "")
              + (("\n" + lessons_block) if lessons_block else "")]
+    if dnt_ordered:
+        # 声明行放 #S1 之前(抬头区): 下游沿 "#S" 切段不受它干扰, 同时它随载荷发给
+        # 翻译端 —— "哪些段禁翻"对上下游都可见, 不再只靠提示词里的一句规则。
+        lines.append(_DNT.payload_line_prefix()
+                     + ",".join("#" + k for k in dnt_ordered))
     for it in items:
         lines.append("#%s" % it["key"])
         body = ""
@@ -347,6 +416,10 @@ def _emit(args, items, merged_log, warnings, pages_str, source=None):
             body += text
         lines.append(body)
     manifest = {"name": args.name, "pages": pages_str, "items": []}
+    if dnt_declared:
+        # 顶层布尔区分"声明为空(确实无 DNT)"与"未声明(legacy 载荷)": 前者门禁可判
+        # 空真通过, 后者门禁只能判 UNVERIFIED —— 二者不可混作一谈。
+        manifest[_DNT.manifest_top_level_flag()] = True
     if args.pdf:
         # [v28.53] 载荷锚定原文: 面板据此把"最新 payload"自动对到它自己的原文 PDF
         # (换论文不用再手设 P2Z_BODY_PDF)。旧载荷没这字段时面板回落服务器 history。
@@ -376,6 +449,8 @@ def _emit(args, items, merged_log, warnings, pages_str, source=None):
             rec["fp"] = _ENG.text_fp(it["parts"][-1][2])
             if (it.get("batch") or (None,))[0] is not None:
                 rec["batch"] = list(it["batch"])
+        if it["key"] in dnt_keys:
+            rec[_DNT.manifest_item_flag()] = True
         manifest["items"].append(rec)
 
     os.makedirs(INBOX, exist_ok=True)
@@ -391,6 +466,14 @@ def _emit(args, items, merged_log, warnings, pages_str, source=None):
     n_cross = sum(1 for it in items if it.get("pool") == "cross_page")
     print("payload: %s (%d 段 / %d 原文字符%s)" % (
         p_txt, len(items), total, ("; 其中跨页池 %d 段" % n_cross) if source else ""))
+    if dnt_declared:
+        if dnt_ordered:
+            print("  %s%d 段声明保持原文（%s）"
+                  % (_DNT.payload_line_prefix(), len(dnt_ordered),
+                     ",".join("#" + k for k in dnt_ordered)))
+        else:
+            print("  %s空声明: 本次导出范围内无文献区（门禁据此判空真通过）"
+                  % _DNT.payload_line_prefix())
     for m in merged_log:
         print("  " + m)
     for w in warnings:
@@ -558,6 +641,10 @@ def main():
     ap.add_argument("--terms", default=TERMS_CSV,
                     help="术语表 csv (english,chinese 无表头); 缺省 %s; 传空串则不注入具体术语" % TERMS_CSV)
     ap.add_argument("--force", action="store_true", help="续接检测失败也照常导出(逐段独立)")
+    ap.add_argument("--dnt-refs", action="store_true",
+                    help="声明文献区(首个参考文献标题起至末尾)禁翻, 写进载荷与 manifest")
+    ap.add_argument("--dnt-seg", default="",
+                    help="显式点名禁翻段(逗号分隔, 如 S15,S16); 覆盖 --dnt-refs 的自动判据")
     args = ap.parse_args()
 
     # 引擎接线门禁: 未接线的引擎在这里拦下, 免得下游报一个看不懂的"侧车不存在: "。

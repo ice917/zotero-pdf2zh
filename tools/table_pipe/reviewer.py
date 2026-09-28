@@ -349,7 +349,13 @@ def _chat(prompt, cfg, timeout=TIMEOUT):
         except Exception:
             pass
         raise RuntimeError("HTTP %s %s" % (e.code, detail))
-    return (data.get("choices") or [{}])[0].get("message", {}).get("content") or ""
+    ch0 = (data.get("choices") or [{}])[0]
+    # [门禁 fail-closed] finish_reason=="length" = 回包被 max_tokens 截断, JSON 多半
+    # 半截。截断的载荷**不能**当可信结果(残缺 JSON 万一还能解析出前几项, 就会被当成
+    # "这一块审完了、其余没问题")。这里直接当失败抛出, 由上层计入 n_failed 并点名。
+    if str(ch0.get("finish_reason") or "") == "length":
+        raise RuntimeError("回包被 max_tokens(%d) 截断, 该块结论不可信" % MAX_TOKENS)
+    return ch0.get("message", {}).get("content") or ""
 
 
 def _norm_kind(kind):
@@ -360,18 +366,23 @@ def _norm_kind(kind):
     return "其他"
 
 
-def parse_items(content, valid_ids):
-    """模型回包 -> 规范化条目列表。**宽容解析**: 围栏/前后废话都容忍; 编号不在本块
-    范围内、或说明为空的条目直接丢弃(宁可少报, 不可把幻觉的段号写进清单)。"""
+def _parse_items(content, valid_ids):
+    """模型回包 -> (规范化条目列表, 错误串)。**宽容解析**: 围栏/前后废话都容忍;
+    编号不在本块范围内、或说明为空的条目直接丢弃(宁可少报, 不可把幻觉的段号写进清单)。
+
+    [门禁 fail-closed] 与"解析成功、但本块无存疑([])"必须分开: 回包里找不到 JSON
+    数组、JSON 解析失败、或不是数组时返回**非空错误串** —— 那是"这一块没审出来",
+    不是"这一块没问题"。上层据此计入 n_failed, 不再把解析失败静默当成 0 条存疑。
+    """
     m = re.search(r"\[.*\]", content or "", flags=re.S)
     if not m:
-        return []
+        return [], "回包里找不到 JSON 数组(模型未按格式回包)"
     try:
         arr = json.loads(m.group(0))
-    except Exception:
-        return []
+    except Exception as e:
+        return [], "回包 JSON 解析失败: %s" % e
     if not isinstance(arr, list):
-        return []
+        return [], "回包 JSON 不是数组"
     low = {str(v).lower(): str(v) for v in valid_ids}
     out, seen = [], set()
     for it in arr:
@@ -388,7 +399,12 @@ def parse_items(content, valid_ids):
             continue
         seen.add(row[:4])
         out.append(row)
-    return out
+    return out, ""
+
+
+def parse_items(content, valid_ids):
+    """模型回包 -> 规范化条目列表(只取条目, 丢弃错误串; 供 report 等调用方沿用)。"""
+    return _parse_items(content, valid_ids)[0]
 
 
 def _audit_chunk(chunk, doc, terms, cfg):
@@ -398,7 +414,7 @@ def _audit_chunk(chunk, doc, terms, cfg):
         content = _chat(_prompt(chunk, doc, terms), cfg)
     except Exception as e:
         return [], "%s" % e
-    return parse_items(content, ids), ""
+    return _parse_items(content, ids)
 
 
 def audit(pairs, doc="", terms=None, cfg=None, workers=WORKERS, log=None):
@@ -446,7 +462,10 @@ def audit(pairs, doc="", terms=None, cfg=None, workers=WORKERS, log=None):
         logs.append("存疑 %d 条, 只保留前 %d 条。" % (len(items), MAX_ITEMS))
         items = items[:MAX_ITEMS]
 
-    r = {"ok": True, "items": items, "n_units": len(pairs), "n_chunks": len(chunks),
+    # [门禁 fail-closed] 全块都失败 = 这一篇根本没审出来, 与"审过、结论是没问题"是
+    # 两回事。至少要有一块审成, ok 才为真; 有块失败时失败块数在 n_failed 里点名。
+    ok = failed < len(chunks)
+    r = {"ok": ok, "items": items, "n_units": len(pairs), "n_chunks": len(chunks),
          "n_failed": failed, "chars": sum(len(a) + len(b) for _, a, b in pairs),
          "secs": round(time.time() - t0, 1), "model": cfg["model"], "report": "",
          "logs": logs}

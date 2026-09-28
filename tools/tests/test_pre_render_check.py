@@ -129,10 +129,11 @@ def main():
 
     # ---------- ③ 判据: 编号制 ----------
     o = ofeat([numbered()])
-    fs, bad = PR.check_pages(o, {1: numbered()})
+    fs, bad = PR.check_pages(o, {1: numbered()}, dnt_pages={1}, covered_pages={1})
     check("③ 编号制·条目保持英文 → 通过", not bad and len(fs) == 1
           and fs[0][0] == "通过", fs)
-    fs, bad = PR.check_pages(o, {1: numbered(zh=True)})
+    fs, bad = PR.check_pages(o, {1: numbered(zh=True)},
+                             dnt_pages={1}, covered_pages={1})
     check("③ 编号制·条目被汉化 → 高危 FAIL", bool(bad) and bad[0][0] == "高", fs)
     check("③ FAIL 结论带页码与条数",
           bool(bad) and "第1页" in bad[0][1] and "15条" in bad[0][2], bad)
@@ -143,9 +144,9 @@ def main():
           PC.is_ref_page(oa[0]), oa[0]["ref_ay_density"])
     check("③b 原文侧无行首 [n]（否则这条测的不是 AY 臂）",
           oa[0]["ref_entries"] == 0, oa[0]["ref_entries"])
-    fs, bad = PR.check_pages(oa, {1: ay()})
+    fs, bad = PR.check_pages(oa, {1: ay()}, dnt_pages={1}, covered_pages={1})
     check("③b 作者-年份制·条目保持英文 → 通过", not bad, fs)
-    fs, bad = PR.check_pages(oa, {1: ay(zh=True)})
+    fs, bad = PR.check_pages(oa, {1: ay(zh=True)}, dnt_pages={1}, covered_pages={1})
     check("③b 作者-年份制·条目被汉化 → 高危 FAIL", bool(bad), fs)
 
     # ---------- ③c 非文献页不参与 ----------
@@ -153,30 +154,48 @@ def main():
             "数值仿真表明所提机制在保持一致性的同时保护了初始历史。" * 20)
     ob = ofeat([body])
     check("③c 正文页不被判为文献页", not PC.is_ref_page(ob[0]), ob[0]["ref_density"])
-    fs, bad = PR.check_pages(ob, {1: body})
-    check("③c 正文页全中文也不产生文献区结论", not ref_finding(fs), fs)
+    fs, bad = PR.check_pages(ob, {1: body}, dnt_pages=set(), covered_pages=set())
+    check("③c 正文页全中文也不产生文献区结论",
+          not any(f[0] in ("高", "未验证") for f in ref_finding(fs)), fs)
 
     # ---------- ③d 被跳页的文献页(无译文)不误判 ----------
-    fs, bad = PR.check_pages(o, {})
+    fs, bad = PR.check_pages(o, {}, dnt_pages=set(), covered_pages=set())
     check("③d 文献页无译文(跳页) → 不判汉化", not bad, fs)
 
     # ---------- ④ 同源: 与 post_check.run_checks 结论一致 ----------
     # 这是前移成立的前提 —— 同一份内容两边必须同判。
-    def parity(orig_feats, text):
-        """渲染前预检与渲染后门禁是否同判。返回两边的高危判定(相等才合格)。"""
-        pre = [f for f in PR.check_pages(orig_feats, {1: text})[0] if f[0] in ("高", "中")]
-        post = [f for f in PC.run_checks(orig_feats, [PC.text_features(text, 1)])[0]
-                if f[0] in ("高", "中")]
+    def parity(orig_feats, text, dnt_pages, covered_pages):
+        """渲染前预检与渲染后门禁是否同判。返回两边的高危判定(相等才合格)。
+        两边必须拿到同一份 DNT 声明, 否则比的不是同一条判据。"""
+        pre = [f for f in PR.check_pages(
+            orig_feats, {1: text}, dnt_pages=dnt_pages,
+            covered_pages=covered_pages)[0] if f[0] in ("高", "中")]
+        post = [f for f in PC.run_checks(
+            orig_feats, [PC.text_features(text, 1)],
+            dnt_pages=dnt_pages, covered_pages=covered_pages)[0]
+            if f[0] in ("高", "中")]
         return bool(pre), bool(post)
 
-    a, b = parity(o, numbered())
+    a, b = parity(o, numbered(), {1}, {1})
     check("④ 同源·编号制良好 → 两边都 PASS", a is False and b is False, (a, b))
-    a, b = parity(o, numbered(zh=True))
+    a, b = parity(o, numbered(zh=True), {1}, {1})
     check("④ 同源·编号制汉化 → 两边都 FAIL", a is True and b is True, (a, b))
-    a, b = parity(oa, ay())
+    a, b = parity(oa, ay(), {1}, {1})
     check("④ 同源·作者-年份制良好 → 两边都 PASS", a is False and b is False, (a, b))
-    a, b = parity(oa, ay(zh=True))
+    a, b = parity(oa, ay(zh=True), {1}, {1})
     check("④ 同源·作者-年份制汉化 → 两边都 FAIL", a is True and b is True, (a, b))
+
+    # ---------- ④b 无声明: 两边都不拿启发式反推, 判"未验证" ----------
+    # 声明缺失时, "文献区被汉化"在渲染前后都没有可比对的契约量 —— 正确反应是
+    # 判"未验证", 而不是拿启发式反推一个"通过"(漏报) 或"高危"(误报)。同时预检
+    # 必须保持不阻断(未验证留给 gate 出 rc=3), 否则无声明会让整条管线在出 PDF
+    # 之前死锁。
+    fs, bad = PR.check_pages(o, {1: numbered(zh=True)})
+    check("④b 无声明预检不阻断(未验证留给 gate rc=3)",
+          not bad and any(f[0] == "未验证" for f in fs), fs)
+    a, b = parity(o, numbered(zh=True), None, None)
+    check("④b 无声明两边都不断言高危(证据不足≠确定缺陷)",
+          a is False and b is False, (a, b))
 
     # ---------- ⑤ CLI 兜底 ----------
     tmp5 = tempfile.mkdtemp(prefix="p2z_prerender_cli_")

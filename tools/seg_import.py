@@ -760,14 +760,24 @@ def reanchor(seg_zh, raw, vars_):
             continue
         toks.append((vn, val, pre, core, post))
 
-    taken, placed, rest = [], {}, []
-    for t in sorted(toks, key=lambda x: -len(x[3])):    # ① 长 core 优先
+    taken, placed = [], {}
+    rest_idx = set()
+    for i, t in sorted(enumerate(toks), key=lambda it: -len(it[1][3])):  # ① 长 core 优先
         free = _free_spans(_core_pattern(t[3]), seg_zh, taken)
         if len(free) == 1:
             placed[t[0]] = free[0]
             taken.append(free[0])
         else:
-            rest.append(t)
+            rest_idx.add(i)
+
+    # [v28.90] ② 必须按**原文顺序**(toks 序)推进 —— 上面 ① 的"长 core 优先"排序
+    #   只决定"谁有资格占全局唯一落点", 不能沿用到 ②。若 ② 也按 core 长度降序,
+    #   游标会被**靠后**的长 token 先推到后面, 于是**靠前**的短 token 只能退到
+    #   "离游标最近"的落点; 而 _core_pattern 的空白弹性(`\s*`)会在译文别处再造
+    #   一个假落点(短字形 `0.1` 跨空格命中长刻度 `0.0 0`), 短 token 就被锚到错
+    #   位置、长 token 反被判 FAIL。实测 Bisicchia 篇右轴刻度 `0.1` 三连假 FAIL
+    #   即此因: 改回原文序后三处全消、无副作用。
+    rest = [toks[i] for i in range(len(toks)) if i in rest_idx]
 
     cursor = 0
     for t in rest:                                      # ② 原文顺序 + 单调游标

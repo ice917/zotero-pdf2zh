@@ -100,14 +100,19 @@ def build_features(orig_pdf, trans_pages):
     return orig, trans_features(trans_pages, n)
 
 
-def check_pages(orig_feats, trans_pages):
+def check_pages(orig_feats, trans_pages, dnt_pages=None, covered_pages=None):
     """渲染前预检的完整判据: 原文特征 + 译文 → (findings, 高危项)。
 
     与 post_check 的差别只有文本来源（一个从 PDF 抽、一个从 imported.json 拼），
     判据本身是同一个 check_ref_zh —— 这是本工具存在的全部理由。
+
+    [本质修 2026-09-28] dnt_pages/covered_pages 来自 export 的 manifest（DNT 声明）;
+    缺省 None = 无声明, check_ref_zh 判「未验证」—— 但预检只对"高/中"fail-closed
+    阻断, "未验证"不在此拦(它属证据不足, 不是确定缺陷), 留给最终 gate 出 rc=3。
     """
     trans = trans_features(trans_pages, len(orig_feats))
-    findings = PC.check_ref_zh(orig_feats, trans)
+    findings = PC.check_ref_zh(orig_feats, trans,
+                               dnt_pages=dnt_pages, covered_pages=covered_pages)
     return findings, [f for f in findings if f[0] in ("高", "中")]
 
 
@@ -117,6 +122,8 @@ def main():
     ap.add_argument("--imported", required=True,
                     help="回锚后的译文 out/<name>.imported.json")
     ap.add_argument("--quiet", action="store_true", help="只打印结论")
+    ap.add_argument("--manifest", default=None,
+                    help="seg_export 生成的 manifest.json: 提供 DNT 声明(与最终门禁同源)")
     args = ap.parse_args()
 
     for p in (args.original, args.imported):
@@ -124,9 +131,21 @@ def main():
             print("[pre-render] 找不到: %s" % p)
             return 1
 
+    # [本质修 2026-09-28] 读 DNT 声明(与 post_check 同一份 manifest 语义)。
+    dnt_pages, covered_pages = None, None
+    if args.manifest:
+        try:
+            _dp, _cp, _declared = PC.load_dnt_manifest(args.manifest)
+        except Exception as exc:
+            print("[pre-render] --manifest 无法读取/解析: %s" % exc)
+            return 2
+        if _declared:
+            dnt_pages, covered_pages = _dp, _cp
+
     trans_pages = load_trans_pages(args.imported)
     orig, _ = build_features(args.original, trans_pages)
-    findings, bad = check_pages(orig, trans_pages)
+    findings, bad = check_pages(orig, trans_pages,
+                                dnt_pages=dnt_pages, covered_pages=covered_pages)
 
     if not args.quiet:
         print("[pre-render] 原文 %d 页 / 译文覆盖 %d 页 / 判据 %d 条"

@@ -235,6 +235,66 @@ def main():
         check("⑦ manifest 跨页 parts",
               [p["page"] for p in man["items"][0]["parts"]] == [2, 3], man["items"][0])
 
+        # ---- ⑱ [DNT 声明] --dnt-seg 显式点名: 契约写进载荷与 manifest ----
+        # 断言4(文献区禁汉化)的本质修法: 让 seg_export 产出**机器可读的禁翻声明**,
+        # 门禁拿着声明比对, 而不是从产物反推该豁免谁(黑名单/代理量/二值判定)。
+        # ⑱ 锁"显式点名"这条产出路径:
+        #   · 载荷抬头区出现 [禁翻] #S2, 且置于 #S1 **之前**(按 "#S" 切段不受扰)
+        #   · manifest 顶层 dnt_declared=True(区分"空声明"与"未声明")
+        #   · 被点名段 rec["dnt"]=True, 未点名段无该键
+        # 声明用 S2 不用 S1: 载荷里 [禁翻] #S1 会让 txt.index("#S1") 命中声明行,
+        # 与 ⑦ 的切段口径打架。
+        root = make_root(tmp)
+        side = write_sidecar(root)
+        rc, out, err = run(root, ["--pages", "2-3", "--name", "d1", "--sidecar", side,
+                                  "--terms", "", "--dnt-seg", "S2"])
+        txt = read_payload(root, "d1") if rc == 0 else ""
+        check("⑱ 显式点名导出成功", rc == 0, (rc, out, err))
+        check("⑱ 载荷据声明出 [禁翻] 行", "[禁翻] #S2" in txt, txt[:300])
+        check("⑱ 未点名段不进声明", "[禁翻] #S1" not in txt, txt[:300])
+        _dl = txt.splitlines()
+        check("⑱ 声明行置于 #S1 之前(切段不受扰)",
+              next(i for i, l in enumerate(_dl) if l.startswith("[禁翻]"))
+              < next(i for i, l in enumerate(_dl) if l.startswith("#S1")), txt[:300])
+        check("⑱ 控制台报出声明段数", "[禁翻] 1 段声明保持原文（#S2）" in out, out)
+        with open(os.path.join(root, "inbox", "d1.manifest.json"), encoding="utf-8") as f:
+            mand1 = json.load(f)
+        check("⑱ manifest 顶层 dnt_declared=True", mand1.get("dnt_declared") is True, mand1)
+        _d1 = {it["key"]: it for it in mand1["items"]}
+        check("⑱ 被点名段 rec['dnt']=True", _d1.get("S2", {}).get("dnt") is True, mand1["items"])
+        check("⑱ 未点名段不带 dnt 键", "dnt" not in _d1.get("S1", {}), mand1["items"])
+
+        # ---- ⑲ [DNT 声明] --dnt-refs 自动判据落空 -> 空声明(仍 dnt_declared) ----
+        # SIDECAR 无文献标题 -> 自动判据命中为空。此时必须与"未声明"**区分开**:
+        # 顶层仍写 dnt_declared=True(作者确实声明了"本次范围内无文献区"), 载荷不出
+        # [禁翻] 行。门禁据此判空真通过; 若误当未声明, 会退化成 UNVERIFIED。
+        root = make_root(tmp)
+        side = write_sidecar(root)
+        rc, out, err = run(root, ["--pages", "2-3", "--name", "d2", "--sidecar", side,
+                                  "--terms", "", "--dnt-refs"])
+        txt = read_payload(root, "d2") if rc == 0 else ""
+        check("⑲ --dnt-refs 自动判据导出成功", rc == 0, (rc, out, err))
+        check("⑲ 无文献标题 -> 载荷无 [禁翻] 行", "[禁翻]" not in txt, txt[:300])
+        check("⑲ 控制台报空声明", "空声明" in out, out)
+        with open(os.path.join(root, "inbox", "d2.manifest.json"), encoding="utf-8") as f:
+            mand2 = json.load(f)
+        check("⑲ 空声明仍写 dnt_declared=True(≠未声明)",
+              mand2.get("dnt_declared") is True, mand2)
+        check("⑲ 空声明下无段带 dnt 键",
+              all("dnt" not in it for it in mand2["items"]), mand2["items"])
+
+        # ---- ⑳ [DNT 声明] 非法/不存在记号必须拒收(不静默降级成无声明) ----
+        # 静默降级会制造"假未声明": 操作者以为声明生效, 门禁却判 UNVERIFIED(或更糟,
+        # 被当空声明判通过)。故非法记号与不存在的段一律 rc=1 拒收。
+        root = make_root(tmp)
+        side = write_sidecar(root)
+        rc, out, err = run(root, ["--pages", "2-3", "--name", "d3", "--sidecar", side,
+                                  "--terms", "", "--dnt-seg", "BOGUS"])
+        check("⑳ 非法记号拒收 rc=1", rc == 1 and "非法记号" in out, (rc, out))
+        rc, out, err = run(root, ["--pages", "2-3", "--name", "d3", "--sidecar", side,
+                                  "--terms", "", "--dnt-seg", "S99"])
+        check("⑳ 不存在的段拒收 rc=1", rc == 1 and "不存在的段" in out, (rc, out))
+
         # ---- ⑧ 第四断言(文献区禁汉化)的口径必须写进 payload 规则 ----
         # 跨类型实跑: 6 篇的"文献区汉化"FAIL 就是规则里没这一条; 其中中段文献区
         # (Melhani p43-44/50)连 skipLastPages 都救不了, 那些段必然进 payload,

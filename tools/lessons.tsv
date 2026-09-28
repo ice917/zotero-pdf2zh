@@ -2,43 +2,53 @@
 # 格式: 类型<TAB>证据<TAB>上下文<TAB>日期
 # 类型: GLYPH=字形整块 / MOVE=断点两侧错位 / OTHER=编号与空段类
 # 删掉某行即不再注入; 清空本文件即回到纯静态规则。
-GLYPH	36.	36. Komari, T., Hiei, Y., Saito, Y., Murai, N. & Kumashiro, T. …	2026-09-25
-GLYPH	86,51–61(1973).	…smission of action potentials in Biophytum. Bot. Mag. Tokyo 86,51–61(…	2026-09-25
-GLYPH	165–174(1996).	…n of transformants free from selection markers. Plant J.10, 165–174(1…	2026-09-25
-GLYPH	.10,	…gation of transformants free from selection markers. Plant J.10, 165–…	2026-09-25
-GLYPH	7.0	with 50 mM EGTA, and the pH was adjusted to 7.0 using KOH and HCl. Pin…	2026-09-25
-GLYPH	1.5	…e into the solution. The isolated pinnae were inserted into 1.5-ml tu…	2026-09-25
-GLYPH	113,	…d with Paraﬁlm to the tubes, and placed in an incubator (LU-113, ESPE…	2026-09-25
-GLYPH	027255)	… can be found in GenBank with the accession numbers pSB1 (AB027255) a…	2026-09-25
-GLYPH	027256).	…Bank with the accession numbers pSB1 (AB027255) and pSB11(AB027256). …	2026-09-25
-GLYPH	731322)	… DNA Data Bank of Japan with the accession numbers ELP1B1(LC731322) a…	2026-09-25
-GLYPH	=0.60).	…10d–f) were corrected by non-linear adjustment (gamma value =0.60).	2026-09-25
-GLYPH	190	…ca S9D, Leica Microsystems) equipped with a camera (Leica MC190 HD, L…	2026-09-25
-GLYPH	.10	…s acquired using a Leica S9D microscope (Sup- plementary Fig.10d–f) w…	2026-09-25
-GLYPH	(53×39×32	…l bins containing leaves were placed in a plastic container (53×39×32…	2026-09-25
-GLYPH	,3–7	… white LED light. When the WT (control) leaves were expanded,3–7 adul…	2026-09-25
-GLYPH	2.5	… ~4 cm in length) or 2 caterpillars (Helicoverpa armigera, ~2.5 cm in…	2026-09-25
-GLYPH	23365	…ipt. This research was supported by grants from KAKENHI (21J23365 to …	2026-09-25
-GLYPH	07411	… was supported by grants from KAKENHI (21J23365 to T.H., 16K07411 and…	2026-09-25
-GLYPH	06715	…d by grants from KAKENHI (21J23365 to T.H., 16K07411 and 19K06715 to …	2026-09-25
-GLYPH	2+	… plants and performed genotyping. T.H. and T.M. performed Ca2+ imagin…	2026-09-25
-GLYPH	/10.1038/	supplementary material available at https://doi.org/10.1038/s41467-022…	2026-09-25
-GLYPH	41467	…upplementary material available at https://doi.org/10.1038/s41467-022…	2026-09-25
-GLYPH	34106	…ry material available at https://doi.org/10.1038/s41467-022-34106-x.	2026-09-25
-GLYPH	ö	…on Nature Communications thanks Simcha Lev- Yadun, Axel Mithöfer and …	2026-09-25
-GLYPH	/4.0/.	… this license, visit http://creativecommons.org/ licenses/by/4.0/.	2026-09-25
-GLYPH	4.0	…is article is licensed under a Creative Commons Attribution 4.0 Inter…	2026-09-25
-GLYPH	3×	…ase was analyzed by t-test using the criterion of a rise to 3× SD abo…	2026-09-25
-GLYPH	2+]cyt	…he following statistical analyses. The velocities of the [Ca2+]cyt in…	2026-09-25
-GLYPH	50	… by a two-tailed Wilcoxon matched-pairs signed rank test. IC50 for th…	2026-09-25
-GLYPH	3+	…airs signed rank test. IC50 for the inhibitory effects of La3+ was es…	2026-09-25
-GLYPH	1	…s were represented in the main text and Supplementary Table 1 for the…	2026-09-25
-GLYPH	ManufacturingLocationCarbon(kg)Δ(kg)Δ(%)	ManufacturingLocationCarbon(kg)Δ(kg)Δ(%) Taiwan(Baseline)1518.2—— Sout…	2026-09-25
-GLYPH	100	…first cut set of ACT3 specifications from more than several 100 cutti…	2026-09-25
-GLYPH	25/105(˜25%)	…nd validate the results, we randomly sample and cross-check 25/105(˜2…	2026-09-25
-GLYPH	LogicArea-basedDiearea,processnode,yield,GPAFabrication,Packaging	ModelInputDriverKeyParametersEmittedSourceTypes LogicArea-basedDiearea…	2026-09-25
-GLYPH	IMECLogicArea-basedDiearea,processnode,yieldFabrication,Packaging	…rea-basedDiearea,processnode,yield,GPAFabrication,Packaging IMECLogic…	2026-09-25
-GLYPH	Flash(SSD)Capacity-basedStoragecapacity(GB)Fabrication,Packaging	… DRAMCapacity-basedStoragecapacity(GB)Fabrication,Packaging Flash(SSD…	2026-09-25
-GLYPH	$4.80	…er kWh). For carbon emissions credits, ACT3 will default to $4.80 per…	2026-09-25
-GLYPH	(a)Bycarbonemissionssourcetype.(b)Bydevicecategorytype.(c)Bydevicesubsystemhierarchy.	…er,2026VincentT.Lee,BilgeAcun,ZacharyLewis,andCarole-JeanWu (a)Bycarb…	2026-09-25
-GLYPH	ModelInputDriverKeyParametersEmittedSourceTypes	ModelInputDriverKeyParametersEmittedSourceTypes LogicArea-basedDiearea…	2026-09-25
+OTHER	FAIL #S11 ⋮ 数量 0 != 预期 1		2026-09-27
+OTHER	FAIL #S155 普通段出现了 ⋮		2026-09-27
+OTHER	FAIL #S181 普通段出现了 ⋮		2026-09-27
+GLYPH	𝛿=0.25,	…d configurations than TVD for large circuits, especially at 𝛿=0.25, s…	2026-09-27
+GLYPH	(𝛿∈0.01,0.025)	…nce metrics. As in the previous plots, the strictest deltas (𝛿∈0.01,0…	2026-09-27
+GLYPH	𝛿=0.05,8.4%	…backend-independent: for most backends it is around 2–3% at 𝛿=0.05,8.…	2026-09-27
+GLYPH	2.2–2.6%),	…hieves a higher rate (11%) than the other backends (roughly 2.2–2.6%)…	2026-09-27
+GLYPH	𝛿≥0.05,	For 𝛿≥0.05, the overall behaviour is remarkably consistent across back…	2026-09-27
+GLYPH	14.1–15.2%.	…n 32.9% and 36.6%, and at 𝛿=0.1 they cluster tightly around 14.1–15.2…	2026-09-27
+GLYPH	14–15.5%	… 34.4% for fake_torino up to 36% for fake_faze), and around 14–15.5% …	2026-09-27
+GLYPH	𝛿=0.25	…. With Hellinger, the percentage of valid configurations at 𝛿=0.25 li…	2026-09-27
+GLYPH	𝛿∈0.1,0.25	…nd mainly appear in the stricter regime (𝛿=0.05), while for 𝛿∈0.1,0.2…	2026-09-27
+GLYPH	(𝛿=0.05),	…ffects are limited and mainly appear in the stricter regime (𝛿=0.05),…	2026-09-27
+GLYPH	𝛿	…dered parameter ranges, the choice of divergence metric and 𝛿 has a m…	2026-09-27
+GLYPH	𝑠𝑐,𝑡	…close a configuration comes to the optimal shot budget. Let 𝑠𝑐,𝑡 be t…	2026-09-27
+GLYPH	𝑜𝑡	…er of shots selected by configuration 𝑐 on trace 𝑡, and let 𝑜𝑡 be the…	2026-09-27
+GLYPH	𝑐	…. Let 𝑠𝑐,𝑡 be the number of shots selected by configuration 𝑐 on trac…	2026-09-27
+GLYPH	1	…vershooting (using more shots than necessary). Values below 1 indicat…	2026-09-27
+GLYPH	𝛿.	…defined as the lowest number of shots to satisfy the target 𝛿.	2026-09-27
+GLYPH	80/20	… each size group, we select the best configuration using an 80/20 spl…	2026-09-27
+GLYPH	180	Train/test protocol. Our dataset comprises 180 traces, each correspond…	2026-09-27
+GLYPH	(80%	… the configuration selected as best on the validation split (80% of t…	2026-09-27
+GLYPH	(20%).	…lidity percentage when evaluated on the held-out test split (20%). Re…	2026-09-27
+GLYPH	𝛿∈{0.10,0.25}	…3.33%, and both Hellinger and JS show 94.44% in some of the 𝛿∈{0.10,0…	2026-09-27
+GLYPH	𝛿=0.10	…n almost all settings, with the only exception being TVD at 𝛿=0.10 (9…	2026-09-27
+GLYPH	(94.44%).	…t all settings, with the only exception being TVD at 𝛿=0.10 (94.44%).…	2026-09-27
+GLYPH	,𝛿,	…figuration (selected on the validation split) for each (size,𝛿, dista…	2026-09-27
+GLYPH	SizeDistance𝜹Bestconf.(val)Validityontest(%)	SizeDistance𝜹Bestconf.(val)Validityontest(%) smalltvd0.05conf_7100.00 …	2026-09-27
+GLYPH	smallhellinger0.05conf_3567100.00	…ce𝜹Bestconf.(val)Validityontest(%) smalltvd0.05conf_7100.00 smallhell…	2026-09-27
+GLYPH	smallhellinger0.10conf_465100.00	…100.00 smalljs0.05conf_3650100.00 smalltvd0.10conf_35894.44 smallhell…	2026-09-27
+GLYPH	7–12	…tance) setting matches the optimal number of shots. Figures 7–12 are …	2026-09-27
+GLYPH	=1138.9)	…lue. TVD (conf_7) is the closest in absolute terms (AvgDiff =1138.9) …	2026-09-27
+GLYPH	=3258.3	…3567) and JS (conf_3650) exhibit larger deviations (AvgDiff =3258.3 a…	2026-09-27
+GLYPH	,𝛿=0.05.	Small circuits,𝛿=0.05. Figure 7 shows that, for the strictest 𝛿 consid…	2026-09-27
+GLYPH	=1075.0,	… AvgDiff =847.2, MedRatio =2.06) and JS (conf_3682; AvgDiff =1075.0, …	2026-09-27
+GLYPH	,𝛿=0.10.	Small circuits,𝛿=0.10. In Figure 8, the three metrics still overshoot,…	2026-09-27
+GLYPH	=450.0,	…conf_358) achieves the smallest absolute deviation (AvgDiff =450.0, M…	2026-09-27
+GLYPH	Number of Shots2000230037006200640066006100480051006500112001200012500117001210011500115008400	…Metric: TVD | Best Configuration: conf_7 0 5000 10000 15000 Number of…	2026-09-27
+GLYPH	150002000300038007300730079007400530062006500147001390013700139001360014100147008400	…nn 8 | FEZqnn 8 | KYIrandom 8 | FEZvqe 8 | KYI 0 5000 10000 150002000…	2026-09-27
+GLYPH	AvgDiff=3627.8, MedRatio=1.71Divergence Metric: JS | Best Configuration: conf_3650	…35036004250360015503850360093509400945094509250920095006700 AvgDiff=3…	2026-09-27
+GLYPH	𝛿=0.05	Fig.7. Small circuits and 𝛿=0.05: incremental shots (best configuratio…	2026-09-27
+GLYPH	,𝛿=0.25.	Small circuits,𝛿=0.25. Figure 9 corresponds to the most permissive del…	2026-09-27
+GLYPH	=166.7	…e optimal in absolute terms. TVD (conf_525) attains AvgDiff =166.7 wi…	2026-09-27
+GLYPH	=216.7	…0, while Hellinger (conf_561) has a slightly larger AvgDiff =216.7 bu…	2026-09-27
+GLYPH	=1508.3),	…ative terms. TVD (conf_105) achieves MedRatio =1.09(AvgDiff =1508.3),…	2026-09-27
+GLYPH	=1338.9),	…is the closest multiplicatively with MedRatio =1.03(AvgDiff =1338.9),…	2026-09-27
+GLYPH	=2008.3).	…Diff =1338.9), and JS (conf_275) has MedRatio =1.06(AvgDiff =2008.3).…	2026-09-27
+OTHER	FAIL #S278 普通段出现了 ⋮		2026-09-27
+OTHER	FAIL #S279 ⋮ 数量 0 != 预期 1		2026-09-27
+GLYPH	0.1	…475/700 Opt.Inc.F1kF2.5kF5kF10kF15k Strategy / baseline 0.0 0.1 0.2 0…	2026-09-28

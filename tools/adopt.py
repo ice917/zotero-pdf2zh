@@ -30,7 +30,10 @@
                 这道闸门原本只在阶段 6 的 post_check 里, 也就是"PDF 出来了才
                 发现文献区被汉化", 得删掉重出。判据同源, 只是文本来源从 mono
                 PDF 换成 imported.json —— 前移之后那一轮服务端渲染直接省掉。
-  6 gate     verify_render(--expect) + post_check 双 PASS 才算交付
+  6 gate     verify_render(--expect) + post_check 双 PASS, **且 deliver 阶段确实核过
+             逐段不变量(inv_ok=True)** 才算交付。缺载荷时 deliver 已如实记
+             inv_ok=False(整段错位那一轮无判据可拦), gate 判 UNVERIFIED 不予放行
+             —— 否定性证据不能在最后一道门上蒸发; 确认无毒用 --waive-inv 显式放行(留痕)。
 
 另有一个**不在顺序里**的止损阶段 (v28.23):
   7 rollback 撤销骨架行: 暂停档(PAUSE_TRANSLATE=1)第一趟为了让 seg_inject
@@ -154,6 +157,7 @@ SI, SJ = _load_siblings()
 
 import engine as ENG                                    # noqa: E402  (须在 sys.path 之后)
 import result_naming as RN                              # noqa: E402  交件命名契约(后缀族)
+import dnt_contract as _DNT                             # noqa: E402  文献区禁汉化契约(退出码真源)
 
 ENGINE = None          # 当前引擎画像; 由 use_engine() 设定
 SIDECAR = ""           # pdf2zh: 全局侧车; next: 空串(next 无侧车, 由 resolve_sidecar 拒绝)
@@ -470,6 +474,12 @@ def stage_export_next(args, led):
         argv += ["--doc", args.doc]
     if args.terms:
         argv += ["--terms", args.terms]
+    # [本质修 2026-09-28] DNT 声明的产生端: 转发给 seg_export 写进载荷与 manifest。
+    # 不带则本次导出无声明, 门禁断言 4 判未验证(不再启发式反推该豁免谁)。
+    if getattr(args, "dnt_refs", False):
+        argv += ["--dnt-refs"]
+    if getattr(args, "dnt_seg", ""):
+        argv += ["--dnt-seg", args.dnt_seg]
     rc, _ = run_tool("seg_export.py", argv)
     if rc != 0:
         mark(led, "export", "failed", reason="seg_export 退出码 %d" % rc)
@@ -507,10 +517,13 @@ def stage_export(args):
     if (led["stages"].get("export") or {}).get("state") == "ok" and not args.force:
         return die("本 run 已导出过; 重做请加 --force (会覆盖 inbox 同名件)")
 
+    # [本质修 2026-09-28] DNT 声明的产生端(1.x 侧车路线), 同 stage_export_next。
     rc, _ = run_tool("seg_export.py",
                      ["--pages", args.pages, "--name", args.name, "--sidecar", sc]
                      + (["--doc", args.doc] if args.doc else [])
-                     + (["--terms", args.terms] if args.terms else []))
+                     + (["--terms", args.terms] if args.terms else [])
+                     + (["--dnt-refs"] if getattr(args, "dnt_refs", False) else [])
+                     + (["--dnt-seg", args.dnt_seg] if getattr(args, "dnt_seg", "") else []))
     if rc != 0:
         mark(led, "export", "failed", reason="seg_export 退出码 %d" % rc)
         save_ledger(led)
@@ -1143,7 +1156,8 @@ def stage_deliver(args):
             # 放行必须留痕 —— 台账记 waive + 报告照落, 事后查得出"谁放过了什么"。
             rep = write_gate_report(args.name, path, src, got, bad_cut, bad_inv, bands, gaps)
             mark(led, "deliver", "ok", file=path, sha1=sha1_8(path),
-                 n_seg=len(got), chars=len(text), waive=True, waive_at=now(),
+                 n_seg=len(got), chars=len(text), inv_ok=inv_on,
+                 waive=True, waive_at=now(),
                  waived={"cut": len(bad_cut), "inv": len(bad_inv),
                          "empty": len(empty), "short": len(short)}, report=rep)
             save_ledger(led)
@@ -1452,8 +1466,13 @@ def stage_render(args):
     else:
         # 预检只比对 imported.json 里**有译文的那几页**, 末 N 页保留原文的页本来
         # 就不在里面, 所以无需把 skip_last 传下去 (pre_render_check 也没这个参数)。
-        rc_c, _ = run_tool("pre_render_check.py",
-                           ["--original", pdf, "--imported", imp], capture=True)
+        # [本质修 2026-09-28] 把 export 阶段落的 manifest 透传下去: 预检与最终门禁
+        # 跑的是同一个 check_ref_zh, 有声明才谈得上"比对"。台账里已存 manifest 路径。
+        pr_args = ["--original", pdf, "--imported", imp]
+        man_exp = (led["stages"].get("export") or {}).get("manifest")
+        if man_exp and os.path.exists(man_exp):
+            pr_args += ["--manifest", man_exp]
+        rc_c, _ = run_tool("pre_render_check.py", pr_args, capture=True)
         if rc_c != 0:
             mark(led, "render", "failed", pdf=pdf,
                  pre_render="FAIL", reason="渲染前预检: 文献区汉化")
@@ -1543,17 +1562,53 @@ def stage_gate(args):
     pa = [mono]
     if skip_last:
         pa += ["--skip-last", str(skip_last)]
+    # [本质修 2026-09-28] 把 export 阶段落的 manifest 透传给最终门禁: 断言 4 据此
+    # 比对 DNT 声明(而非从产物反推)。台账里已存 manifest 路径, 无需新 plumbing。
+    man_exp = (led["stages"].get("export") or {}).get("manifest")
+    if man_exp and os.path.exists(man_exp):
+        pa += ["--manifest", man_exp]
     rc_p, _ = run_tool("post_check.py", pa)
 
-    ok = (rc_v == 0 and rc_p == 0)
-    mark(led, "gate", "ok" if ok else "failed", mono=mono,
+    ok2 = (rc_v == 0 and rc_p == 0)
+    # [V1 修] deliver 的**否定性证据**必须在这道最终放行门上被消费, 否则它在交付那一刻蒸发:
+    #   inv_ok is True  -> 逐段不变量确实核过, 双 PASS 即放行;
+    #   inv_ok is False -> 缺载荷, 逐段不变量**没核**(整段错位这一轮拦不住) -> UNVERIFIED,
+    #                      默认不放行; 这正是"unknown 不得静默当 PASS"的三值口径;
+    #   inv_ok is None  -> 老台账没这条记录(或 deliver 走了别的分支), 同等 fail-closed。
+    # 唯一出路是 --waive-inv **显式**豁免(留痕), 不是让证据悄悄消失。
+    inv_ok = (led["stages"].get("deliver") or {}).get("inv_ok")
+    inv_verified = (inv_ok is True)
+    # [本质修 2026-09-28] post_check 退出码三值: 0=PASS / 1=FAIL / 3=UNVERIFIED。
+    # rc=3 不是"确定失败", 是"证据不足以放行"(断言 4 无 DNT 声明, 或声明与独立信号
+    # 不一致), 归 unverified(与 inv_ok 缺记录同级) —— 不放行, 但不谎称 FAIL。
+    # rc=2(基础设施错误) 与其余非 0 码仍按 fail-closed 记 failed。
+    # [A1 2026-09-28] 码->verdict 映射抽为契约 exit_codes(tools/contracts/dnt.json);
+    # 未登记码(含保留的 2) -> None -> 落 "FAIL"(fail-closed), 语义与旧硬编码一字不差。
+    post_state = _DNT.verdict_for_exit_code(rc_p) or "FAIL"
+    if ok2 and (inv_verified or args.waive_inv):
+        state = "ok"
+    elif rc_v != 0 or post_state == "FAIL":
+        state = "failed"
+    else:
+        state = "unverified"
+    mark(led, "gate", state, mono=mono,
          verify="PASS" if rc_v == 0 else "FAIL",
-         post_check="PASS" if rc_p == 0 else "FAIL",
+         post_check=post_state,
+         inv_ok=inv_ok, inv_waived=bool(args.waive_inv),
          expect=list(args.expect), forbid=list(args.forbid), skip_last=skip_last)
     save_ledger(led)
-    if ok:
+    if state == "ok":
         print("[adopt] gate OK —— 本 run 交付完成 (%s)" % args.name)
         return 0
+    if state == "unverified":
+        if rc_p == 3:
+            return die("验收 UNVERIFIED: post_check 判 UNVERIFIED —— 文献区禁汉化断言"
+                       "无 DNT 声明(--manifest), 或声明与独立信号不一致, 无契约可放行。"
+                       "用 seg_export --dnt-refs/--dnt-seg 生成声明后重跑, 或人工核查后处置")
+        return die("验收 UNVERIFIED: verify_render/post_check 双 PASS, 但 deliver 阶段"
+                   "「逐段不变量未核验」(inv_ok=%s, 载荷不可读) —— 整段错位这一轮无判据可拦, "
+                   "故不放行。补上 export 载荷后重跑, 或 --waive-inv 显式放行(留痕)"
+                   % ("False" if inv_ok is False else "缺记录"))
     return die("验收未过: verify_render=%s post_check=%s"
                % ("PASS" if rc_v == 0 else "FAIL", "PASS" if rc_p == 0 else "FAIL"))
 
@@ -1619,6 +1674,12 @@ def main():
                    help="next: translate_tracking.json 路径; 缺省取工作根下最新一份(换论文会被覆盖)")
     p.add_argument("--doc", default="", help='文档抬头(写进 payload 首行), 如 "标题 (期刊, 年份)"')
     p.add_argument("--terms", default="", help="术语表 csv; 缺省用 seg_export 默认(server/glossary/terms.csv)")
+    # [本质修 2026-09-28] DNT 声明: 契约先于产物, 让门禁比对声明而非从产物反推。
+    p.add_argument("--dnt-refs", action="store_true",
+                   help="声明文献区(首个参考文献标题起至末尾)禁翻, 写进载荷与 manifest; "
+                        "门禁断言 4 据此比对(不给则判未验证)")
+    p.add_argument("--dnt-seg", default="",
+                   help="显式点名禁翻段(逗号分隔, 如 S15,S16); 覆盖 --dnt-refs 的自动判据")
     p.set_defaults(fn=stage_export)
 
     p = sub.add_parser("deliver", help="2 登记豆包交件 (段号守恒 + 留空/半截/错位/不变量/⋮ 内容门禁)")
@@ -1685,6 +1746,10 @@ def main():
     p.add_argument("--skip-last", type=int, default=None,
                    help="末尾保留页豁免数; 缺省沿用 render 阶段实际用的值(原本缺省 0, "
                         "整篇翻的 run 传了 --skip-last 也会被当成没跳页)")
+    # [V1 修] 只加在 gate, **不可**放 common(p) —— 否则污染 export/deliver/import 等所有子命令。
+    p.add_argument("--waive-inv", action="store_true",
+                   help="显式豁免「逐段不变量未核验」(deliver.inv_ok 非 True): "
+                        "缺载荷时 gate 默认判 UNVERIFIED 不放行, 加此开关才放行并留痕台账")
     p.set_defaults(fn=stage_gate)
 
     p = sub.add_parser("status", help="看台账 / 列出全部 run")

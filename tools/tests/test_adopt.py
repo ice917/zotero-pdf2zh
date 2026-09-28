@@ -67,6 +67,17 @@ def fake_run_tool(script, args, capture=False):
         name = args[args.index("--name") + 1]
         with open(os.path.join(AD.INBOX, name + ".manifest.json"), "w", encoding="utf-8") as f:
             json.dump(FAKE["manifest"], f, ensure_ascii=False)
+        # 真实 seg_export **同时落一份载荷(源文)**, 见 tools/seg_export.py 的落盘分支:
+        #   inbox/<name>.txt 与 inbox/<name>.manifest.json 并存。
+        # [夹具失真修复] 原先这里只写 manifest, 于是台账 export.txt 指向一个**不存在的**
+        # 文件 -> deliver 阶段一律记 inv_ok=False, 把"gate 从不消费 inv_ok"(V1) 这个
+        # 结构性缺陷盖住了。补齐载荷后 c8 等用例的 deliver 才如实记 inv_ok=True。
+        # 载荷每段给一段**不含数字且 < 60 字符**的占位源文: 数字会触发 diff_invariants
+        # 判"数字不符", >=60 字符会触发 gap_defects 判"只译半截", 都会误伤 rc==0 用例。
+        items = (FAKE["manifest"] or {}).get("items") or []
+        with open(os.path.join(AD.INBOX, name + ".txt"), "w", encoding="utf-8") as f:
+            for i, _it in enumerate(items, 1):
+                f.write("#S%d\n源文段落\n" % i)
         return 0, ""
     if script == "seg_import.py":
         man_p = args[args.index("--manifest") + 1]
@@ -379,6 +390,33 @@ def main():
     check("⑰ post_check FAIL -> gate failed 且 verify 仍记 PASS",
           rc == 1 and g["state"] == "failed" and g["verify"] == "PASS" and g["post_check"] == "FAIL", g)
 
+    # ⑰b [V1] gate 必须消费 deliver 的**否定性证据**: 载荷不可读时 deliver 已如实记
+    #      inv_ok=False(逐段不变量没核过), 双 PASS 也不能算交付完成。用**真实代码路径**
+    #      造这个态 —— 删掉载荷后重跑 deliver(它不因缺载荷拒收, 只把该核的标记成没核)。
+    _pay = os.path.join(AD.INBOX, "c8.txt")
+    _bak = open(_pay, "rb").read()
+    os.remove(_pay)
+    rc, out = run(["deliver", "--name", "c8", "--text", p8])
+    check("⑰b 缺载荷 deliver 仍 ok 但如实记 inv_ok=False",
+          rc == 0 and AD.load_ledger("c8")["stages"]["deliver"]["inv_ok"] is False, out[-160:])
+    FAKE["rc"]["post_check.py"] = 0
+    rc, out = run(["gate", "--name", "c8", "--expect", "共识"])
+    g = AD.load_ledger("c8")["stages"]["gate"]
+    check("⑰b 双 PASS + inv_ok=False -> UNVERIFIED 不放行",
+          rc == 1 and g["state"] == "unverified" and g["verify"] == "PASS"
+          and g["post_check"] == "PASS" and g["inv_ok"] is False, (g, out[-200:]))
+    rc, out = run(["gate", "--name", "c8", "--expect", "共识", "--waive-inv"])
+    g = AD.load_ledger("c8")["stages"]["gate"]
+    check("⑰c --waive-inv 显式豁免才放行且留痕",
+          rc == 0 and g["state"] == "ok" and g.get("inv_waived") is True, g)
+    with open(_pay, "wb") as f:                          # 复原载荷与 deliver 记录, 供后续 case 用
+        f.write(_bak)
+    rc, _ = run(["deliver", "--name", "c8", "--text", p8])
+    d8r = AD.load_ledger("c8")["stages"]["deliver"]
+    rc_g, _ = run(["gate", "--name", "c8", "--expect", "共识"])
+    check("⑰d 载荷复原后 deliver 记 inv_ok=True 且 gate 照旧放行",
+          rc == 0 and d8r["inv_ok"] is True and rc_g == 0, (rc, rc_g, d8r))
+
     # ⑱ failed 不抹掉前序 ok 阶段; 台账无 .tmp 残留
     l8 = AD.load_ledger("c8")
     check("⑱ 后阶段失败不影响前序 ok",
@@ -554,7 +592,7 @@ def main():
     # ㉔d 载荷读不到 -> **明示跳过**, 不拿空基准逐段比(那会把每段都判成"数字多出来", 全线误杀)
     reset(mk_manifest("d3", [[(1, 0)]]))
     run(["export", "--name", "d3", "--pages", "1"])
-    # 假 seg_export 不落载荷文件, 台账记的 inbox/d3.txt 本来就是空的 —— 这正是要测的形态
+    # 夹具现在会随 export 落一份载荷, 这里**显式删掉**以造"载荷不可读"的形态
     _p3 = os.path.join(AD.INBOX, "d3.txt")
     if os.path.exists(_p3):
         os.remove(_p3)
