@@ -1327,6 +1327,14 @@ tr.last td{background:color-mix(in srgb,var(--warn) 15%,transparent)}
 
   <div class="glass banner idle" id="banner">尚未检查。</div>
 
+  <section class="glass row spread" id="resumeCard" hidden>
+    <span id="resumeMsg"></span>
+    <span>
+      <button class="btn" id="resumeBtn" type="button">恢复上次检查</button>
+      <button class="btn small" id="resumeNoBtn" type="button">不用了</button>
+    </span>
+  </section>
+
   <div class="glass row todorow" id="todoRow">
     <span class="muted">这一篇</span>
     <span id="todoStat">还没有可判的任务 —— 装配后这里会列出这一篇该做的每一块。</span>
@@ -1523,6 +1531,7 @@ function renderTodos(list){
 function edited(){
   commitBtn.disabled=true;commitBtn.textContent='⑤ 确认写入并出稿';
   $('rvCard').hidden=true;window.__rv='';       /* ④ 的结论是针对旧文本的, 一改即作废 */
+  $('resumeCard').hidden=true;                  /* 文本一改, 旧会话就对不上了 —— 撤下[恢复]入口 */
   setBanner('idle','内容已改 —— 请重新点 ③ 检查。');
 }
 ta.addEventListener('input',edited);
@@ -1548,6 +1557,7 @@ $('buildBtn').addEventListener('click',function(){
 });
 $('checkBtn').addEventListener('click',function(){
   commitBtn.disabled=true;commitBtn.textContent='⑤ 确认写入并出稿';
+  $('resumeCard').hidden=true;                  /* 新一轮检查开始 —— 旧会话的[恢复]入口先撤下, 免得显示过期摘要 */
   setBanner('busy','检查中…(在临时沙箱里跑真门禁)');
   api('/api/check',{text:ta.value}).then(function(r){
     if(r.error){
@@ -2505,6 +2515,34 @@ api('/api/ulstate').then(function(s){
 $('healScanBtn').addEventListener('click',function(){healAsk('heal_render.py',true)});
 $('healRenderBtn').addEventListener('click',function(){healAsk('heal_render.py',false)});
 $('healRelinkBtn').addEventListener('click',function(){healAsk('relink_pages.py',false)});
+/* 续跑(L2): 面板重启后, 若工作目录里还留着一份**③ 通过**的会话(.panel_session.json), 给一个
+   [恢复]入口 —— 超长论文里 ③ 慢、人工比对译文也久, 这期间进程一退, 回来就不必重贴整篇、重跑 ③。
+   真伪判据全在服务器(_session_info / _resume): 这里只负责显示与递话, 不自己判"能不能恢复"。 */
+function renderSession(s){
+  var card=$('resumeCard');
+  if(!s){card.hidden=true;return}
+  var b=$('resumeBtn');
+  if(s.stale){
+    $('resumeMsg').textContent='上次的检查已过期：'+s.job_label+'（'+s.why+'）—— 请重新点 ③ 检查。';
+    b.disabled=true;
+  }else{
+    $('resumeMsg').textContent='上次的检查还在：'+s.job_label+' · '+s.n+' 单元 · '+s.verdict
+      +'（'+s.when+'）—— 可直接恢复, 不必重贴重跑 ③。';
+    b.disabled=false;
+  }
+  card.hidden=false;
+}
+$('resumeBtn').addEventListener('click',function(){
+  var b=$('resumeBtn');b.disabled=true;
+  api('/api/resume',{}).then(function(r){
+    if(r.error){log('✗ '+r.error);setBanner('err','✗ '+r.error);b.disabled=false;return}
+    ta.value=r.text||'';
+    log('↺ 已恢复上次的检查（'+r.job_label+'）—— 粘贴区已回填; 直接点 ⑤ 出稿即可, 不必重跑 ③。');
+    $('resumeCard').hidden=true;
+    render(r.payload);
+  });
+});
+$('resumeNoBtn').addEventListener('click',function(){$('resumeCard').hidden=true});
 api('/api/state').then(function(s){
   taskDD.setOptions(s.jobs||[]);
   vendorDD.setOptions(s.vendors||[]);
@@ -2513,7 +2551,7 @@ api('/api/state').then(function(s){
   $('workdir').textContent='工作目录 '+(s.workdir||'');
   renderTodos(s.todos);
   theme=s.theme||theme;applyTheme();
-  renderBuild(s.build);renderReady(s.ready);
+  renderBuild(s.build);renderReady(s.ready);renderSession(s.session);
   log('翻译方「'+vendor+'」; 审核者 '+s.rv_model+' —— ④ 只审不改, 且与翻译方同源时拒审。');
   ping();setInterval(ping,5000);
 });
@@ -2609,6 +2647,68 @@ def _sha(text):
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
+# ---------------- 会话台账(L1, v40): ③ 通过的那份会话落到工作目录 ----------------
+# 解决什么: 超长论文上 ③ 一次要跑很久, 用户拿去人工比对译文也很久 —— 这期间面板进程若退了
+# (关窗告别 / Ctrl+C / 息屏被杀), 服务端内存 STATE 与浏览器 DOM **两层记忆都易失**, 回来就得
+# 重贴整篇、重跑 ③。这里把"③ 这一次的会话"(原始回包 + /api/check 载荷 + 单元表)落一份到
+# **工作目录**(数据侧, 不进仓库), 面板重启时给一个[恢复]入口(见 /api/resume)。
+# 纪律(对齐 ledger): 读写异常一律吞掉 —— 会话只是便利, 绝不能带崩 ③ / ⑤;
+# 只在 **③ 通过**时写(未过的会话没有 ⑤ 可续, 留着只会是噪音); ⑤ 出稿成功 / 装配 后即清;
+# 文件含用户译文 -> 只落工作目录, 绝不进 git。
+SESSION_FILE = os.path.join(wc.D, ".panel_session.json")
+
+
+def _save_session(d):
+    try:
+        with io.open(SESSION_FILE, "w", encoding="utf-8") as f:
+            json.dump(d, f, ensure_ascii=False)
+    except Exception:                                   # noqa: BLE001
+        pass
+
+
+def _load_session():
+    try:
+        with io.open(SESSION_FILE, encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else None
+    except Exception:                                   # noqa: BLE001
+        return None
+
+
+def _clear_session():
+    try:
+        os.remove(SESSION_FILE)
+    except OSError:
+        pass
+
+
+def _session_info():
+    """会话台账摘要 -> dict(供前端出[恢复]入口); 没有会话 -> None。
+
+    这里只做**只读**校验(任务在不在 / 单元对不对得上); 真正的回填在 /api/resume。
+    过期(stale)判据: ① 那条任务还在当前装配里(标签对得上); ② 会话里的单元编号与当前
+    manifest 逐一对齐 —— 装配过新一轮就当过期, 要求重跑 ③。这是堵"过期续跑"假恢复的
+    前两道闸: 宁可让人重跑一次 ③, 也不拿旧会话去开 ⑤。
+    """
+    s = _load_session()
+    if not s:
+        return None
+    label = s.get("job_label") or ""
+    ids = list(s.get("ids") or [])
+    ts = s.get("ts") or 0
+    out = {"job_label": label, "n": len(ids), "verdict": s.get("verdict") or "",
+           "ts": ts, "when": (time.strftime("%m-%d %H:%M", time.localtime(ts))
+                              if ts else "")}
+    job = next((j for j in wc.available_jobs() if j["label"] == label), None)
+    if job is None:
+        out.update(stale=True, why="任务「%s」已不在当前装配里" % label)
+    elif list(wc.manifest_ids(job)) != ids:
+        out.update(stale=True, why="装配已更新(单元对不上), 需重跑 ③")
+    else:
+        out.update(stale=False, why="")
+    return out
+
+
 class H(BaseHTTPRequestHandler):
     server_version = "p2z-panel/3"
 
@@ -2655,7 +2755,8 @@ class H(BaseHTTPRequestHandler):
                         "workdir": wc.D, "theme": _load_theme(),
                         "todos": paper_tasks(),   # 这一篇该做的每一块到哪一步了(判据在产物上)
                         "build": build_stamp(),   # 本面板吃的是哪一版代码(旧实例自查)
-                        "ready": payload_ready()})  # 页面一开就能看见最近那份载荷就绪标记
+                        "ready": payload_ready(),  # 页面一开就能看见最近那份载荷就绪标记
+                        "session": _session_info()})  # L2: 工作目录里若还留着③通过的会话, 给[恢复]入口
         elif path == "/api/ping":
             with LOCK:
                 STATE["ping"] = time.time()
@@ -2687,6 +2788,8 @@ class H(BaseHTTPRequestHandler):
             self._json({"ok": True})
         elif path == "/api/check":
             self._check(b)
+        elif path == "/api/resume":
+            self._resume()
         elif path == "/api/review":
             self._review(b)
         elif path == "/api/termadd":
@@ -3109,6 +3212,7 @@ class H(BaseHTTPRequestHandler):
         with LOCK:
             STATE["checked"] = None
             STATE["sha"] = None
+        _clear_session()                      # 会话跟着作废(单元已变, 旧会话不能再[恢复])
         self._json({"ok": True, "out": out, "summary": out[0] if out else "ok"})
 
     def _send(self, b):
@@ -3148,7 +3252,7 @@ class H(BaseHTTPRequestHandler):
             with LOCK:                        # 记住"这次检查"的内容指纹, commit 时必须对得上
                 STATE["checked"] = (r["job"], r["ids"], r["got"])
                 STATE["sha"] = _sha(text)
-        self._json({
+        resp = {
             "ok": r["ok"], "verdict": r["verdict"], "job": r["job"]["label"], "n": len(r["ids"]),
             "vendor": _load_vendor(),
             "median": round(r["median"], 3), "n_dup": r["n_dup"], "n_incons": r["n_incons"],
@@ -3157,7 +3261,50 @@ class H(BaseHTTPRequestHandler):
             "items": [{"lv": lv, "kind": k, "msg": m, "ids": u}
                       for lv, k, m, u in r["items"]],
             "rows": [{"ratio": round(rt, 3), "id": uid, "orig": o, "zh": z}
-                     for rt, uid, o, z in r["rows"]]})
+                     for rt, uid, o, z in r["rows"]]}
+        if r["ok"]:
+            # L1: 把这次通过的会话落盘(原始回包 + 载荷 + 单元表) —— 这之后面板若退出(超长论文上
+            # 很常见, 见 SESSION_FILE 段), 重启时 /api/resume 能原样还回来, 不必重贴整篇、重跑 ③。
+            # 只存通过态: 未过的会话没有 ⑤ 可续, 留着只是噪音。存盘失败不影响本次检查。
+            _save_session({"ts": time.time(), "job_label": r["job"]["label"],
+                           "ids": list(r["ids"]), "verdict": r["verdict"],
+                           "sha": _sha(text), "text": text,
+                           "got": dict(r["got"]), "payload": resp})
+        self._json(resp)
+
+    def _resume(self):
+        """L2 续跑: 面板重启后, 把上次 **③ 通过**的会话原样还回来 —— 不必重贴整篇、重跑 ③。
+
+        回填前**再校验一次**(与 _session_info 同判据 + 指纹自洽): 任务在、单元对齐、sha 对得上、
+        载荷是那次 PASS 的; 任何一条不成立就如实说 stale, 让用户重跑 ③ —— **绝不**拿过期或损坏的
+        会话去开 ⑤。通过态会话本就带 PASS, 回填 STATE 后 ⑤ 直接可用(见 _commit 的 sha 比对)。
+        """
+        s = _load_session()
+        if not s:
+            self._json({"ok": False, "error": "没有可恢复的会话。"}, 404)
+            return
+        label = s.get("job_label") or ""
+        ids = list(s.get("ids") or [])
+        text = s.get("text") or ""
+        payload = s.get("payload")
+        job = next((j for j in wc.available_jobs() if j["label"] == label), None)
+        why = ""
+        if job is None:
+            why = "任务「%s」已不在当前装配里" % label
+        elif list(wc.manifest_ids(job)) != ids:
+            why = "装配已更新(单元对不上)"
+        elif not isinstance(payload, dict) or not payload.get("ok"):
+            why = "会话文件不完整"
+        elif _sha(text) != (s.get("sha") or ""):
+            why = "会话文件损坏(指纹对不上)"
+        if why:
+            self._json({"ok": False, "stale": True, "error": "%s —— 需重跑 ③。" % why}, 409)
+            return
+        with LOCK:                            # 回填内存态: ⑤ 拿到的就是这一次会话
+            STATE["checked"] = (job, ids, dict(s.get("got") or {}))
+            STATE["sha"] = s.get("sha")
+        self._json({"ok": True, "job_label": label, "verdict": s.get("verdict") or "",
+                    "text": text, "payload": payload})
 
     def _review(self, b):
         """④ 语义审核: 只读 —— 不落任何产物、不动已检查状态(审核不改门禁结论)。
@@ -3256,6 +3403,7 @@ class H(BaseHTTPRequestHandler):
                "已出稿" + ("(缺: %s)" % names if miss else ""), out)
         with LOCK:                            # 已落盘, 防双击重复出稿
             STATE["checked"] = None
+        _clear_session()                      # 出稿成功 -> 这次会话已经用掉了, 别再[恢复]它
         if miss:
             logs.append("! 已记台账: 这一篇还有 %s 没出稿。" % names)
         # [v36.4] 这里原有一条"整篇齐了就安排收摊"(退出腿②, v28.79)。**已删** —— 收摊改由
