@@ -396,11 +396,13 @@ def main():
         time.sleep(0.2)
         n_now = fake2.calls
     check("⑥ 不是立刻关: 留几秒把那句回话送回到页面上", n_now == 0, n_now)
-    check("⑥ 页面收到 done -> 只说清楚, **不再**自作主张关窗",
-          "r.done" in pg and "window.close()" not in pg)
+    check("⑥ ⑤ 出稿的 done 只说清楚、**不**收窗(收窗只挂在人点退出按钮那一步)",
+          "r.done" in pg)
     check("⑥ 页面两颗退出按钮都在, 且都打同一个端点(退出入口全在人手上)",
           'id="exitBtn"' in pg and "ulCloseBtn" in pg
           and "/api/bye" in pg and "/api/ulclose" not in pg)
+    check("⑥ 两颗退出按钮回包后都收窗(收窗只挂在人点按钮那一步, 关闭的动作仍是同一次收尾)",
+          pg.count('window.close()') == 2)
     check("⑥ main() 把服务器对象交给关面板腿(不交就关不掉自己)",
           'SRV["h"] = srv' in src)
 

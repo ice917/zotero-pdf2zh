@@ -135,6 +135,9 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
         那条兜底真正想近似的东西**不是**"你多久没动静了", 而是"活干完了吧"。v28.79 曾用
         "⑤ 出稿且整篇出齐"这个**确定性信号**接过它, v36.4 又按上面的理由退掉 —— 所以现在
         这条动线上**没有**任何自动退出: 退出只有"按按钮"一条(见上 [v41]), 得人来。
+        收窗是这同一次收尾的一部分: 人按下按钮、回应一落地, 页面自己 window.close()
+        (不留一个满是可点按钮的死窗等人亲手关), 后端过了 CLOSE_GRACE 才真正停。
+        关窗/刷新 ≠ 退出这条不变 —— 收窗只挂在"人点了退出按钮"这一次, 没有别的自动腿。
         连带的 /api/idle 端点、头部倒计时与暂停按钮一并删除。
   改动作废: /api/check 记下当时文本的 sha1, /api/commit 发现文本变了直接拒绝 ——
             "确认"不可能按在过期内容上(服务器端强制, 不只靠前端禁用按钮)。
@@ -1855,6 +1858,10 @@ $('exitBtn').addEventListener('click',function(){
     if(r&&r.net){b.disabled=false;b.textContent='退出面板';
       setBanner('idle','连不上本机服务器 —— 面板可能已经退了, 关掉这扇窗即可。');return}
     setBanner('idle',(r&&r.out)||'面板即将关停。');
+    /* 人已经决定退: 回应落横幅后由页面收掉这扇窗, 不留一个满是可点按钮的死窗等人亲手关。
+       注意此时后端可能还没真停(CLOSE_GRACE 那 3s 是给这句回话先落地用的), 但既然人点了退出,
+       收窗就是同一次收尾的一部分。 */
+    window.close();
   });
 });
 function applyTheme(){
@@ -2459,6 +2466,7 @@ $('ulCloseBtn').addEventListener('click',function(){
      「退出面板」共用同一个端点 —— 两个入口、一个动作。 */
   api('/api/bye',{}).then(function(r){
     ulMsg('✓ '+(r.out||'面板即将关停。'),'ulok');
+    window.close();                       /* 同表头那颗: 回应落地后由页面收窗, 收尾交给同一次决定 */
   });
 });
 api('/api/ulstate').then(function(s){
