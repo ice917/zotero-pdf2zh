@@ -13,9 +13,9 @@
        否则 TR。已知局限: 命名人全裸写(无括号)的物种列可能漏过 R3', 审计里给两个比率供人核。
      表头逐格判: 无字母、或字母 token 全 <=2 字符 -> 不送译。
 
-  2) 自举禁翻面: 禁翻列整体不送译; 可翻格里的数字一律换成 {S###} 占位符(翻完由
-     check_job.py 还原); 折行连字空格(前段实测 15 处全部是本身带的 - 或 /)就地还原,
-     逐条记入审计。
+  2) 自举禁翻面: 禁翻列整体不送译; 可翻格与送译表头里的数字一律换成 {S###} 占位符(翻完由
+     check_job.py 还原; 表头数字不锁的话, 临床表头 n=、95% CI 这类会被 G3 判违规); 折行连字
+     空格(前段实测 15 处全部是本身带的 - 或 /)就地还原, 逐条记入审计。
 
   3) 产物: job_doubao.txt(编号<TAB>文本, 整段粘给豆包)
            job_manifest.json(表结构 + 编号 -> 行/列/原文/占位符原值, 对账契约; paper=篇名)
@@ -137,6 +137,12 @@ def main():
     for tb in TABLES:
         with io.open(os.path.join(D, tb + ".tsv"), encoding="utf-8") as f:
             rows = [r for r in csv.reader(f, delimiter="\t")]
+        if not rows:
+            # 空 TSV 不再裸崩(rows[0] IndexError, 2026-10-10 跨论文测试 genedit T1 实测踩过)
+            # —— 问题出在上游切格, 这里只负责指路, 不产出半截 manifest。
+            print("!! %s.tsv 是空的: 切格没切出任何行。先看 grid_audit.txt ——"
+                  " 摘页区域选对了吗? 侧排表没烘正? 图片型表格(无文本层)?" % tb)
+            sys.exit(1)
         hdr, data = rows[0], rows[1:]
         ncol = len(hdr)
 
@@ -169,7 +175,9 @@ def main():
 
         for c in range(ncol):
             if hpol[c] == "TR":
-                add_unit(0, c, dehyph(hdr[c], nlog, "表头[%d]" % c))
+                # 表头数字与数据格同样锁成占位符: 临床/医学表头几乎必带数字(n=1,836,006、
+                # 95% CI、per 10,000), 忠实照抄的译文 100% 触发 G3(占位符外不得有数字)。
+                add_unit(0, c, NUMTOK_RE.sub(lambda m: new_ph(m.group(0)), dehyph(hdr[c], nlog, "表头[%d]" % c)))
         for c in range(ncol):
             if pol[c] != "TR":
                 continue

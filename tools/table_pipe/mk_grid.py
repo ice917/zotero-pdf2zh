@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""按坐标把整页表格切成网格(TSV) + 对齐审计  v4
+"""按坐标把整页表格切成网格(TSV) + 对齐审计  v5
 
 v1 失败: 行间空档阈值(4pt)切不开 —— 块内行距空白 0.9-1.5pt / 块间 3.4-3.7pt, 阈值无解。
 v2 失败: ① x 投影找列 -> 单字符列(H/D/Nectar, 宽 3pt)被当槽吃掉, 12 列(应为 13);
@@ -12,13 +12,19 @@ v4 换两个正交的判据(全部实测):
        续行缩进约 7pt -> 距离 <COL_MERGE(10pt) 的簇并掉, 保留左者。
        实测 T2 = 73/144/165/205/241/289/341/397/443/458/473/499/553 -> 13 列。
   行 = 基线 y1。同行各格字号不同 -> 顶边 y0 可差 2pt, 但**基线 y1 一致**(实测偏差 <0.3pt);
-       行距 18pt -> 分离度 80 倍。行首由最左列的行首行标出:
-       最左列里 x0 落在最左簇的即行首(续行缩进 7pt, 天然分开)。
+       行距 18pt -> 分离度 80 倍。行首锚点: 最左簇的第 0 列行无条件算。
+
+v5 修: v4 的行首曾判成"只认最左簇"(借续行缩进 7pt 天然排除续行) —— 在临床表翻车:
+       keratitis T1 子行标签缩进 8pt, 7pt(要并) 与 8pt(要拆) 几何同信号, 纯 x0 分不开,
+       一刀切全并 -> 子行串格。改用伴随判据(证据详见 main() 锚点处): 缩进的第 0 列行,
+       基线带内其他列的数据格填的是行首没有的列 -> 新行; 填的是行首已有内容的列 ->
+       同一内容的断行延续(格内续行, 如物种名续行旁 Reference 列的年份也断行掉下来)。
 
 审计原则: 不许静默丢。噪声 / 跨列组表头 / 未落格 / 格数异常 全部逐条列出。
 """
 
 import os
+import sys
 from collections import Counter
 
 import pymupdf
@@ -33,6 +39,7 @@ TAIL_DY = 3.0      # 紧跟表注末行(与表注块底线间隙 < 此值) -> �
 CLU_TOL = 2.0      # x0 聚簇容差
 COL_MERGE = 10.0   # 相邻簇距离 < 此值 -> 并簇(续行缩进约 7pt)
 ROW_TOL = 1.0      # 行带在基线上的容差
+COMP_TOL = 1.5     # 伴随格基线容差: 同行各格 y1 实测偏差 <0.3pt, 放 5 倍余量(行距 18pt, 不会把邻行误当伴)
 MIN_SUPPORT = 3    # 列落格数下限, 低于此判为残列(幻影列)
 INNER = 3.0        # 判"横跨多列"时, 内列左边缘须落在单元格内部并留出的边距
 
@@ -111,6 +118,17 @@ def columns(cells):
     return edges, sizes, set(cl[0])
 
 
+def _img_n(idx):
+    """摘页第 idx(0 基)页里共多少张图片 —— 零落格/零列时的"图片型表格"证据。"""
+    try:
+        d = pymupdf.open(EXC)
+        n = sum(len(d[i].get_images(full=True)) for i in idx)
+        d.close()
+        return n
+    except Exception:
+        return 0
+
+
 def main():
     report, tsvs = [], []
     for label, idx in (("table_10_1", [0]), ("table_10_2", range(1, 7))):
@@ -121,8 +139,36 @@ def main():
                 (noise if r["noise"] else cells).append(r)
             furn += pg["furn"]
 
+        if not cells:
+            # 零落格不裸崩(columns() 的 set(cl[0]) 会 IndexError) —— 把"为什么一格都没有"
+            # 摆到人眼前(2026-10-10 跨论文测试: genedit T1 侧排未烘正全进 furn;
+            # spectra T2/T3 图片型表格文本层为空)。
+            why = []
+            if furn:
+                why.append("%d 行文字方向非正向 -> 疑似侧排表, 先把摘页旋转烘正"
+                           "(参照 mk_excerpt_upright.py 的做法, 区域级辨向)" % len(furn))
+            n_img = _img_n(idx)
+            if n_img:
+                why.append("摘页含 %d 张图片且无文本可落格 -> 疑似图片型表格"
+                           "(文本层为空, 现管线无解, 需 OCR/多模态)" % n_img)
+            if not why:
+                why.append("无侧排行也无图片 -> 多半是裁剪框没框住表格区域")
+            print("!! %s: 该组页面没有任何可落格的文本行(另有噪声 %d 行)。排查:\n  - %s"
+                  % (label, len(noise), "\n  - ".join(why)))
+            sys.exit(1)
+
         edges_all, sizes, leftmost = columns(cells)
         edges = [e for e in edges_all if sizes[e] >= MIN_SUPPORT]
+        if not edges:
+            # 有零星文本但构不成任何一列(每簇落格数 < MIN_SUPPORT) —— 零列会让 fill()
+            # 裸崩(row=[] 还要 row[col])。常见于裁剪框切在表格外缘只漏进一两行残文
+            # (2026-10-10 跨论文测试: spectra T2 图片表区域漏进题注末行实测踩过)。
+            why = ["裁剪框是否切在表格外缘, 只漏进零散残行?"]
+            if _img_n(idx):
+                why.append("摘页含图片 -> 疑似图片型表格(文本层为空, 漏进来的只是题注/邻段)")
+            print("!! %s: 有 %d 行文本但构不成任何一列(每簇落格数 < %d)。排查:\n  - %s"
+                  % (label, len(cells), MIN_SUPPORT, "\n  - ".join(why)))
+            sys.exit(1)
         stray = [(e, sizes[e]) for e in edges_all if sizes[e] < MIN_SUPPORT]
         mid = [(edges[i] + edges[i + 1]) / 2.0 for i in range(len(edges) - 1)]
 
@@ -145,15 +191,53 @@ def main():
             """
             return any(c["x0"] + INNER < a < c["x1"] - INNER for a in edges)
 
-        # 行首: 最左列里 x0 落在最左簇的行(续行缩进约 7pt, 天然排除)
+        # 行首: 最左簇的第 0 列行无条件算; 缩进的第 0 列行要有伴随格(见下)才算
         L = []
         out, seen_head, group_hdr, foot = [], False, [], []
         for pg in pages:
             pc = [c for c in cells if c["pg"] == pg["rows"][0]["pg"]] if pg["rows"] else []
             if not pc:
                 continue
-            anchors = sorted(round(c["y1"], 2) for c in pc
-                             if round(c["x0"], 1) in leftmost and c["col"] == 0)
+            # 伴随判据(v5.1): 缩进(不在最左簇)的第 0 列行, 基线带内(|dy|<=COMP_TOL)有其他列
+            # (col>0)数据格陪伴, 且这些伴填的是**行首没有的列** -> 升级为行锚点;
+            # 否则是格内续行, 并回上一行。
+            # 为什么(死结的两次收紧):
+            #   ① 7 与 8pt 几何同信号: 基准篇物种名续行缩进约 7pt(要并回), keratitis T1
+            #      子行标签缩进 8pt(要独立成行), v4"只认最左簇"一刀切全并, 临床表子行
+            #      串格(实测改前 TSV 第 0 列: "Age, yr ;19 20–29 30–39 40–49 50–59
+            #      60–69 70;" 七个逻辑行挤一行)。只看"有格陪伴"还不够:
+            #   ② 续行也可能有伴: 基准篇 "(Engelm.) Schum." 断行的同一条基线上,
+            #      Reference 列的 "2007" 也断行掉了下来(实测) —— "有伴就拆"会把
+            #      续行也拆出去(T2 66 行被拆成 108 行)。分得开两者的是**列占位**:
+            #      子行标签的伴填的是行首没有的列 —— 实测 "20–29" y1=505.4, 同行
+            #      Total 列 "317,019 (17.3)" y1=505.5(列 1), 而行首 "Age, yr" 的
+            #      基线带只占列 0 与列 4(SMD) -> 列 1 是新行的数据;
+            #      续行的伴填的是行首已有内容的列 —— "2007"(列 12)在行首已有
+            #      "Martı´nez-Peralta", 只是同一格内容断行的另一半, 该并回。
+            #      两案例同行各格 y1 偏差实测均 <0.3pt, 故 COMP_TOL 放 1.5pt(5 倍余量)。
+            # 行首取上方最近的无条件锚点(分组的标签行), 不取新拆出的子行 ——
+            #   子行的伴列(1/2/3)彼此相同, 若拿上一子行当"行首", 列全被占, 第二个子行
+            #   就误判孤身; 分组行首才定义"本组哪些列已有内容"。
+            # companions 减去已有锚点值: 与无条件锚点同基线的缩进段不再加锚,
+            #   否则同值重复锚点会切出空带, 凭空多出一行全空行。
+            hard = sorted(round(c["y1"], 2) for c in pc
+                          if round(c["x0"], 1) in leftmost and c["col"] == 0)
+            companions = set()
+            for c in pc:
+                if c["col"] != 0 or round(c["x0"], 1) in leftmost:
+                    continue
+                y = round(c["y1"], 2)
+                escorts = {o["col"] for o in pc
+                           if o["col"] > 0 and abs(o["y1"] - c["y1"]) <= COMP_TOL}
+                if not escorts:
+                    continue
+                up = [b for b in hard if b < y]
+                b_head = up[-1] if up else None
+                occupied = {o["col"] for o in pc if b_head is not None
+                            and abs(o["y1"] - b_head) <= COMP_TOL}
+                if escorts - occupied:
+                    companions.add(y)
+            anchors = sorted(hard + list(companions - set(hard)))
             if not anchors:
                 L.append("  !! p%d 无行锚点" % pc[0]["pg"])
                 continue
@@ -181,8 +265,14 @@ def main():
                         L.append("  (续页表头已并, p%d, 去掉跨列组表头 %d 格)" % (pc[0]["pg"], len(gh)))
                         continue
                     seen_head = True
-                elif len(nz) == 1 and row[0]:
-                    # 表下脚注(如 T1 的 "aUndetermined"): 只有最左列一格, 不是数据行
+                elif len(nz) == 1 and row[0] and b in (anchors[0], anchors[-1]):
+                    # 脚注类(单格行, 未进 TSV 但审计逐条列)只可能是页上的两个边:
+                    #   表底 = 表下脚注(如 T1 的 "aUndetermined"); 表顶 = 裁剪圈进来的
+                    #   标题断行残尾(如 genedit T1 页顶的 "nuclease therapy.", v4 即
+                    #   按脚注语义审计列出)。**中间**的单格行不算 —— 拆行后分组的
+                    #   标签行(如 keratitis 的 "Comorbidities"/"Subgroup†")也只剩
+                    #   孤零零一格, 但它下面还有本组的数据行, 是分组头, 必须进 TSV,
+                    #   按 v4 的老判据会被静默吞掉。
                     foot.append((pc[0]["pg"], b, row[0]))
                     continue
                 out.append((pc[0]["pg"], b, row, "表头" if is_head else ""))
