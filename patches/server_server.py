@@ -2859,12 +2859,23 @@ if __name__ == '__main__':
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         print(f"🔍 检查端口 {port} 是否被占用...")
         if s.connect_ex(('localhost', port)) == 0:
-            print(f"❌ 端口 {port} 已被占用！")
-            print("\n💡 解决方案:")
-            print("   1. 选择其他端口启动: python server.py --port XXXX")
-            print("   2. 或在Zotero插件设置中修改Server IP端口号")
-            print(f"   3. 或停止占用端口 {port} 的其他程序")
-            all_checks_passed = False
+            # [自研补丁 2026-10-10] 端口被占从"可忽略警告"改为**当场拒绝**。
+            # 原先只置 all_checks_passed=False, 汇总处还能输 y 强行继续 —— Windows
+            # SO_REUSEADDR 允许新旧实例同时 LISTENING, 而实际应答的始终是先来的
+            # 那个: 新实例的终端看着像在服务, 其实一个请求也收不到(2026-10-10
+            # 实测双绑踩过)。继续启动没有任何意义, 指路后退出; 其余检查(目录权限
+            # 等)仍走原来的 y/n 汇总, 不受影响。
+            print(f"❌ 端口 {port} 已被占用！无法在此端口服务, 已拒绝启动(不再提供\"忽略并继续\"选项)。")
+            print("   占用者多半是上一个还没关的 zotero-pdf2zh Server —— 先去它的终端确认")
+            print("   是否正在翻译(旧实例里可能压着未完成的任务, 动手前先看一眼)。")
+            print("\n💡 排查与解决:")
+            print(f"   1. 找占用者:    netstat -ano | findstr :{port}    (记下 LISTENING 的 PID)")
+            print("       看几点起的:    Get-Process -Id <PID> | Select-Object Id, StartTime")
+            print("       确认是残留后:  taskkill /PID <PID> /F           (然后重新启动本服务)")
+            print("       若 LISTENING 有两行 = 已双绑: 杀 StartTime 早的那个, 留晚的")
+            print("       (先来的才真正干活 —— 这正是本检查改为拒绝的原因)")
+            print(f"   2. 或换端口启动:  python server.py --port XXXX     (Zotero 插件设置同步改)")
+            sys.exit(1)
         else:
             print(f"✅ 端口 {port} 可用")
 
