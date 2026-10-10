@@ -215,6 +215,12 @@ def execute_with_progress(cmd, task_id, args, env_manager, extra_env=None):
     final_cmd = cmd
     final_env = os.environ.copy()
     final_env["PYTHONUNBUFFERED"] = "1"
+    # [自研补丁 2026-10-03] 子进程 stdout 强制 UTF-8:
+    # 不设时 Windows 落到 GBK(cp936), pdf2zh 里任何含"PDF 提取的特殊 Unicode 符号"的
+    # print(如 converter._lookahead_of 的 [前瞻] 诊断行)会在 GBK 编码时抛
+    # UnicodeEncodeError, 整段 worker 崩溃、全篇转译失败; 且父进程按 UTF-8 读
+    # (execute._decode_pty_utf8), GBK 字节被误读成乱码(如「前瞻」→'ǰհ')。
+    final_env["PYTHONIOENCODING"] = "utf-8"
     final_env["FORCE_COLOR"] = "1"
     final_env["FORCE_TERMINAL"] = "1"
     final_env.pop("NO_COLOR", None)
