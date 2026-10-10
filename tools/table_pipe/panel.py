@@ -138,6 +138,12 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
         收窗是这同一次收尾的一部分: 人按下按钮、回应一落地, 页面自己 window.close()
         (不留一个满是可点按钮的死窗等人亲手关), 后端过了 CLOSE_GRACE 才真正停。
         关窗/刷新 ≠ 退出这条不变 —— 收窗只挂在"人点了退出按钮"这一次, 没有别的自动腿。
+        [v41+] 但关窗也不再是"哑巴": 页面收起时发一个 /api/viewgone beacon, 只标
+        "这扇窗收起了"(**不退出**)。为什么要它: 服务端铃响时要把面板叫到台前
+        (server._open_panel), 它现在按"进程在跑**且**窗还在"才跳过开窗; 少了这个标记,
+        "关窗没退出"(v41 才有的常驻状态)会被误判成"窗还在", 于是铃响了却没有窗。
+        它是**确定事件**(窗收起就发), 与上面删掉的时间窗兜底不是一回事 —— 这里没有任何
+        时间判断, 也绝不触发退出。
         连带的 /api/idle 端点、头部倒计时与暂停按钮一并删除。
   改动作废: /api/check 记下当时文本的 sha1, /api/commit 发现文本变了直接拒绝 ——
             "确认"不可能按在过期内容上(服务器端强制, 不只靠前端禁用按钮)。
@@ -147,6 +153,7 @@ Apple WWDC25 Liquid Glass 官方设计原则(透镜高光/静止时安静、交�
   python panel.py --takeover             60642 上有自家旧实例时, 先请它走再起(见下)
   python panel.py --selftest [回包文件]   无界面自检(跑 analyse 并打印待看清单)
   python panel.py --announce <文件>       把实际端口写到该文件(服务端拉起时用它回话; 见 announce_port)
+  python panel.py --openview <端口>       只开一扇窗指向**已在跑**的实例, 不另起进程(见 main 里那段)
 
 为什么有 --takeover: 旧实例没退干净时, 新面板会**静默**回落随机端口, 而用户眼前那扇
 窗连的还是旧进程(吃的旧代码) —— 体检里那条"端口·面板共存"只是只读提醒, 不会替你动手。
@@ -748,6 +755,11 @@ def analyse(text):
 
     job, ids, got = hit
     orig = {u["id"]: u["orig"] for u in wc.manifest_units(job)}
+    # 回包重复编号: 解析层"取首条"是静默降级 —— 其余各次出现连正文一起被丢,
+    # 高危形态是"引用行劫持"(译文里出现行首同号行, 先于真编号行, 真译文反被丢)。
+    # 这里重新带 stats 解析一次(纯正则, 开销可忽略), 把降级变成人看得见的条目。
+    _stats = {}
+    wc.parse_units(text, ids, job["pre"], stats=_stats)
     v, out, note = sandbox_gates(job, ids, got)      # 只跑一次(门禁有副作用/开销)
     verdict = _as_verdict(v)
     ok = (verdict == "PASS")
@@ -761,6 +773,16 @@ def analyse(text):
     # 长度比(rows / med / last_r)是**读数**: 只在全表那一列与顶部显示, 不产生任何条目 ——
     # 它的参照(整篇中位数)跨了源串类别, 且"低于中位"按定义就是整篇约 50% 的事件。见 [v30.5]。
     items = []
+
+    # 0) 回包里重复出现的编号: 解析已按首条取用, 但首条未必是真译文 ——
+    #    若首条是"引用行/误排"(如译文正文里行首出现同号), 真编号行的译文被整体丢弃。
+    #    不自动裁决谁真谁假(机械判不出), 只点名让人核。
+    if _stats.get("dups"):
+        _dup_ids = [u for u, _ in _stats["dups"]]
+        items.append(("中", "重复编号",
+                      "回包里这些编号出现多次, 已按首条取用: %s —— 若首条是引用行/误排, "
+                      "真译文被丢弃, 请对照原文核对这几段" % _brief(_dup_ids),
+                      " ".join(_dup_ids)))
 
     # 1) 一致性: 同一原文必须同一译文。纯机械判断 —— 不需要专业知识就能定夺。
     by = {}
@@ -1618,6 +1640,7 @@ $('reviewBtn').addEventListener('click',function(){
   var b=$('reviewBtn'),txt=b.textContent;
   b.disabled=true;b.textContent='审核中…';
   log('▶ 提交 ④ 语义审核: 整篇「原文↔译文」发给硅基流动(付费, 只审不改), 通常几十秒到几分钟。');
+  log('⚠ 请确认粘贴内容确来自 '+vendor+' —— 同源防护只认面板里选的翻译方, 认不出粘贴文本的真实出处。');
   api('/api/review',{text:ta.value}).then(function(r){
     b.textContent=txt;applyVendorGuard();       /* 恢复按钮态: 同源则该保持禁用 */
     if(r.error){
@@ -1970,6 +1993,11 @@ document.addEventListener('visibilitychange',function(){
   // 从豆包切回来立即心跳唤醒, 不等被浏览器节流的 setInterval
   if(!document.hidden)ping();
 });
+/* [v41+] 关窗只标"视图已收起", **不**退出 —— 退出只认「退出面板」/「完工, 关面板」两颗按钮。
+   为什么要它: 服务端铃响时要把面板叫到台前(见 server._open_panel), 判据是"进程在跑**且**窗还在";
+   而 v41 把"关窗"与"退出"解耦之后(关窗 ≠ 退出, 进程照旧活着), 只看进程活不活会把"关窗没退出"
+   误判成"窗还在" —— 于是铃响了却没有窗。这里补一个**确定事件**信号(不是时间窗), 好让它把窗弹回来。 */
+window.addEventListener('pagehide',function(){navigator.sendBeacon('/api/viewgone')});
 /* ---- 概念链接: 把"成品里选中的那段字 -> 你自己的网址"装进成品 ----
    动线为什么长这样: 锚文本必须**是成品页面上真正印出来的那段中文**。手打一个中文概念词,
    差一个字就是一条死链, 而"差一个字"光看屏幕看不出来 —— 所以先「载入对照」, 点右边
@@ -2590,6 +2618,15 @@ api('/api/state').then(function(s){
 
 CLOSE_GRACE = 3      # 点「退出面板 / 完工, 关面板」后的宽限秒数: 留几秒让那句回话先回到页面上
 STATE = {"checked": None, "sha": None}
+# [v41+] 「视图(那扇窗)还在不在」—— 一个**确定事件**标记, 不是时间戳。
+# 为什么要有它: 服务端铃响时要把面板叫到台前(见 server._open_panel), 而它的旧判据是
+# "进程在不在跑"; v41 把"关窗"与"退出"解耦之后(关窗 ≠ 退出, 进程照旧活着), 这个代理
+# 就失效了 —— 关窗没退出时铃响会被误判成"窗还在", 于是**铃响了却没有窗**。
+# 语义与已删的退出腿①**不同**: 腿①是拿 15s 时间窗猜"人走没走"去替人退出; 这个只记
+# "这扇窗收起了没有", 绝不触发退出, 只用来决定"铃响时要不要把窗重新弹出来"。
+# 页面每 5s 打 /api/ping 证"我在"; 收起时 sendBeacon 打 /api/viewgone 证"我走了"。
+# 服务端自己**不**打 /api/ping(它探 /api/state), 故这个信号不会被自家探测污染。
+VIEW = {"present": True}
 LOCK = threading.Lock()
 SRV = {"h": None}    # main() 起的那个服务器; 退出要它才关得掉(见 close_panel)
 
@@ -2780,10 +2817,13 @@ class H(BaseHTTPRequestHandler):
                         "todos": paper_tasks(),   # 这一篇该做的每一块到哪一步了(判据在产物上)
                         "build": build_stamp(),   # 本面板吃的是哪一版代码(旧实例自查)
                         "ready": payload_ready(),  # 页面一开就能看见最近那份载荷就绪标记
-                        "session": _session_info()})  # L2: 工作目录里若还留着③通过的会话, 给[恢复]入口
+                        "session": _session_info(),  # L2: 工作目录里若还留着③通过的会话, 给[恢复]入口
+                        "view": VIEW["present"]})  # [v41+] 那扇窗还在不在(服务端铃响据此决定要不要弹窗)
         elif path == "/api/ping":
             # 心跳顺带把"载荷就绪"捎回去: 前端每 5s 已经在打这个接口, 不必另开一条轮询
             # (服务端响铃时若本面板已在跑, 提到台前那一步只能靠页面自己 —— 见 renderReady)
+            # [v41+] 心跳同时证明"视图还在"(见 VIEW): 页面活着才打得到这里。
+            VIEW["present"] = True
             self._json({"ok": True, "ready": payload_ready()})
         elif path == "/api/ulstate":
             self._ul_state()
@@ -2804,6 +2844,12 @@ class H(BaseHTTPRequestHandler):
             self._send(b)
         elif path == "/api/build":
             self._build()
+        elif path == "/api/viewgone":
+            # [v41+] 页面收起时(sendBeacon)标一句"这扇窗没了"。**不退出** —— 只让服务端知道
+            # "进程还在、窗收起了", 好让下次铃响时把窗重新弹出来(见 VIEW 与 server._open_panel)。
+            # 与 /api/bye 的区别是本质的: 这里收的是"界面", 那里关的是"服务"。
+            VIEW["present"] = False
+            self._json({"ok": True})
         elif path == "/api/bye":
             # 显式退出: 表头「退出面板」/ 概念链接区「完工, 关面板」/ --takeover 都走这里。
             # 不再有"页面关窗前 sendBeacon -> 宽限期"那条腿 —— 退出的决定权在人, 不靠时间窗
@@ -3564,6 +3610,15 @@ def main():
         return selftest(os.path.join(wc.D, f))
     if not wc.check_workdir():
         return 2
+    if "--openview" in sys.argv:
+        # [v41+] 只开一扇窗指向**已经在跑**的那个实例, 不另起服务进程。
+        # 谁用它: server._open_panel —— "进程在跑、但那扇窗收起了"(关窗没退出)时铃响要把窗
+        # 重新弹出来。此时**不能**走正常启动: 旧进程还占着 60642, 新进程只会落到随机端口,
+        # 眼前多一扇窗且各连各的。开窗这步复用 open_app(与正常启动同一份 --app 逻辑)。
+        i = sys.argv.index("--openview")
+        p = int(sys.argv[i + 1]) if len(sys.argv) > i + 1 and sys.argv[i + 1].isdigit() else PANEL_PORT
+        open_app("http://127.0.0.1:%d/" % p)
+        return 0
     announce = ""
     if "--announce" in sys.argv:        # [v28.79+] 服务端拉起来的: 用它回话(见 announce_port)
         i = sys.argv.index("--announce")

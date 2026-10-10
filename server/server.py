@@ -381,17 +381,27 @@ def _announced_port():
         return 0
 
 
-def _panel_running_port():
-    """**已经跑着**的自家面板在哪个端口; 没有则 0。
+def _panel_running():
+    """**已经跑着**的自家面板: (端口, 它报的状态); 没有则 (0, None)。
 
     先看它自己报的(面板端口被占时会回落随机端口, 那份不在 60642 上), 再看固定的 60642。
     报上来的那份要**探一下才算数** —— 文件可能是上一次运行留下的(进程没了文件还在),
     也可能是端口已经被别人接管了。
+
+    [v41+] 连状态一起返回的理由: "进程在跑"与"那扇窗还在"已经是两件事(关窗 ≠ 退出),
+    铃响时得按"窗还在不在"决定是"切过去"还是"把窗重新弹出来"(见 _open_panel;
+    那个标记由 panel 的 VIEW 维护, 随 /api/state 报出来)。
     """
     for cand in (_announced_port(), PANEL_PORT):
-        if cand and _panel_state(cand):
-            return cand
-    return 0
+        st = _panel_state(cand) if cand else None
+        if st:
+            return cand, st
+    return 0, None
+
+
+def _panel_running_port():
+    """**已经跑着**的自家面板在哪个端口; 没有则 0。(只取端口的那几处调用点用)"""
+    return _panel_running()[0]
 
 
 def _wait_panel_port(timeout=4.0):
@@ -417,25 +427,58 @@ def _panel_script():
     return ""
 
 
+def _spawn_view(port):
+    """[v41+] 开一扇窗指向**已经在跑**的那个面板实例(不另起面板进程)。起成返回 True。
+
+    为什么要单开这一格: 那个实例还占着自己的端口, 若走正常启动, 新进程只会落到随机端口
+    —— 眼前多一扇窗、且两扇各连各的。开窗逻辑只在 panel.py 里有一份(open_app), 这里借
+    它的 `--openview` 模式复用, 不在这边抄一遍 --app 参数(两处各写一份迟早分叉)。
+    """
+    panel = _panel_script()
+    if not panel:
+        return False
+    creation = 0
+    for flag in ("DETACHED_PROCESS", "CREATE_NEW_PROCESS_GROUP"):
+        creation |= getattr(subprocess, flag, 0)
+    try:
+        subprocess.Popen([sys.executable, panel, "--openview", str(port)],
+                         cwd=os.path.dirname(panel),
+                         env=os.environ.copy(), creationflags=creation,
+                         stdin=subprocess.DEVNULL, close_fds=True)
+        return True
+    except Exception:                           # noqa: BLE001 —— 弹不出窗不能连累翻译
+        return False
+
+
 def _open_panel():
     """[v28.79] 把中继面板叫到台前。返回一句人话(给日志/卡片用), **绝不抛异常**。
 
-    只做**没跑时起新的**这一件事; 已经在跑就只报出它在哪个端口(_panel_running_port)
-    —— 隔进程把窗口提到前台没有可靠办法(硬用 Win32 SetForegroundWindow 得绑死窗口标题,
-    标题一改就失效), 而"把决定权交给会失效的代码"比"少做一步"更糟。已在跑时改由**页面
-    自己**接手: 前端每 5s 打一次 /api/ping, 发现载荷是新一轮的(.ready.json 的 ready_at
-    变了)就 window.focus() —— 拿不准也不会有副作用, 浏览器不理它就只是没弹到最前。
+    分三种情况(判据见 _panel_running):
+      • 没在跑      -> 起一个新的(开窗是它自己启动时那一下);
+      • 在跑且有窗  -> 不另开: 隔进程把**已有**窗口提到前台没有可靠办法(硬用 Win32
+        SetForegroundWindow 得绑死窗口标题, 标题一改就失效), 交给**页面自己**接手 ——
+        前端每 5s 打一次 /api/ping, 发现载荷是新一轮的(.ready.json 的 ready_at 变了)
+        就 window.focus()。拿不准也不会有副作用, 浏览器不理它就只是没弹到最前。
+      • 在跑但窗收起了 -> [v41+] **把窗重新弹出来**(_spawn_view 开一扇新窗指向同一实例)。
+        v41 之前没有这一格: 那时关窗即退出, "进程还在但没窗"只是瞬态; v41 把关窗与退出
+        解耦后(关窗 ≠ 退出)它成了常驻状态, 不补这格就会出现"铃响了却没有窗"。
 
     **起完必须回头看一眼它到底起没起**(v28.79+): 拉起的是分离进程, 不等退出码, 而面板
     会因为环境里没有 P2Z_TABLE_DIR/P2Z_PROJ 找不到 manifest 就自己退出(退出码 2)。所以
     这里等它把端口报出来, 报不出来就**明说没起来**并给排查方向 —— 报一句"已启动"而其实
     没起来, 是最坏的一种诚实(用户会对着空桌面找窗口)。
     """
-    port = _panel_running_port()
+    port, st = _panel_running()
     if port:
-        return ("中继面板已在跑(127.0.0.1:%d), 载荷已就绪 —— 切到那个窗口即可。"
-                "(表头有「构建」时间; 若那扇窗连的是旧进程、吃不到最新改动, "
-                "关掉它重跑, 或 `python tools/table_pipe/panel.py --takeover`。)" % port)
+        if st.get("view", True):
+            return ("中继面板已在跑(127.0.0.1:%d), 载荷已就绪 —— 切到那个窗口即可。"
+                    "(表头有「构建」时间; 若那扇窗连的是旧进程、吃不到最新改动, "
+                    "关掉它重跑, 或 `python tools/table_pipe/panel.py --takeover`。)" % port)
+        if _spawn_view(port):
+            return ("已把中继面板的窗重新弹出来(127.0.0.1:%d) —— 载荷就绪, 切到那个窗口即可。"
+                    "(上一扇窗收起了、进程一直在跑: 关窗只是收起界面, 不停服务。)" % port)
+        return ("⚠️ 中继面板进程在跑(127.0.0.1:%d), 但那扇窗收起了、这次没能自动弹回来 —— "
+                "手动开 http://127.0.0.1:%d/ 即可。" % (port, port))
     panel = _panel_script()
     if not panel:
         return "⚠️ 找不到 tools/table_pipe/panel.py —— 面板没起成, 请手动打开。"

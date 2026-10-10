@@ -23,11 +23,13 @@ v28.60 给面板加过一条"心跳静默 IDLE_LIMIT(1800s) = 窗口已关"的�
 本套件逐条锁死现在的契约:
   ① 退出: **没有任何自动退出腿**(v41) —— 关窗即退(告别腿)与心跳静默兜底都没了;
      行为层已无对象可测, 故本段只做**静态守卫**(模块属性 + 页面源码形态), 谁塞回来就报红;
+     [v41+] 关窗仍会发一个 pagehide beacon, 但只打 /api/viewgone("视图已收起", **不退出**):
+     服务端铃响时据此判断"进程在跑但没窗" -> 把窗重新弹出来(见 ④);
   ② 载荷就绪标记: payload_ready() 认 inbox 里最新那份 .ready.json, 坏文件不抛;
   ③ 构建戳: build_stamp() 取三份关键文件里最新的 mtime(表头那行"构建 09-23 20:15"),
      用来一眼认出"60642 上那扇窗跑的是旧进程";
-  ④ HTTP 契约 + 页面接线: /api/state 给 build/ready 且**不再有 idle**, /api/idle 下线,
-     页面有构建时间位、载荷就绪时自己 window.focus()、且送出去的页面里再无关窗告别;
+  ④ HTTP 契约 + 页面接线: /api/state 给 build/ready/view 且**不再有 idle**, /api/idle 下线,
+     页面有构建时间位、载荷就绪时自己 window.focus()、关窗只打 /api/viewgone(不退出);
      面板把**实际端口**写进回话文件(--announce, v28.79+) —— 服务端是分离进程拉起它的,
      全靠这个文件才知道它起没起、落在哪个端口(sandbox 的对应一半在 test_pause_adopt.py 的 D 段);
   ⑤ 60642 旧实例: 只识别、**绝不代杀** —— 本套件只做静态守卫, 不真发退出
@@ -196,14 +198,19 @@ def main():
     # 决定", 与这个产品"沉浸式自主填写、决定权在人"相悖。
     # 行为层已无对象可测(线程/常量都没了), 故本段改做**静态守卫**: 属性层 + 源码层两路取证,
     # 谁把自动退出塞回来(改个名也算 —— 只要 STATE 里再冒出心跳/告别时间戳)这里就报红。
+    # [v41+] 关窗现在仍有一个 pagehide beacon, 但语义**相反**: 它打 /api/viewgone 只标
+    # "这扇窗收起了"(确定事件, **不退出**), 好让服务端铃响时把窗弹回来(见 panel.VIEW 与
+    # server._open_panel)。下面两条把它与已删的告别腿划清: beacon 若指向 /api/bye(退出),
+    # 或那个 viewgone 标记不见了, 这里就报红。
     src0 = open(os.path.join(TABLE_PIPE, "panel.py"), encoding="utf-8").read()
     check("① 看门狗线程已从模块里消失(_watchdog)", not hasattr(PN, "_watchdog"))
     check("① 告别宽限期常量已从模块里消失(BYE_GRACE)", not hasattr(PN, "BYE_GRACE"))
     check("① 心跳/告别时间戳不再进 STATE(无从判'多久没动静')",
           "ping" not in PN.STATE and "bye_at" not in PN.STATE, sorted(PN.STATE.keys()))
-    check("① 页面源码里再无 pagehide 告别 beacon(只认代码形态, 不被文档里那句解释误伤)",
-          "'pagehide'" not in src0 and '"pagehide"' not in src0
-          and "sendBeacon(" not in src0)
+    check("① 关窗不再打退出端点(告别 beacon 已删: 没有 sendBeacon 指向 /api/bye)",
+          "sendBeacon('/api/bye')" not in src0 and 'sendBeacon("/api/bye")' not in src0)
+    check("① 关窗只标『视图已收起』(pagehide -> /api/viewgone), 供铃响时把窗弹回来",
+          "addEventListener('pagehide'" in src0 and "sendBeacon('/api/viewgone')" in src0)
     check("① 旧的 /api/ulclose 路由已并进 /api/bye(退出只剩一个动作)",
           "/api/ulclose" not in src0)
     check("① 倒计时那套也从模块里消失",
@@ -267,8 +274,19 @@ def main():
               'id="idleTxt"' not in pg and 'id="idleBtn"' not in pg)
         check("④ 载荷就绪时页面自己 focus + 落横幅",
               "/api/bye" in pg and "renderReady" in pg and "window.focus()" in pg)
-        check("④ 送到浏览器的页面里没有任何关窗告别(v41: 关窗 ≠ 退出)",
-              "pagehide" not in pg and "sendBeacon" not in pg)
+        check("④ 页面关窗只标『视图已收起』(打 /api/viewgone), 不打退出端点(v41+: 关窗 ≠ 退出)",
+              "pagehide" in pg and "/api/viewgone" in pg
+              and "sendBeacon('/api/bye')" not in pg)
+        st0 = http_json(base + "api/state")
+        check("④ 默认视图在(/api/state 报 view=True): 铃响时只需切过去",
+              st0.get("view") is True, st0.get("view"))
+        http_json(base + "api/viewgone", {})
+        st1 = http_json(base + "api/state")
+        check("④ 视图收起后报 view=False(铃响时服务端据此把窗弹回来, 不再误判'窗还在')",
+              st1.get("view") is False, st1.get("view"))
+        http_json(base + "api/ping")
+        st2 = http_json(base + "api/state")
+        check("④ 心跳回来 -> view 复位 True(页面又在跑)", st2.get("view") is True, st2.get("view"))
         pi = http_json(base + "api/ping")
         check("④ 心跳顺带捎回载荷就绪(不另开轮询)",
               pi.get("ok") and (pi.get("ready") or {}).get("name") == "payload_live", pi)
@@ -298,6 +316,14 @@ def main():
           and "/api/bye" in src)
     check("⑤ 起不来时明说落在随机端口, 不假装占了 60642",
           "60642 没腾出来" in src)
+    # [v41+] 服务端"把面板叫到台前"的判据: 由"进程在不在跑"改成"在跑**且**窗还在"才跳过
+    # 开窗; 在跑但窗收起了要走 _spawn_view 把窗开回来 —— 否则 v41 把关窗与退出解耦之后,
+    # "关窗没退出"会变成"铃响了却没有窗"(见 server._open_panel 那段 docstring)。
+    ssrc = open(os.path.join(os.path.dirname(TOOLS), "server", "server.py"),
+                encoding="utf-8").read()
+    check("⑤ 服务端叫面板分三格: 没跑起新的 / 在跑有窗切过去 / 在跑没窗把窗弹回来",
+          "def _spawn_view(" in ssrc and "_panel_running()" in ssrc
+          and 'st.get("view", True)' in ssrc and '"--openview"' in ssrc)
 
     # ---- ⑥ 退出腿②: 出稿**不再**自动收摊, 关面板交给人 ----
     # [v36.4] 判据还留着(paper_done), 但它现在**不驱动任何自动行为** —— 只用来在出稿日志

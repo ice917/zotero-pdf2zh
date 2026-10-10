@@ -126,7 +126,8 @@ def panel_ns():
         s = const_src(c)
         assert s, "server.py 里找不到常量 %s" % c
         exec(compile(s, "<server.%s>" % c, "exec"), ns)
-    for n in ("_panel_state", "_announced_port", "_panel_running_port",
+    for n in ("_panel_state", "_announced_port", "_panel_running",
+              "_panel_running_port", "_spawn_view",
               "_wait_panel_port", "_panel_script", "_open_panel"):
         s = func_src(n)
         assert s, "server.py 里找不到 %s" % n
@@ -394,14 +395,25 @@ def main():
     # ② 地址要报真的(60642 被占时面板回落随机端口, 再报 60642 就是指错门);
     # ③ 自动回路是无人值守的, 不该往人眼前弹窗。
     L = panel_ns()
-    real_running = L["_panel_running_port"]
+    real_running = L["_panel_running_port"]          # 原版(只取端口) —— 末尾探端口真值用
+    real_panel_running = L["_panel_running"]          # 原版(端口+状态), mock 完要还原
 
-    L["_panel_running_port"] = lambda: 51234
+    L["_panel_running"] = lambda: (51234, {"view": True})
     note = L["_open_panel"]()
-    check("D 已在跑 -> 报出它的端口(哪怕不是 60642), 不起新的",
+    check("D 已在跑且有窗 -> 报出它的端口(哪怕不是 60642), 不起新的",
           "127.0.0.1:51234" in note and L["subprocess"].calls == [], note)
 
-    L["_panel_running_port"] = lambda: 0
+    # [v41+] 关窗 ≠ 退出: 进程还在跑、但那扇窗收起了(VIEW 报 view=False) —— 此时铃响
+    # 不能像从前那样误判"窗还在"只报一句"切过去", 得**开一扇新窗**指回同一实例。
+    L["subprocess"] = PopenSpy()
+    L["_panel_running"] = lambda: (51234, {"view": False})
+    note = L["_open_panel"]()
+    check("D 在跑但窗收起了 -> 开一扇新窗(--openview)指回同一实例, 不另起服务进程",
+          len(L["subprocess"].calls) == 1
+          and L["subprocess"].calls[0][2:] == ["--openview", "51234"]
+          and "重新弹" in note, (note, L["subprocess"].calls))
+
+    L["_panel_running"] = lambda: (0, None)
     L["subprocess"] = PopenSpy()
     L["_PANEL_LAUNCH"]["at"] = 0.0
     L["_wait_panel_port"] = lambda *a: 51234          # 面板回落到了随机端口
@@ -443,6 +455,7 @@ def main():
 
     # 面板报上来的端口要**探一下才算数**: 文件可能是上一轮留下的(进程没了文件还在),
     # 也可能是端口早被别的程序接管了 —— 不探就报, 等于把用户指到一扇不存在的窗。
+    L["_panel_running"] = real_panel_running          # 还原: 下面走真探测, 不能用上面那两把 mock
     ann_ns = L["_PANEL_ANNOUNCE"]
     L["PANEL_PORT"] = 59997                           # 固定端口挪开, 免得撞上真在跑的面板
     with open(ann_ns, "w", encoding="utf-8") as f:
